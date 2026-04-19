@@ -1,0 +1,2 @@
+Version: 1.12.0
+Arguments: ['C:\\Program Files (x86)\\pipx\\.cache\\58c9282b97b2a68\\Scripts\\delvewheel', 'repair', '-v', '-w', 'C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cibw-run-8bglfdne\\cp313-win_amd64\\repaired_wheel', 'C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cibw-run-8bglfdne\\cp313-win_amd64\\built_wheel\\psd_tools-1.15.0.post1-cp313-cp313-win_amd64.whl']

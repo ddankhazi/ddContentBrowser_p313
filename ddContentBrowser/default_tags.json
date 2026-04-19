@@ -1,0 +1,118 @@
+{
+  "Asset Type": {
+    "color": "#4CAF50",
+    "description": "Type of asset or file",
+    "tags": [
+      "HDRI / Skydome",
+      "Texture Set",
+      "PBR Material",
+      "Tileable Texture",
+      "3D Model",
+      "Environment Prop",
+      "Vegetation",
+      "Rock / Ground",
+      "Reference Image",
+      "Concept Art",
+      "Camera / Lens Data"
+    ]
+  },
+  "Environment": {
+    "color": "#2196F3",
+    "description": "Environment category and setting",
+    "tags": [
+      "Natural / Forest",
+      "Natural / Jungle",
+      "Natural / Desert",
+      "Natural / Mountain",
+      "Natural / Rock",
+      "Natural / Water",
+      "Natural / Ocean",
+      "Natural / Sky",
+      "Urban / Street",
+      "Urban / Road",
+      "Urban / Building",
+      "Urban / Architecture",
+      "Urban / Industrial",
+      "Interior / Room",
+      "Interior / Props",
+      "Interior / Furniture"
+    ]
+  },
+  "Lighting": {
+    "color": "#FF9800",
+    "description": "Lighting and time of day",
+    "tags": [
+      "Day / Morning",
+      "Day / Noon",
+      "Day / Afternoon",
+      "Evening / Golden Hour",
+      "Night / Blue Hour",
+      "Night / Moonlight",
+      "Night / City Lights",
+      "Overcast / Cloudy",
+      "Sunset / Sunrise",
+      "Studio / Neutral"
+    ]
+  },
+  "Source": {
+    "color": "#9C27B0",
+    "description": "Origin or source of asset",
+    "tags": [
+      "Quixel Megascans",
+      "Polyhaven",
+      "HDRI Haven",
+      "Texture Haven",
+      "Personal Work",
+      "Client Project",
+      "Free Asset",
+      "Purchased Asset"
+    ]
+  },
+  "Technical": {
+    "color": "#607D8B",
+    "description": "Technical specifications",
+    "tags": [
+      "8K / High Resolution",
+      "4K / Medium Resolution",
+      "2K / Low Resolution",
+      "UDIM",
+      "Tileable",
+      "LOD Available",
+      "Scanned / Photogrammetry",
+      "Procedural"
+    ]
+  },
+  "Material": {
+    "color": "#795548",
+    "description": "Material type or surface",
+    "tags": [
+      "Concrete",
+      "Metal",
+      "Wood",
+      "Fabric / Cloth",
+      "Stone / Rock",
+      "Ground / Dirt",
+      "Grass / Vegetation",
+      "Water",
+      "Glass / Transparent",
+      "Plastic",
+      "Ceramic",
+      "Brick"
+    ]
+  },
+  "Status": {
+    "color": "#F44336",
+    "description": "Project status and usage",
+    "tags": [
+      "Favorite / Go-to",
+      "Frequently Used",
+      "Ready to Use",
+      "Work In Progress",
+      "Needs Cleanup",
+      "Archive",
+      "Hero Asset",
+      "Background Asset",
+      "Test / Experiment"
+    ]
+  }
+}

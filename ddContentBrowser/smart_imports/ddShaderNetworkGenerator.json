@@ -1,0 +1,25 @@
+{
+  "channel_aliases": {
+    "baseColor": ["basecolor", "base_color", "albedo", "diffuse", "diff", "color", "col"],
+    "roughness": ["roughness", "rough", "glossiness", "gloss"],
+    "metalness": ["metalness", "metallic", "metal", "met"],
+    "normal": ["normal", "normalmap", "nrm", "nor", "norm"],
+    "height": ["height", "heightmap", "bumpheight"],
+    "displacement": ["displacement", "disp", "displ", "displace"],
+    "emission": ["emission", "emissive", "emit"]
+  },
+  "material_suffixes_to_strip": [
+    "_MAT$", "_mat$", "_aiStandardSurface$", "_openPBR$", "_Mtl$", "_mtl$", "_dGecko$", "_openPBRSurface$", "_PBR$", "_shader$"
+  ],
+  "extension_priority": [".tif", ".tiff", ".png", ".jpg", ".jpeg"],
+  "accept_extensions": [".tif", ".tiff", ".png", ".jpg", ".jpeg"],
+  "accept_extensions_per_channel": {
+    "displacement": [".exr", ".tif", ".tiff", ".png", ".jpg", ".jpeg"]
+  },
+  "extension_priority_per_channel": {
+    "displacement": [".exr", ".tif", ".tiff", ".png", ".jpg", ".jpeg"]
+  },
+  "udim_regex": "(?:[\\._-])(1\\d{3})(?=[\\._-]|$)",
+  "scan_depth": 1,
+  "openpbr_nits_per_unit_fallback": 1000.0
+}

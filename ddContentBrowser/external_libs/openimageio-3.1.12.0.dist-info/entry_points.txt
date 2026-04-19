@@ -1,0 +1,5 @@
+[console_scripts]
+idiff = OpenImageIO:_command_line
+maketx = OpenImageIO:_command_line
+oiiotool = OpenImageIO:_command_line
+
