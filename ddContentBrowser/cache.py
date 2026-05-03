@@ -55,7 +55,7 @@ try:
     script_dir = Path(__file__).parent
     external_libs_path = script_dir / "external_libs"
     if str(external_libs_path) not in sys.path:
-        sys.path.insert(0, str(external_libs_path))
+        sys.path.append(str(external_libs_path))
     
     from turbojpeg import TurboJPEG
     
@@ -1200,7 +1200,7 @@ class ThumbnailGenerator(QThread):
                 
                 # Use OpenCV for fast decoding and resizing (thread-safe)
                 import cv2
-                cv2.setLogLevel(0)  # Silent
+                if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)  # Silent
                 
                 if DEBUG_MODE:
                     import threading
@@ -1759,7 +1759,7 @@ class ThumbnailGenerator(QThread):
         """
         import cv2
         # Suppress OpenCV/FFmpeg verbose output
-        cv2.setLogLevel(0)  # 0 = Silent
+        if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)  # 0 = Silent
         
         # If no file path provided, use default flags
         if file_path is None:
@@ -1831,7 +1831,7 @@ class ThumbnailGenerator(QThread):
         # Add external_libs to path
         external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
         if external_libs not in sys.path:
-            sys.path.insert(0, external_libs)
+            sys.path.append(external_libs)
         
         try:
             from psd_tools import PSDImage
@@ -1932,7 +1932,7 @@ class ThumbnailGenerator(QThread):
         # Add external_libs to path for PIL import
         external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
         if external_libs not in sys.path:
-            sys.path.insert(0, external_libs)
+            sys.path.append(external_libs)
         
         try:
             with open(str(file_path), 'rb') as f:
@@ -2251,7 +2251,7 @@ class ThumbnailGenerator(QThread):
             thread_name = threading.current_thread().name if DEBUG_MODE else None
             
             # Suppress OpenCV/FFmpeg verbose output
-            cv2.setLogLevel(0)
+            if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)
             
             # Open video file
             cap = cv2.VideoCapture(str(file_path))
@@ -2324,7 +2324,7 @@ class ThumbnailGenerator(QThread):
             import numpy as np
             
             # Suppress OpenCV/FFmpeg verbose output
-            cv2.setLogLevel(0)  # 0 = Silent
+            if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)  # 0 = Silent
             
             if PYSIDE_VERSION == 6:
                 from PySide6.QtGui import QImage, QPixmap
@@ -2580,7 +2580,7 @@ class ThumbnailGenerator(QThread):
                         print(f"[THUMB DEBUG] Attempting OpenCV load...")
                     
                     # Suppress OpenCV/FFmpeg verbose output
-                    cv2.setLogLevel(0)  # 0 = Silent
+                    if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)  # 0 = Silent
                     
                     # Get optimized imread flags (uses IMREAD_REDUCED_* for faster decoding)
                     # Pass file_path to check original dimensions
@@ -2975,7 +2975,7 @@ class ThumbnailGenerator(QThread):
                     import numpy as np
                     
                     # Suppress OpenCV/FFmpeg verbose output
-                    cv2.setLogLevel(0)  # 0 = Silent
+                    if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)  # 0 = Silent
                     
                     # Get optimized imread flags (uses IMREAD_REDUCED_* for faster decoding)
                     # Pass file_path to check original dimensions
@@ -3105,7 +3105,7 @@ class ThumbnailGenerator(QThread):
                         import cv2
                         import numpy as np
                         
-                        cv2.setLogLevel(0)  # Suppress verbose output
+                        if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)  # Suppress verbose output
                         
                         # Use REDUCED_8 for maximum speed
                         imread_flag = cv2.IMREAD_REDUCED_COLOR_8
@@ -3302,7 +3302,7 @@ class ThumbnailGenerator(QThread):
         # Add external_libs to path
         external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
         if external_libs not in sys.path:
-            sys.path.insert(0, external_libs)
+            sys.path.append(external_libs)
         
         try:
             import numpy as np
@@ -3454,7 +3454,7 @@ class ThumbnailGenerator(QThread):
                     import cv2
                     
                     # Suppress OpenCV/FFmpeg verbose output
-                    cv2.setLogLevel(0)  # 0 = Silent
+                    if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)  # 0 = Silent
                     if width > self.thumbnail_size or height > self.thumbnail_size:
                         scale = min(self.thumbnail_size / width, self.thumbnail_size / height)
                         new_width = int(width * scale)
@@ -3613,7 +3613,7 @@ class ThumbnailGenerator(QThread):
             import numpy as np
             
             # Suppress OpenCV/FFmpeg verbose output
-            cv2.setLogLevel(0)  # 0 = Silent
+            if hasattr(cv2, 'setLogLevel'): cv2.setLogLevel(0)  # 0 = Silent
             
             if DEBUG_MODE:
                 print(f"[HDR-OPT] Loading HDR with OpenCV: {Path(file_path).name}")

@@ -381,7 +381,7 @@ def auto_tag_file_colorspace(file_path, metadata_manager=None):
             import sys
             external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
             if external_libs not in sys.path:
-                sys.path.insert(0, external_libs)
+                sys.path.append(external_libs)
             
             import OpenEXR
             with OpenEXR.File(str(file_path)) as exr_file:

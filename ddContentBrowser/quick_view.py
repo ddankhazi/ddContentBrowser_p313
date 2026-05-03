@@ -1234,7 +1234,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                         import os
                         external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
                         if external_libs not in sys.path:
-                            sys.path.insert(0, external_libs)
+                            sys.path.append(external_libs)
                         
                         from PIL import Image
                         # Disable decompression bomb warning for large images
@@ -1289,7 +1289,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                         import os
                         external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
                         if external_libs not in sys.path:
-                            sys.path.insert(0, external_libs)
+                            sys.path.append(external_libs)
                         
                         from PIL import Image
                         Image.MAX_IMAGE_PIXELS = None
@@ -1383,7 +1383,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                                 import os
                                 external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
                                 if external_libs not in sys.path:
-                                    sys.path.insert(0, external_libs)
+                                    sys.path.append(external_libs)
                                 
                                 from PIL import Image
                                 pil_image = Image.open(str(file_path))
@@ -2062,7 +2062,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                         import os
                         external_libs = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ddContentBrowser', 'external_libs')
                         if external_libs not in sys.path:
-                            sys.path.insert(0, external_libs)
+                            sys.path.append(external_libs)
                         
                         # Try psd-tools first for PSD files
                         if file_path.suffix.lower() == '.psd':
@@ -2151,7 +2151,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                                 import sys
                                 external_libs = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ddContentBrowser', 'external_libs')
                                 if external_libs not in sys.path:
-                                    sys.path.insert(0, external_libs)
+                                    sys.path.append(external_libs)
                                 
                                 import tifffile
                                 import numpy as np

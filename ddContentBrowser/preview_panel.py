@@ -1324,7 +1324,7 @@ class PreviewPanel(QWidget):
             # Add external_libs to path
             external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
             if external_libs not in sys.path:
-                sys.path.insert(0, external_libs)
+                sys.path.append(external_libs)
             
             import OpenEXR
             import numpy as np
@@ -1485,7 +1485,7 @@ class PreviewPanel(QWidget):
             # Add external_libs to path
             external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
             if external_libs not in sys.path:
-                sys.path.insert(0, external_libs)
+                sys.path.append(external_libs)
             
             # Load HDR with OpenCV (FULL RESOLUTION)
             rgb = cv2.imread(str(file_path), cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
@@ -3321,7 +3321,7 @@ class PreviewPanel(QWidget):
                         import os
                         external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
                         if external_libs not in sys.path:
-                            sys.path.insert(0, external_libs)
+                            sys.path.append(external_libs)
                         
                         from PIL import Image
                         # Disable decompression bomb warning for large images
@@ -3423,7 +3423,7 @@ class PreviewPanel(QWidget):
                                 import os
                                 external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
                                 if external_libs not in sys.path:
-                                    sys.path.insert(0, external_libs)
+                                    sys.path.append(external_libs)
                                 
                                 from PIL import Image
                                 pil_image = Image.open(file_path_str)
@@ -4429,7 +4429,7 @@ class PreviewPanel(QWidget):
                                     import os
                                     external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
                                     if external_libs not in sys.path:
-                                        sys.path.insert(0, external_libs)
+                                        sys.path.append(external_libs)
                                     
                                     from PIL import Image
                                     Image.MAX_IMAGE_PIXELS = None
@@ -4515,7 +4515,7 @@ class PreviewPanel(QWidget):
                                     import os
                                     external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
                                     if external_libs not in sys.path:
-                                        sys.path.insert(0, external_libs)
+                                        sys.path.append(external_libs)
                                     
                                     from PIL import Image
                                     Image.MAX_IMAGE_PIXELS = None

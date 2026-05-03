@@ -17,10 +17,16 @@ from datetime import datetime, timedelta
 UI_FONT = "Segoe UI"
 
 # Add external_libs to path for OpenEXR
+# In Maya, append to avoid conflicting with Maya's own numpy/cv2/etc.
+# In standalone mode, insert at front so external_libs packages take priority.
 import sys
 _external_libs = os.path.join(os.path.dirname(__file__), "external_libs")
 if os.path.exists(_external_libs) and _external_libs not in sys.path:
-    sys.path.insert(0, _external_libs)
+    try:
+        import maya.cmds  # noqa: F401
+        sys.path.append(_external_libs)
+    except ImportError:
+        sys.path.insert(0, _external_libs)
 
 # NumPy is built into Maya 2026+
 try:
@@ -2415,7 +2421,7 @@ def load_oiio_image_array(file_path, max_size=2048, mip_level=0):
         import os
         external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
         if external_libs not in sys.path:
-            sys.path.insert(0, external_libs)
+            sys.path.append(external_libs)
         
         from OpenImageIO import ImageInput
         import numpy as np
@@ -2513,7 +2519,7 @@ def load_oiio_image(file_path, max_size=2048, mip_level=0, exposure=0.0, metadat
         import os
         external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
         if external_libs not in sys.path:
-            sys.path.insert(0, external_libs)
+            sys.path.append(external_libs)
         
         from OpenImageIO import ImageInput, ImageBuf, ImageSpec
         import numpy as np
