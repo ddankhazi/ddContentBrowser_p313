@@ -584,8 +584,8 @@ class FileSystemModel(QAbstractListModel):
                     
                     root_path = Path(root)
                     
-                    # Add folders if enabled (only direct subfolders in current dir)
-                    if self.show_folders and root == str(self.current_path):
+                    # Add folders if enabled (all subfolders at every depth)
+                    if self.show_folders:
                         for dir_name in dirs:
                             if not dir_name.startswith('.'):
                                 if self.filter_text:
@@ -1488,8 +1488,8 @@ class FileSystemModel(QAbstractListModel):
                 
                 root_path = Path(root)
                 
-                # Add folders
-                if self.show_folders and root == str(self.current_path):
+                # Add folders (all subfolders at every depth)
+                if self.show_folders:
                     for dir_name in dirs:
                         if not dir_name.startswith('.'):
                             if self.filter_text:
