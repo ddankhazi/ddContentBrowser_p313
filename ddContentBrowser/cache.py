@@ -815,7 +815,6 @@ class ThumbnailGenerator(QThread):
                             else:
                                 if DEBUG_MODE:
                                     print(f"[CACHE-THREAD] Failed to convert to QPixmap: {Path(file_path).name}")
-                                # Emit fail signal so delegate stops retrying
                                 self.generation_failed.emit(file_path, "Failed to convert image data to QPixmap")
                         else:
                             # Worker returned NULL data (unsupported format or error)
@@ -1009,14 +1008,65 @@ class ThumbnailGenerator(QThread):
             import cv2
             
             img_array = img_data['array']
-            width = img_data['width']
-            height = img_data['height']
-            channels = img_data['channels']
+            width = img_data.get('width')
+            height = img_data.get('height')
+            channels = img_data.get('channels')
             is_rgb = img_data.get('is_rgb', False)  # Default: BGR (OpenCV)
+
+            if img_array is None:
+                return None
+
+            # Normalize shape/channels for robust TIFF handling (e.g. 2-channel or multi-channel data).
+            if img_array.ndim == 2:
+                channels = 1
+                height, width = img_array.shape
+            elif img_array.ndim == 3:
+                height, width = img_array.shape[:2]
+                actual_channels = img_array.shape[2]
+
+                if actual_channels == 1:
+                    img_array = img_array[:, :, 0]
+                    channels = 1
+                elif actual_channels == 2:
+                    # Use first channel as grayscale (common for grayscale+alpha TIFF variants).
+                    img_array = img_array[:, :, 0]
+                    channels = 1
+                elif actual_channels >= 4:
+                    # Keep RGBA/BGRA for 4 channels, reduce anything larger to first 3 channels.
+                    if actual_channels == 4:
+                        channels = 4
+                    else:
+                        img_array = img_array[:, :, :3]
+                        channels = 3
+                else:
+                    channels = 3
+            else:
+                if DEBUG_MODE:
+                    print(f"[PIXMAP] Unsupported array ndim: {img_array.ndim}")
+                return None
+
+            # Fall back to shape-derived dimensions if metadata is missing or stale.
+            if not width or not height:
+                if img_array.ndim == 2:
+                    height, width = img_array.shape
+                else:
+                    height, width = img_array.shape[:2]
             
             # Ensure uint8
             if img_array.dtype != np.uint8:
-                img_array = img_array.astype(np.uint8)
+                if np.issubdtype(img_array.dtype, np.floating):
+                    # Handle float TIFF data robustly (NaN/Inf and ranges > 1.0).
+                    img_array = np.nan_to_num(img_array, nan=0.0, posinf=1.0, neginf=0.0)
+                    max_val = float(np.max(img_array)) if img_array.size else 0.0
+                    if max_val > 1.0:
+                        img_array = np.clip(img_array, 0.0, 255.0)
+                    else:
+                        img_array = np.clip(img_array, 0.0, 1.0) * 255.0
+                    img_array = img_array.astype(np.uint8)
+                elif img_array.dtype == np.uint16:
+                    img_array = (img_array / 257).astype(np.uint8)
+                else:
+                    img_array = np.clip(img_array, 0, 255).astype(np.uint8)
             
             # Qt's Format_RGB888 expects RGB format
             # OpenCV outputs BGR, so we need to convert BGR→RGB
@@ -1148,6 +1198,13 @@ class ThumbnailGenerator(QThread):
             # Most CPU-intensive formats (TIFF, HDR, EXR, PSD, TGA, etc.)
             
             if extension in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif', '.tga', '.hdr']:
+                # TIFF can decode inconsistently with OpenCV on some texture packs.
+                # Prefer PIL/tifffile path first for better compatibility.
+                if extension in ['.tiff', '.tif']:
+                    tiff_data = self._generate_tiff_thumbnail_data(file_path)
+                    if tiff_data is not None:
+                        return tiff_data
+
                 # TurboJPEG for JPEG files (2-3x faster than OpenCV)
                 if extension in ['.jpg', '.jpeg'] and TURBOJPEG_AVAILABLE:
                     try:
@@ -1239,9 +1296,24 @@ class ThumbnailGenerator(QThread):
                     if DEBUG_MODE:
                         print(f"[{thread_name}] ✓ OpenCV loaded: {img.shape}")
                     
-                    # Keep in BGR format (will be converted to RGB in _numpy_to_pixmap)
+                    # Normalize channel layout to Qt-friendly formats.
                     if len(img.shape) == 3:
-                        channels = img.shape[2]
+                        loaded_channels = img.shape[2]
+                        if loaded_channels == 1:
+                            img = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2BGR)
+                            channels = 3
+                        elif loaded_channels == 2:
+                            # Some TIFF files decode as gray+alpha; keep luminance.
+                            img = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2BGR)
+                            channels = 3
+                        elif loaded_channels == 3:
+                            channels = 3
+                        elif loaded_channels == 4:
+                            channels = 4
+                        else:
+                            # Reduce unsupported multi-channel buffers to BGR.
+                            img = img[:, :, :3]
+                            channels = 3
                     else:
                         # Grayscale - convert to BGR for consistency
                         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -1336,6 +1408,114 @@ class ThumbnailGenerator(QThread):
                 import traceback
                 traceback.print_exc()
             raise
+
+    def _generate_tiff_thumbnail_data(self, file_path):
+        """Generate TIFF thumbnail data with PIL/tifffile-first strategy."""
+        try:
+            import numpy as np
+
+            # 1) PIL path first: consistent with Quick View behavior.
+            try:
+                from PIL import Image
+                Image.MAX_IMAGE_PIXELS = None
+                pil_img = Image.open(str(file_path))
+                pil_img = pil_img.convert('RGB')
+                pil_img.thumbnail((self.thumbnail_size, self.thumbnail_size), Image.Resampling.LANCZOS)
+
+                img_array = np.array(pil_img)
+                height, width = img_array.shape[:2]
+
+                return {
+                    'array': img_array,
+                    'width': width,
+                    'height': height,
+                    'channels': 3,
+                    'is_rgb': True
+                }
+            except Exception as pil_error:
+                if DEBUG_MODE:
+                    print(f"[TIFF-DATA] PIL failed: {pil_error}")
+
+            # 2) tifffile fallback for special/compressed TIFF variants.
+            try:
+                import tifffile
+                img_array = tifffile.imread(str(file_path))
+
+                if img_array is None:
+                    return None
+
+                # Reduce multi-page / extra dimensions to first image plane.
+                while getattr(img_array, 'ndim', 0) > 3:
+                    img_array = img_array[0]
+
+                if img_array.ndim == 2:
+                    pass
+                elif img_array.ndim == 3:
+                    ch = img_array.shape[2]
+                    if ch == 1:
+                        img_array = img_array[:, :, 0]
+                    elif ch == 2:
+                        img_array = img_array[:, :, 0]
+                    elif ch >= 4:
+                        img_array = img_array[:, :, :3]
+                else:
+                    return None
+
+                if img_array.dtype == np.bool_:
+                    img_array = img_array.astype(np.uint8) * 255
+                elif img_array.dtype == np.uint16:
+                    img_array = (img_array / 257).astype(np.uint8)
+                elif np.issubdtype(img_array.dtype, np.integer) and img_array.dtype != np.uint8:
+                    info = np.iinfo(img_array.dtype)
+                    denom = float(max(info.max - info.min, 1))
+                    img_array = ((img_array.astype(np.float32) - info.min) / denom * 255.0).astype(np.uint8)
+                elif np.issubdtype(img_array.dtype, np.floating):
+                    img_array = np.nan_to_num(img_array, nan=0.0, posinf=1.0, neginf=0.0)
+                    max_val = float(np.max(img_array)) if img_array.size else 0.0
+                    if max_val > 1.0:
+                        p99 = float(np.percentile(img_array, 99)) if img_array.size else 255.0
+                        scale_max = p99 if p99 > 0 else max_val
+                        img_array = np.clip(img_array / max(scale_max, 1e-6), 0.0, 1.0)
+                    else:
+                        img_array = np.clip(img_array, 0.0, 1.0)
+                    img_array = (img_array * 255.0).astype(np.uint8)
+
+                if img_array.ndim == 2:
+                    img_array = np.stack([img_array, img_array, img_array], axis=2)
+
+                # Resize to thumbnail target.
+                height, width = img_array.shape[:2]
+                if width > self.thumbnail_size or height > self.thumbnail_size:
+                    try:
+                        import cv2
+                        scale = min(self.thumbnail_size / width, self.thumbnail_size / height)
+                        new_width = max(1, int(width * scale))
+                        new_height = max(1, int(height * scale))
+                        img_array = cv2.resize(img_array, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+                    except Exception:
+                        from PIL import Image
+                        pil_img = Image.fromarray(img_array)
+                        pil_img.thumbnail((self.thumbnail_size, self.thumbnail_size), Image.Resampling.LANCZOS)
+                        img_array = np.array(pil_img)
+
+                height, width = img_array.shape[:2]
+
+                return {
+                    'array': img_array,
+                    'width': width,
+                    'height': height,
+                    'channels': 3,
+                    'is_rgb': True
+                }
+            except Exception as tiff_error:
+                if DEBUG_MODE:
+                    print(f"[TIFF-DATA] tifffile failed: {tiff_error}")
+
+            return None
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"[TIFF-DATA] Error: {e}")
+            return None
     
     def _generate_exr_thumbnail_data(self, file_path):
         """

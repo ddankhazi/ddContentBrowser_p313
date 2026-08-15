@@ -13,16 +13,46 @@ Or simply:
 
 def launch(force_reload=True):
     """
-    Launch the DD Content Browser with automatic reload
-    
+    Launch the DD Content Browser with a genuine full reload.
+
     Args:
-        force_reload (bool): If True (default), reloads all modules before launching.
+        force_reload (bool): If True (default), purges all package modules and
+                           re-imports fresh code before launching.
                            Set to False for faster startup if no code changes.
     """
+    import sys
     try:
-        # Import and show the browser
+        if force_reload:
+            # browser.py cannot reload itself from inside show_content_browser
+            # (the running module keeps its own old classes). Purge here, BEFORE
+            # importing browser, so code edits actually take effect.
+            browser_mod = sys.modules.get('ddContentBrowser.browser')
+            if browser_mod is not None:
+                inst = getattr(browser_mod, '_content_browser_instance', None)
+                if inst is not None:
+                    try:
+                        inst.close()
+                        inst.deleteLater()
+                    except Exception:
+                        pass
+                    try:
+                        browser_mod._content_browser_instance = None
+                    except Exception:
+                        pass
+
+            to_delete = [
+                name for name in list(sys.modules.keys())
+                if name == 'ddContentBrowser' or name.startswith('ddContentBrowser.')
+            ]
+            for name in to_delete:
+                if name == 'ddContentBrowser.launch_browser':
+                    continue  # keep the currently-running launcher alive
+                del sys.modules[name]
+            print(f"[Reload] Purged {len(to_delete)} module(s), importing fresh code...")
+
+        # Fresh import AFTER purge -> picks up latest edits in every module.
         from ddContentBrowser.browser import show_content_browser
-        browser = show_content_browser(force_reload=force_reload)
+        browser = show_content_browser(force_reload=False)
         print("[DD Content Browser] Launched successfully!")
         return browser
     except Exception as e:

@@ -3238,41 +3238,13 @@ class PreviewPanel(QWidget):
                     # Fallback to Qt
                     self.full_res_pixmap = QPixmap(file_path_str)
             
-            # === TIFF with OpenCV ===
-            elif (file_ext.endswith('.tif') or file_ext.endswith('.tiff')) and OPENCV_AVAILABLE and NUMPY_AVAILABLE:
-                try:
-                    import cv2
-                    import numpy as np
-                    
-                    # Read FULL resolution image with OpenCV
-                    img = cv2.imread(file_path_str, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
-                    
-                    if img is not None:
-                        # Normalize bit depth FIRST (before color conversion!)
-                        if img.dtype == np.uint16:
-                            img = (img / 256).astype(np.uint8)
-                        elif img.dtype == np.float32 or img.dtype == np.float64:
-                            img = np.clip(img, 0, 1)
-                            img = (img * 255).astype(np.uint8)
-                        
-                        # NOW convert to RGB (after normalization)
-                        if len(img.shape) == 2:
-                            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                        elif len(img.shape) == 3 and img.shape[2] == 4:
-                            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-                        elif len(img.shape) == 3 and img.shape[2] == 3:
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        
-                        # Convert to QPixmap
-                        height, width, channels = img.shape
-                        bytes_per_line = width * channels
-                        q_image = QImage(img.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
-                        self.full_res_pixmap = QPixmap.fromImage(q_image.copy())
-                    else:
-                        raise Exception("OpenCV could not load TIFF")
-                        
-                except Exception as e:
-                    # Fallback to standard QPixmap loading
+            # === TIFF ===
+            elif file_ext.endswith('.tif') or file_ext.endswith('.tiff'):
+                pixmap, resolution_str = self._load_tiff_preview_pixmap(file_path_str, max_size=8192)
+                if pixmap and not pixmap.isNull():
+                    self.full_res_pixmap = pixmap
+                else:
+                    # Last fallback to Qt loader
                     self.full_res_pixmap = QPixmap(file_path_str)
             
             # === Standard images (JPG, PNG, etc.) ===
@@ -4278,145 +4250,16 @@ class PreviewPanel(QWidget):
                             except Exception as e:
                                 self.graphics_scene.clear()
                                 self.current_text_item = None
-                        # Special handling for 16-bit/32-bit TIFF files - use OpenCV for better support
-                        elif (file_ext.endswith('.tif') or file_ext.endswith('.tiff')) and OPENCV_AVAILABLE and NUMPY_AVAILABLE:
-                            try:
-                                import cv2
-                                import numpy as np
-                                
-                                # Read image with OpenCV (supports 16-bit and 32-bit TIFF)
-                                img = cv2.imread(file_path_str, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
-                                
-                                if img is not None:
-                                    # Get original size for resolution metadata
-                                    height, width = img.shape[:2]
-                                    resolution_str = f"{width} x {height}"
-                                    
-                                    # Normalize bit depth FIRST (before color conversion!)
-                                    if img.dtype == np.uint16:
-                                        # 16-bit image - normalize to 8-bit
-                                        img = (img / 256).astype(np.uint8)
-                                    elif img.dtype == np.float32 or img.dtype == np.float64:
-                                        # 32-bit float - simple clipping and normalization
-                                        img = np.clip(img, 0, 1)  # Clip to 0-1 range
-                                        img = (img * 255).astype(np.uint8)
-                                    
-                                    # NOW convert to RGB (after normalization)
-                                    if len(img.shape) == 2:
-                                        # Grayscale - convert to RGB
-                                        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                                    elif len(img.shape) == 3 and img.shape[2] == 4:
-                                        # RGBA - convert to RGB
-                                        img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-                                    elif len(img.shape) == 3 and img.shape[2] == 3:
-                                        # BGR - convert to RGB
-                                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                                    
-                                    # Resize for preview if too large
-                                    max_preview = 1024  # Higher quality for preview vs thumbnail
-                                    if width > max_preview or height > max_preview:
-                                        scale = min(max_preview / width, max_preview / height)
-                                        new_width = int(width * scale)
-                                        new_height = int(height * scale)
-                                        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-                                    
-                                    # Convert numpy array to QPixmap
-                                    height, width, channels = img.shape
-                                    bytes_per_line = width * channels
-                                    q_image = QImage(img.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
-                                    pixmap = QPixmap.fromImage(q_image.copy())
-                                    
-                                    if not pixmap.isNull():
-                                        self.current_pixmap = pixmap
-                                        self.add_to_cache(file_path_str, pixmap, resolution_str)
-                                        self.fit_pixmap_to_label()
-                                    else:
-                                        raise Exception("Failed to convert to QPixmap")
-                                else:
-                                    raise Exception("OpenCV could not load the TIFF image")
-                                    
-                            except Exception as e:
-                                print(f"TIFF OpenCV loading failed: {e}, trying QImageReader fallback...")
-                                # Fall back to QImageReader for standard TIFF handling
-                                image_reader = QImageReader(file_path_str)
-                                image_reader.setAllocationLimit(2048)  # 2 GB limit for large images
-                                image_reader.setAutoTransform(True)  # Auto-apply EXIF orientation
-                                
-                                original_size = image_reader.size()
-                                if original_size.isValid():
-                                    resolution_str = f"{original_size.width()} x {original_size.height()}"
-                                
-                                if original_size.width() > 1024 or original_size.height() > 1024:
-                                    if original_size.width() > original_size.height():
-                                        scaled_size = QSize(1024, int(1024 * original_size.height() / original_size.width()))
-                                    else:
-                                        scaled_size = QSize(int(1024 * original_size.width() / original_size.height()), 1024)
-                                    image_reader.setScaledSize(scaled_size)
-                                
-                                image = image_reader.read()
-                                if not image.isNull():
-                                    pixmap = QPixmap.fromImage(image)
-                                    
-                                    self.current_pixmap = pixmap
-                                    self.add_to_cache(file_path_str, pixmap, resolution_str)
-                                    self.fit_pixmap_to_label()
-                                else:
-                                    # QImageReader also failed - try tifffile for special formats
-                                    try:
-                                        import tifffile
-                                        import numpy as np
-                                        
-                                        # Read TIFF with tifffile (handles Affinity/compressed TIFFs)
-                                        img_array = tifffile.imread(file_path_str)
-                                        
-                                        # Get resolution
-                                        if len(img_array.shape) == 3:
-                                            height, width, channels = img_array.shape
-                                        else:
-                                            height, width = img_array.shape
-                                            channels = 1
-                                        resolution_str = f"{width} x {height}"
-                                        
-                                        # Normalize to 8-bit
-                                        if img_array.dtype == np.uint32:
-                                            # Affinity uses uint32 with limited range - normalize to actual min/max
-                                            img_min = img_array.min()
-                                            img_max = img_array.max()
-                                            if img_max > img_min:
-                                                img_array = ((img_array.astype(np.float64) - img_min) / (img_max - img_min) * 255).astype(np.uint8)
-                                            else:
-                                                img_array = np.zeros_like(img_array, dtype=np.uint8)
-                                        elif img_array.dtype == np.uint16:
-                                            img_array = (img_array / 256).astype(np.uint8)
-                                        elif img_array.dtype == np.float32 or img_array.dtype == np.float64:
-                                            img_array = (img_array * 255).astype(np.uint8)
-                                        
-                                        # Convert to RGB if needed
-                                        if len(img_array.shape) == 2:
-                                            img_array = np.stack([img_array, img_array, img_array], axis=2)
-                                        elif len(img_array.shape) == 3 and img_array.shape[2] > 3:
-                                            img_array = img_array[:, :, :3]
-                                        
-                                        # Resize if too large
-                                        from PIL import Image
-                                        pil_image = Image.fromarray(img_array)
-                                        if pil_image.width > 1024 or pil_image.height > 1024:
-                                            pil_image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-                                        
-                                        # Convert to QPixmap
-                                        img_array = np.array(pil_image)
-                                        height, width = img_array.shape[:2]
-                                        bytes_per_line = width * 3
-                                        q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
-                                        pixmap = QPixmap.fromImage(q_image.copy())
-                                        
-                                        self.current_pixmap = pixmap
-                                        self.add_to_cache(file_path_str, pixmap, resolution_str)
-                                        self.fit_pixmap_to_label()
-                                    except Exception as tiff_error:
-                                        print(f"tifffile also failed: {tiff_error}")
-                                        self.graphics_scene.clear()
-                                        self.current_text_item = None
+                        # TIFF: use the same robust loader as Quick View (PIL/tifffile first)
+                        elif file_ext.endswith('.tif') or file_ext.endswith('.tiff'):
+                            pixmap, resolution_str = self._load_tiff_preview_pixmap(file_path_str, max_size=1024)
+                            if pixmap and not pixmap.isNull():
+                                self.current_pixmap = pixmap
+                                self.add_to_cache(file_path_str, pixmap, resolution_str)
+                                self.fit_pixmap_to_label()
+                            else:
+                                self.graphics_scene.clear()
+                                self.current_text_item = None
                         elif file_ext.endswith(('.tga', '.psd')):
                             # TGA/PSD files - use PIL (Qt has allocation issues)
                             
@@ -5471,45 +5314,176 @@ class PreviewPanel(QWidget):
         Returns:
             QPixmap or None
         """
-        if not OPENCV_AVAILABLE or not NUMPY_AVAILABLE:
-            return None
-        
+        pixmap, _resolution = self._load_tiff_preview_pixmap(file_path, max_size=1024)
+        return pixmap
+
+    def _load_tiff_preview_pixmap(self, file_path, max_size=1024):
+        """Load TIFF preview pixmap with robust PIL/tifffile-first decoding."""
         try:
-            import cv2
-            import numpy as np
-            
-            # Read image with OpenCV
-            img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
-            
-            if img is None:
-                return None
-            
-            # Normalize bit depth FIRST (before color conversion!)
-            if img.dtype == np.uint16:
-                img = (img / 256).astype(np.uint8)
-            elif img.dtype == np.float32 or img.dtype == np.float64:
-                img = np.clip(img, 0, 1)
-                img = (img * 255).astype(np.uint8)
-            
-            # NOW convert to RGB (after normalization)
-            if len(img.shape) == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-            elif len(img.shape) == 3 and img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-            elif len(img.shape) == 3 and img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            # Convert to QPixmap
-            height, width, channels = img.shape
-            bytes_per_line = width * channels
-            q_image = QImage(img.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_image.copy())
-            
-            return pixmap if not pixmap.isNull() else None
-            
+            # 1) PIL first (matches Quick View behavior)
+            try:
+                from PIL import Image
+                import numpy as np
+
+                Image.MAX_IMAGE_PIXELS = None
+                pil_img = Image.open(file_path)
+                resolution_str = f"{pil_img.width} x {pil_img.height}"
+                pil_img = pil_img.convert('RGB')
+                if pil_img.width > max_size or pil_img.height > max_size:
+                    pil_img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+                img_array = np.array(pil_img)
+                h, w = img_array.shape[:2]
+                q_image = QImage(img_array.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(q_image.copy())
+                if pixmap and not pixmap.isNull():
+                    return pixmap, resolution_str
+            except Exception as pil_error:
+                if DEBUG_MODE:
+                    print(f"[Preview TIFF] PIL failed: {pil_error}")
+
+            # 2) tifffile for complex TIFF variants
+            try:
+                import tifffile
+                import numpy as np
+                from PIL import Image
+
+                img_array = tifffile.imread(file_path)
+                if img_array is None:
+                    return None, None
+
+                while getattr(img_array, 'ndim', 0) > 3:
+                    img_array = img_array[0]
+
+                if img_array.ndim == 2:
+                    h, w = img_array.shape
+                    resolution_str = f"{w} x {h}"
+                elif img_array.ndim == 3:
+                    h, w = img_array.shape[:2]
+                    resolution_str = f"{w} x {h}"
+                    ch = img_array.shape[2]
+                    if ch == 1:
+                        img_array = img_array[:, :, 0]
+                    elif ch == 2:
+                        img_array = img_array[:, :, 0]
+                    elif ch >= 4:
+                        img_array = img_array[:, :, :3]
+                else:
+                    return None, None
+
+                if img_array.dtype == np.bool_:
+                    img_array = img_array.astype(np.uint8) * 255
+                elif img_array.dtype == np.uint16:
+                    img_array = (img_array / 257).astype(np.uint8)
+                elif np.issubdtype(img_array.dtype, np.integer) and img_array.dtype != np.uint8:
+                    info = np.iinfo(img_array.dtype)
+                    denom = float(max(info.max - info.min, 1))
+                    img_array = ((img_array.astype(np.float32) - info.min) / denom * 255.0).astype(np.uint8)
+                elif np.issubdtype(img_array.dtype, np.floating):
+                    img_array = np.nan_to_num(img_array, nan=0.0, posinf=1.0, neginf=0.0)
+                    max_val = float(np.max(img_array)) if img_array.size else 0.0
+                    if max_val > 1.0:
+                        p99 = float(np.percentile(img_array, 99)) if img_array.size else 255.0
+                        scale_max = p99 if p99 > 0 else max_val
+                        img_array = np.clip(img_array / max(scale_max, 1e-6), 0.0, 1.0)
+                    else:
+                        img_array = np.clip(img_array, 0.0, 1.0)
+                    img_array = (img_array * 255.0).astype(np.uint8)
+
+                if img_array.ndim == 2:
+                    img_array = np.stack([img_array, img_array, img_array], axis=2)
+
+                pil_img = Image.fromarray(img_array)
+                if pil_img.width > max_size or pil_img.height > max_size:
+                    pil_img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+                img_array = np.array(pil_img)
+                h, w = img_array.shape[:2]
+                q_image = QImage(img_array.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(q_image.copy())
+                if pixmap and not pixmap.isNull():
+                    return pixmap, resolution_str
+            except Exception as tiff_error:
+                if DEBUG_MODE:
+                    print(f"[Preview TIFF] tifffile failed: {tiff_error}")
+
+            # 3) OpenCV fallback
+            if OPENCV_AVAILABLE and NUMPY_AVAILABLE:
+                try:
+                    import cv2
+                    import numpy as np
+
+                    img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
+                    if img is not None:
+                        if len(img.shape) == 2:
+                            h, w = img.shape
+                            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                        else:
+                            h, w = img.shape[:2]
+                            if img.shape[2] == 4:
+                                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+                            elif img.shape[2] == 3:
+                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                            elif img.shape[2] == 2:
+                                img = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2RGB)
+                            else:
+                                img = img[:, :, :3]
+
+                        resolution_str = f"{w} x {h}"
+
+                        if img.dtype == np.uint16:
+                            img = (img / 257).astype(np.uint8)
+                        elif np.issubdtype(img.dtype, np.floating):
+                            img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+                            max_val = float(np.max(img)) if img.size else 0.0
+                            if max_val > 1.0:
+                                img = np.clip(img, 0.0, 255.0)
+                            else:
+                                img = np.clip(img, 0.0, 1.0) * 255.0
+                            img = img.astype(np.uint8)
+                        elif img.dtype != np.uint8:
+                            img = np.clip(img, 0, 255).astype(np.uint8)
+
+                        if w > max_size or h > max_size:
+                            scale = min(max_size / w, max_size / h)
+                            nw = max(1, int(w * scale))
+                            nh = max(1, int(h * scale))
+                            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+                            h, w = nh, nw
+
+                        q_image = QImage(img.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+                        pixmap = QPixmap.fromImage(q_image.copy())
+                        if pixmap and not pixmap.isNull():
+                            return pixmap, resolution_str
+                except Exception as cv_error:
+                    if DEBUG_MODE:
+                        print(f"[Preview TIFF] OpenCV fallback failed: {cv_error}")
+
+            # 4) Qt reader final fallback
+            try:
+                image_reader = QImageReader(file_path)
+                image_reader.setAllocationLimit(2048)
+                image_reader.setAutoTransform(True)
+                original_size = image_reader.size()
+                resolution_str = f"{original_size.width()} x {original_size.height()}" if original_size.isValid() else None
+                if original_size.isValid() and (original_size.width() > max_size or original_size.height() > max_size):
+                    if original_size.width() > original_size.height():
+                        scaled_size = QSize(max_size, int(max_size * original_size.height() / original_size.width()))
+                    else:
+                        scaled_size = QSize(int(max_size * original_size.width() / original_size.height()), max_size)
+                    image_reader.setScaledSize(scaled_size)
+                image = image_reader.read()
+                if not image.isNull():
+                    return QPixmap.fromImage(image), resolution_str
+            except Exception as qt_error:
+                if DEBUG_MODE:
+                    print(f"[Preview TIFF] Qt fallback failed: {qt_error}")
+
+            return None, None
         except Exception as e:
-            print(f"TIFF fallback loading failed: {e}")
-            return None
+            if DEBUG_MODE:
+                print(f"[Preview TIFF] Loader error: {e}")
+            return None, None
     
     # Tag Management Methods
     

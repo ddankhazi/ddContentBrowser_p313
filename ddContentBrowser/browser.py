@@ -2962,6 +2962,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     
     def on_thumbnail_ready(self, file_path, pixmap):
         """Handle thumbnail ready from generator"""
+        if not pixmap or pixmap.isNull():
+            return
+
         # Use fast O(1) lookup instead of looping through all rows
         model = self.file_list.model()
         if model:
