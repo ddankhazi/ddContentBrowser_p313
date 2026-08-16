@@ -20,7 +20,8 @@ UI_FONT = "Segoe UI"
 # In Maya, append to avoid conflicting with Maya's own numpy/cv2/etc.
 # In standalone mode, insert at front so external_libs packages take priority.
 import sys
-_external_libs = os.path.join(os.path.dirname(__file__), "external_libs")
+from .utils import get_external_libs_dir
+_external_libs = get_external_libs_dir()
 if os.path.exists(_external_libs) and _external_libs not in sys.path:
     try:
         import maya.cmds  # noqa: F401
@@ -2147,14 +2148,52 @@ class MayaStyleListView(QListView):
         indexes = self.selectedIndexes()
         file_paths = []
         urls = []
+        texture_set_assets = []
         
         for index in indexes:
             if index.isValid():
                 asset = self.model().data(index, Qt.UserRole)
-                if asset and not asset.is_folder:
-                    file_path = str(asset.file_path)
-                    file_paths.append(file_path)
-                    urls.append(QUrl.fromLocalFile(file_path))
+                if not asset or asset.is_folder:
+                    continue
+                # Texture set: build shader graph on drop (do NOT drag the raw file URL)
+                if getattr(asset, 'is_texture_set', False) and getattr(asset, 'texture_set', None):
+                    texture_set_assets.append(asset)
+                    # For MMB (collections/batch import) keep a representative URL so the
+                    # internal drop handler still has something to work with.
+                    if is_middle_button:
+                        rep = str(asset.file_path)
+                        file_paths.append(rep)
+                        urls.append(QUrl.fromLocalFile(rep))
+                    continue
+                file_path = str(asset.file_path)
+                file_paths.append(file_path)
+                urls.append(QUrl.fromLocalFile(file_path))
+        
+        # Texture set drag -> stash payload and set the shader-build MEL command as text.
+        # Only for ALT/external (Windows-native) drags; MMB drops build via batch_import_files.
+        if texture_set_assets and not is_middle_button:
+            try:
+                from . import models as _models
+                _models._PENDING_TEXTURE_SET_DROP = {
+                    'sets': [
+                        {'name': a.texture_set.name, 'channels': a.texture_set.channel_paths}
+                        for a in texture_set_assets
+                    ]
+                }
+            except Exception as e:
+                print(f"[TextureSet] Failed to stash drop payload: {e}")
+            mime_data.setText(
+                'python("import ddContentBrowser.models as _m; _m.apply_pending_texture_set_drop()");'
+            )
+            drag.setMimeData(mime_data)
+            if is_middle_button:
+                self.middle_button_pressed = False
+                self.drag_start_position = None
+                self.drag_started = False
+                self.setCursor(Qt.ArrowCursor)
+                self.unsetCursor()
+            drag.exec_(supportedActions)
+            return
         
         if not urls:
             # No files to drag - reset state if middle button
@@ -2187,11 +2226,25 @@ class MayaStyleListView(QListView):
             return
         
         paths = []
+        texture_set_assets = []
         for index in indexes:
             if index.isValid():
                 asset = self.model().data(index, Qt.UserRole)
-                if asset and not asset.is_folder:
-                    paths.append(str(asset.file_path))
+                if not asset or asset.is_folder:
+                    continue
+                # Texture set -> build shader network instead of importing the base color file
+                if getattr(asset, 'is_texture_set', False) and getattr(asset, 'texture_set', None):
+                    texture_set_assets.append(asset)
+                    continue
+                paths.append(str(asset.file_path))
+        
+        # Build shader network(s) for any texture sets via the browser
+        if texture_set_assets:
+            browser = self.parent()
+            while browser and not hasattr(browser, '_build_texture_set_shaders'):
+                browser = browser.parent()
+            if browser and hasattr(browser, '_build_texture_set_shaders'):
+                browser._build_texture_set_shaders(texture_set_assets)
         
         if not paths:
             return
@@ -2202,10 +2255,16 @@ class MayaStyleListView(QListView):
             
             imported_count = 0
             failed_count = 0
-            
+
             # Get image extensions from config
             image_exts = get_extensions_by_category('images')
-            
+
+            # Find the browser instance once, for the auto-material hook below
+            # (same lookup pattern as _build_texture_set_shaders above)
+            browser = self.parent()
+            while browser and not hasattr(browser, '_try_auto_assign_texture_set_material'):
+                browser = browser.parent()
+
             for file_path in paths:
                 try:
                     file_ext = Path(file_path).suffix.lower()
@@ -2248,24 +2307,30 @@ class MayaStyleListView(QListView):
                         # Get Maya import type from config
                         file_type = get_maya_import_type(file_ext)
                         
+                        new_nodes = []
                         if file_type:
                             # Import with type specification
-                            cmds.file(file_path, i=True, type=file_type, ignoreVersion=True,
+                            new_nodes = cmds.file(file_path, i=True, type=file_type, ignoreVersion=True,
                                      mergeNamespacesOnClash=False, namespace=':',
-                                     options='v=0', preserveReferences=True)
+                                     options='v=0', preserveReferences=True, returnNewNodes=True) or []
                             imported_count += 1
                         else:
                             # Unknown format or no import type - try auto-detect
                             try:
-                                cmds.file(file_path, i=True, ignoreVersion=True,
+                                new_nodes = cmds.file(file_path, i=True, ignoreVersion=True,
                                          mergeNamespacesOnClash=False, namespace=':',
-                                         preserveReferences=True)
+                                         preserveReferences=True, returnNewNodes=True) or []
                                 imported_count += 1
                             except:
                                 # Skip unsupported file types
                                 failed_count += 1
                                 continue
-                    
+
+                        # Auto-build & assign a material from a matching texture
+                        # set (same folder or subfolders), if one is found
+                        if browser:
+                            browser._try_auto_assign_texture_set_material(file_path, new_nodes)
+
                 except Exception as e:
                     failed_count += 1
             
@@ -2392,7 +2457,12 @@ class DragDropCollectionListWidget(QListWidget):
         for index in indexes:
             if index.isValid():
                 asset = source.model().data(index, Qt.UserRole)
-                if asset and not asset.is_folder:
+                if not asset or asset.is_folder:
+                    continue
+                if getattr(asset, 'is_texture_set', False) and asset.texture_set:
+                    # Add every file that makes up the set, not just the representative thumbnail
+                    file_paths.extend(str(f) for f in asset.texture_set.files)
+                else:
                     file_paths.append(str(asset.file_path))
         
         if file_paths:
@@ -2401,6 +2471,18 @@ class DragDropCollectionListWidget(QListWidget):
             event.acceptProposedAction()
         else:
             event.ignore()
+
+
+def _resize_float_rgb(img, new_width, new_height):
+    """Resize a float32 (H,W,C) image without cv2 (avoids numpy/cv2 ABI mismatch)."""
+    import numpy as np
+    from PIL import Image
+    channels = []
+    for c in range(img.shape[2]):
+        ch = np.ascontiguousarray(img[:, :, c], dtype=np.float32)
+        pil = Image.fromarray(ch, mode='F').resize((new_width, new_height), Image.BILINEAR)
+        channels.append(np.asarray(pil, dtype=np.float32))
+    return np.stack(channels, axis=2)
 
 
 def load_oiio_image_array(file_path, max_size=2048, mip_level=0):
@@ -2419,7 +2501,8 @@ def load_oiio_image_array(file_path, max_size=2048, mip_level=0):
     try:
         import sys
         import os
-        external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+        from .utils import get_external_libs_dir
+        external_libs = get_external_libs_dir()
         if external_libs not in sys.path:
             sys.path.append(external_libs)
         
@@ -2488,8 +2571,7 @@ def load_oiio_image_array(file_path, max_size=2048, mip_level=0):
             if new_width < 1 or new_height < 1:
                 return None
             
-            import cv2
-            img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+            img = _resize_float_rgb(img, new_width, new_height)
         
         # Return as float32 [0-inf] - caller will handle tone mapping
         # This allows HDR/ACEScg color management in the worker thread
@@ -2517,7 +2599,8 @@ def load_oiio_image(file_path, max_size=2048, mip_level=0, exposure=0.0, metadat
     try:
         import sys
         import os
-        external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+        from .utils import get_external_libs_dir
+        external_libs = get_external_libs_dir()
         if external_libs not in sys.path:
             sys.path.append(external_libs)
         
@@ -2618,8 +2701,7 @@ def load_oiio_image(file_path, max_size=2048, mip_level=0, exposure=0.0, metadat
             if new_width < 1 or new_height < 1:
                 return None, None, None
             
-            import cv2
-            img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+            img = _resize_float_rgb(img, new_width, new_height)
             width, height = new_width, new_height
         
         # Detect ACES color space

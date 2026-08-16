@@ -708,11 +708,13 @@ class ThumbnailGenerator(QThread):
                             already_processing = True
                     
                     if not already_processing:
-                        # For sequences, use pattern as cache key instead of file path
+                        # For sequences/texture sets, use a stable pattern/name as cache key
                         cache_key = file_path
                         is_sequence = asset and asset.is_sequence and asset.sequence
                         if is_sequence:
                             cache_key = str(asset.sequence.pattern)
+                        elif asset and getattr(asset, 'is_texture_set', False) and asset.texture_set:
+                            cache_key = "texset::" + str(asset.texture_set.directory) + "::" + str(asset.texture_set.name)
                         
                         if DEBUG_MODE:
                             print(f"[CACHE-THREAD] Processing: {Path(file_path).name}")
@@ -1052,9 +1054,13 @@ class ThumbnailGenerator(QThread):
                 else:
                     height, width = img_array.shape[:2]
             
-            # Ensure uint8
-            if img_array.dtype != np.uint8:
-                if np.issubdtype(img_array.dtype, np.floating):
+            # Ensure uint8 — use dtype.kind/itemsize instead of np.issubdtype.
+            # np.issubdtype can hit an infinite-recursion crash when another tool
+            # shadows numpy on sys.path (numpy version conflict).
+            _kind = img_array.dtype.kind
+            _isize = img_array.dtype.itemsize
+            if not (_kind == 'u' and _isize == 1):
+                if _kind == 'f':
                     # Handle float TIFF data robustly (NaN/Inf and ranges > 1.0).
                     img_array = np.nan_to_num(img_array, nan=0.0, posinf=1.0, neginf=0.0)
                     max_val = float(np.max(img_array)) if img_array.size else 0.0
@@ -1063,7 +1069,7 @@ class ThumbnailGenerator(QThread):
                     else:
                         img_array = np.clip(img_array, 0.0, 1.0) * 255.0
                     img_array = img_array.astype(np.uint8)
-                elif img_array.dtype == np.uint16:
+                elif _kind == 'u' and _isize == 2:
                     img_array = (img_array / 257).astype(np.uint8)
                 else:
                     img_array = np.clip(img_array, 0, 255).astype(np.uint8)
@@ -1104,16 +1110,21 @@ class ThumbnailGenerator(QThread):
             elif channels == 1:
                 q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_Grayscale8)
             else:
-                if DEBUG_MODE:
-                    print(f"[PIXMAP] Unsupported channel count: {channels}")
+                print(f"[PIXMAP] Unsupported channel count: {channels}")
+                return None
+            
+            if q_image.isNull():
+                print(f"[PIXMAP] Null QImage (w={width}, h={height}, ch={channels}, dtype={img_array.dtype}, shape={img_array.shape})")
                 return None
             
             pixmap = QPixmap.fromImage(q_image.copy())
+            if pixmap.isNull():
+                print(f"[PIXMAP] Null QPixmap (w={width}, h={height}, ch={channels}, dtype={img_array.dtype}, shape={img_array.shape})")
+                return None
             return pixmap
             
         except Exception as e:
-            if DEBUG_MODE:
-                print(f"[PIXMAP] Error converting to QPixmap: {e}")
+            print(f"[PIXMAP] Error converting to QPixmap: {type(e).__name__}: {e}")
             return None
     
     def _generate_thumbnail_data(self, file_path, asset=None):
@@ -1141,6 +1152,12 @@ class ThumbnailGenerator(QThread):
                 middle_frame_path = asset.sequence.get_middle_frame()
                 if middle_frame_path:
                     file_path = middle_frame_path
+            
+            # Texture set: use the representative (baseColor) file for the thumbnail
+            if asset and getattr(asset, 'is_texture_set', False) and asset.texture_set:
+                rep_path = asset.texture_set.get_thumbnail_path()
+                if rep_path:
+                    file_path = rep_path
             
             extension = os.path.splitext(str(file_path))[1].lower()
             
@@ -1461,15 +1478,15 @@ class ThumbnailGenerator(QThread):
                 else:
                     return None
 
-                if img_array.dtype == np.bool_:
+                if img_array.dtype.kind == 'b':
                     img_array = img_array.astype(np.uint8) * 255
-                elif img_array.dtype == np.uint16:
+                elif img_array.dtype.kind == 'u' and img_array.dtype.itemsize == 2:
                     img_array = (img_array / 257).astype(np.uint8)
-                elif np.issubdtype(img_array.dtype, np.integer) and img_array.dtype != np.uint8:
+                elif img_array.dtype.kind in ('i', 'u') and not (img_array.dtype.kind == 'u' and img_array.dtype.itemsize == 1):
                     info = np.iinfo(img_array.dtype)
                     denom = float(max(info.max - info.min, 1))
                     img_array = ((img_array.astype(np.float32) - info.min) / denom * 255.0).astype(np.uint8)
-                elif np.issubdtype(img_array.dtype, np.floating):
+                elif img_array.dtype.kind == 'f':
                     img_array = np.nan_to_num(img_array, nan=0.0, posinf=1.0, neginf=0.0)
                     max_val = float(np.max(img_array)) if img_array.size else 0.0
                     if max_val > 1.0:
@@ -2009,7 +2026,8 @@ class ThumbnailGenerator(QThread):
         import os
         
         # Add external_libs to path
-        external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+        from .utils import get_external_libs_dir
+        external_libs = get_external_libs_dir()
         if external_libs not in sys.path:
             sys.path.append(external_libs)
         
@@ -2110,7 +2128,8 @@ class ThumbnailGenerator(QThread):
         import os
         
         # Add external_libs to path for PIL import
-        external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+        from .utils import get_external_libs_dir
+        external_libs = get_external_libs_dir()
         if external_libs not in sys.path:
             sys.path.append(external_libs)
         
@@ -3480,7 +3499,8 @@ class ThumbnailGenerator(QThread):
         import os
         
         # Add external_libs to path
-        external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+        from .utils import get_external_libs_dir
+        external_libs = get_external_libs_dir()
         if external_libs not in sys.path:
             sys.path.append(external_libs)
         
@@ -3620,7 +3640,7 @@ class ThumbnailGenerator(QThread):
                         print(f"[EXR-OPT] → Loaded data: shape={rgb.shape}, dtype={rgb.dtype}")
                     
                     # Check if dtype is numeric (deep EXR returns object arrays)
-                    if rgb.dtype == np.object_ or not np.issubdtype(rgb.dtype, np.number):
+                    if rgb.dtype.kind not in ('i', 'u', 'f', 'c'):
                         raise Exception(f"Non-numeric dtype: {rgb.dtype} (deep/volumetric EXR not supported)")
                     
                     # Convert float16 to float32 (OpenCV resize needs float32)

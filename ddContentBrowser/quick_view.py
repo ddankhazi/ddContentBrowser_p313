@@ -1232,7 +1232,8 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                     try:
                         import sys
                         import os
-                        external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+                        from .utils import get_external_libs_dir
+                        external_libs = get_external_libs_dir()
                         if external_libs not in sys.path:
                             sys.path.append(external_libs)
                         
@@ -1287,7 +1288,8 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                         import time
                         import sys
                         import os
-                        external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+                        from .utils import get_external_libs_dir
+                        external_libs = get_external_libs_dir()
                         if external_libs not in sys.path:
                             sys.path.append(external_libs)
                         
@@ -1381,10 +1383,11 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                             try:
                                 import sys
                                 import os
-                                external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+                                from .utils import get_external_libs_dir
+                                external_libs = get_external_libs_dir()
                                 if external_libs not in sys.path:
                                     sys.path.append(external_libs)
-                                
+
                                 from PIL import Image
                                 pil_image = Image.open(str(file_path))
                                 

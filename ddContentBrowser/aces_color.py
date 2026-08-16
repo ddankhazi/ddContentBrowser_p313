@@ -379,10 +379,11 @@ def auto_tag_file_colorspace(file_path, metadata_manager=None):
         try:
             # Try to read EXR metadata for detection
             import sys
-            external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+            from .utils import get_external_libs_dir
+            external_libs = get_external_libs_dir()
             if external_libs not in sys.path:
                 sys.path.append(external_libs)
-            
+
             import OpenEXR
             with OpenEXR.File(str(file_path)) as exr_file:
                 header = exr_file.header()

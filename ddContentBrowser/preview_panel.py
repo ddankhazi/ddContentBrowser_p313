@@ -1322,7 +1322,8 @@ class PreviewPanel(QWidget):
             import os
             
             # Add external_libs to path
-            external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+            from .utils import get_external_libs_dir
+            external_libs = get_external_libs_dir()
             if external_libs not in sys.path:
                 sys.path.append(external_libs)
             
@@ -1483,7 +1484,8 @@ class PreviewPanel(QWidget):
             import numpy as np
             
             # Add external_libs to path
-            external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+            from .utils import get_external_libs_dir
+            external_libs = get_external_libs_dir()
             if external_libs not in sys.path:
                 sys.path.append(external_libs)
             
@@ -3291,10 +3293,11 @@ class PreviewPanel(QWidget):
                     try:
                         import sys
                         import os
-                        external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+                        from .utils import get_external_libs_dir
+                        external_libs = get_external_libs_dir()
                         if external_libs not in sys.path:
                             sys.path.append(external_libs)
-                        
+
                         from PIL import Image
                         # Disable decompression bomb warning for large images
                         Image.MAX_IMAGE_PIXELS = None
@@ -3393,7 +3396,8 @@ class PreviewPanel(QWidget):
                             try:
                                 import sys
                                 import os
-                                external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+                                from .utils import get_external_libs_dir
+                                external_libs = get_external_libs_dir()
                                 if external_libs not in sys.path:
                                     sys.path.append(external_libs)
                                 
@@ -4270,7 +4274,8 @@ class PreviewPanel(QWidget):
                                     import time
                                     import sys
                                     import os
-                                    external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+                                    from .utils import get_external_libs_dir
+                                    external_libs = get_external_libs_dir()
                                     if external_libs not in sys.path:
                                         sys.path.append(external_libs)
                                     
@@ -4356,7 +4361,8 @@ class PreviewPanel(QWidget):
                                 try:
                                     import sys
                                     import os
-                                    external_libs = os.path.join(os.path.dirname(__file__), 'external_libs')
+                                    from .utils import get_external_libs_dir
+                                    external_libs = get_external_libs_dir()
                                     if external_libs not in sys.path:
                                         sys.path.append(external_libs)
                                     
@@ -4535,7 +4541,19 @@ class PreviewPanel(QWidget):
                 missing_count = len(seq.missing_frames)
                 self.add_metadata_row("⚠️", "Missing", f"{missing_count} frames")
             self.add_metadata_row("💾", "Total Size", self.format_file_size(seq.total_size))
-        
+
+        # If this is a texture set, add texture-set-specific metadata (which files make it up)
+        if getattr(asset, 'is_texture_set', False) and asset.texture_set:
+            ts = asset.texture_set
+            self.add_metadata_row("🧩", "Texture Set", f"{len(ts.files)} files")
+            self.add_metadata_row("💾", "Total Size", self.format_file_size(ts.total_size))
+            for channel_key in sorted(ts.channels.keys()):
+                names = ", ".join(f.name for f in ts.channels[channel_key])
+                self.add_metadata_row("🎨", channel_key, names)
+            if ts.extra_formats:
+                extra_names = ", ".join(f.name for f in ts.extra_formats)
+                self.add_metadata_row("⚠️", f"+{len(ts.extra_formats)} Alt. Format(s)", extra_names)
+
         # If this is a video file, add video-specific metadata
         if asset.is_video_file:
             try:
@@ -5371,15 +5389,15 @@ class PreviewPanel(QWidget):
                 else:
                     return None, None
 
-                if img_array.dtype == np.bool_:
+                if img_array.dtype.kind == 'b':
                     img_array = img_array.astype(np.uint8) * 255
-                elif img_array.dtype == np.uint16:
+                elif img_array.dtype.kind == 'u' and img_array.dtype.itemsize == 2:
                     img_array = (img_array / 257).astype(np.uint8)
-                elif np.issubdtype(img_array.dtype, np.integer) and img_array.dtype != np.uint8:
+                elif img_array.dtype.kind in ('i', 'u') and not (img_array.dtype.kind == 'u' and img_array.dtype.itemsize == 1):
                     info = np.iinfo(img_array.dtype)
                     denom = float(max(info.max - info.min, 1))
                     img_array = ((img_array.astype(np.float32) - info.min) / denom * 255.0).astype(np.uint8)
-                elif np.issubdtype(img_array.dtype, np.floating):
+                elif img_array.dtype.kind == 'f':
                     img_array = np.nan_to_num(img_array, nan=0.0, posinf=1.0, neginf=0.0)
                     max_val = float(np.max(img_array)) if img_array.size else 0.0
                     if max_val > 1.0:
@@ -5431,9 +5449,9 @@ class PreviewPanel(QWidget):
 
                         resolution_str = f"{w} x {h}"
 
-                        if img.dtype == np.uint16:
+                        if img.dtype.kind == 'u' and img.dtype.itemsize == 2:
                             img = (img / 257).astype(np.uint8)
-                        elif np.issubdtype(img.dtype, np.floating):
+                        elif img.dtype.kind == 'f':
                             img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
                             max_val = float(np.max(img)) if img.size else 0.0
                             if max_val > 1.0:

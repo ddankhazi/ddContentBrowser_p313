@@ -3,6 +3,28 @@ DD Content Browser - Utility Functions
 Helper functions for Maya integration and common operations
 """
 
+import os
+import sys
+
+
+def get_external_libs_dir():
+    """
+    Return the external_libs folder matching the running interpreter's ABI.
+
+    The bundled binary wheels (numpy, Pillow, OpenEXR, scikit-image, scipy,
+    psd-tools, aggdraw, ...) are compiled for a specific CPython version and
+    won't import under a different one. external_libs/ is the default build
+    (currently Python 3.13, for newer Maya); external_libs_py311/ is a
+    Python 3.11 build (for Maya 2025/2026). Falls back to external_libs/ if
+    no version-specific folder matches the running interpreter.
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    versioned = os.path.join(base, f'external_libs_py{sys.version_info.major}{sys.version_info.minor}')
+    if os.path.isdir(versioned):
+        return versioned
+    return os.path.join(base, 'external_libs')
+
+
 # Maya imports
 try:
     import maya.cmds as cmds
@@ -151,6 +173,14 @@ FILE_TYPE_REGISTRY = {
         "generate_thumbnail": False,
         "is_3d": False
     }
+}
+
+# The browser shows every file by default (see is_extension_supported()) so users
+# don't have to register each format they care about. These extensions are pure
+# filesystem/editor noise, so they default to disabled instead - still visible if
+# the user explicitly re-enables them via Settings -> File Formats.
+DEFAULT_DISABLED_EXTENSIONS = {
+    ".tmp", ".bak", ".old", ".log", ".lock", ".swp", ".cache", ".pyc",
 }
 
 
@@ -395,19 +425,24 @@ def get_default_icon_colors(extension):
     return color_schemes.get(extension, ([100, 100, 100], [150, 150, 150]))
 
 
+# Extension -> Maya import type string. Single source of truth, also used by
+# the Settings -> File Formats editor to build its "Maya Import Type" dropdown
+# (so the two never drift apart again).
+MAYA_IMPORT_TYPES = {
+    '.ma': 'mayaAscii',
+    '.mb': 'mayaBinary',
+    '.obj': 'OBJ',
+    '.fbx': 'FBX',
+    '.abc': 'Alembic',
+    '.usd': 'USD Import',
+    '.dae': 'DAE_FBX',
+    '.stl': 'STL'
+}
+
+
 def get_default_maya_import_type(extension):
     """Get default Maya import type for extension"""
-    maya_import_types = {
-        '.ma': 'mayaAscii',
-        '.mb': 'mayaBinary',
-        '.obj': 'OBJ',
-        '.fbx': 'FBX',
-        '.abc': 'Alembic',
-        '.usd': 'USD Import',
-        '.dae': 'DAE_FBX',
-        '.stl': 'STL'
-    }
-    return maya_import_types.get(extension, None)
+    return MAYA_IMPORT_TYPES.get(extension, None)
 
 
 def get_default_thumbnail_method(extension):
@@ -673,10 +708,11 @@ def get_extension_config(extension):
             "maya_import_type": maya_import_type
         }
     
-    # Final fallback: safe defaults
+    # Final fallback: unknown extensions are shown by default (opt-out model),
+    # except for known filesystem/editor noise (see DEFAULT_DISABLED_EXTENSIONS).
     return {
         "category": "unknown",
-        "enabled": True,
+        "enabled": extension not in DEFAULT_DISABLED_EXTENSIONS,
         "show_in_filters": True,
         "icon_color_primary": [100, 100, 100],
         "icon_color_secondary": [150, 150, 150],
@@ -927,4 +963,529 @@ def format_sequence_pattern(base_name: str, padding: int, separator: str, extens
         return f"{base_name}%0{padding}d{extension}"
     else:
         return f"{base_name}{separator}{'#' * padding}{extension}"
+
+
+# ============================================================
+# Texture Set detection (PBR channels grouped by shared base name)
+# ============================================================
+
+# Canonical channel -> filename suffix aliases. Kept aligned with
+# smart_imports/ddShaderNetworkGenerator.json so grouping and shader
+# building agree on which suffix maps to which material channel.
+TEXTURE_CHANNEL_ALIASES = {
+    "baseColor":    ["basecolor", "base_color", "albedo", "diffuse", "diffuse_color", "diff", "color", "col"],
+    "roughness":    ["roughness", "rough", "glossiness", "gloss"],
+    "metalness":    ["metalness", "metallic", "metal", "met"],
+    "normal":       ["normal", "normalmap", "normal_gl", "normal_dx", "normalgl", "normaldx", "nrm", "nor", "norm", "n"],
+    # High-poly-only normal variant (baked bump-into-normal for the "High" LOD).
+    # Two unrelated naming conventions map to the same channel: the compound
+    # "NormalBump"/"BumpNormal", and a plain "Normal" with an "_HF" (High
+    # Frequency) suffix - both are used the same way, only for High geo.
+    "normalHigh":   ["normalbump", "bumpnormal", "normal_hf", "normalhf"],
+    "bump":         ["bump", "bumpmap"],
+    "height":       ["height", "heightmap", "bumpheight"],
+    "displacement": ["displacement", "disp", "displ", "displace"],
+    "emission":     ["emission", "emissive", "emit"],
+    "opacity":      ["opacity", "alpha", "cutout", "cutoutopacity", "mask"],
+    "transmission": ["transmission", "refraction", "refract"],
+    "ao":           ["ao", "ambientocclusion", "ambient_occlusion", "occlusion", "occ"],
+    "cavity":       ["cavity"],
+    "specular":     ["specular", "spec"],
+}
+
+# Channels that are recognized/grouped for organization but are never wired
+# into a shader network by the material builder (not valid PBR inputs for an
+# Albedo/Metalness/Roughness workflow, and not needed for Arnold renders).
+TEXTURE_CHANNELS_NEVER_WIRED = {"ao", "cavity", "specular"}
+
+# Real image extensions that can appear as a "fake" embedded extension in a
+# .tx filename (RenderMan's txmake often keeps the source format before the
+# real .tx, e.g. "Albedo_sRGB_ACEScg.jpg.tx"). Used only for .tx parsing.
+_TX_SOURCE_FORMAT_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.exr', '.hdr', '.tga', '.psd', '.gif',
+}
+
+
+def _build_texture_alias_lookup():
+    """Flatten aliases into (alias, channel) pairs sorted by alias length desc."""
+    pairs = []
+    for channel, aliases in TEXTURE_CHANNEL_ALIASES.items():
+        for alias in aliases:
+            pairs.append((alias.lower(), channel))
+    pairs.sort(key=lambda x: len(x[0]), reverse=True)
+    return pairs
+
+
+_TEXTURE_ALIAS_LOOKUP = _build_texture_alias_lookup()
+
+
+def _match_channel_suffix(s):
+    """Match the longest known channel alias as a trailing token of s.
+    Returns (base, channel), or (None, None) if nothing matches."""
+    low = s.lower()
+    for alias, channel in _TEXTURE_ALIAS_LOOKUP:
+        for sep in ('_', '-', '.'):
+            token = sep + alias
+            if low.endswith(token):
+                base = s[:len(s) - len(token)]
+                if base:
+                    return base, channel
+    return None, None
+
+
+_LOD_REGEX = re.compile(r'[._-]lod(\d+)$', re.IGNORECASE)
+
+
+def parse_texture_filename(stem: str, extension: str = None):
+    """
+    Parse a texture filename stem into (set_base, channel, udim, lod).
+
+    Strips a trailing UDIM (1xxx) token, then a trailing LOD tag (e.g.
+    "_LOD0", "_LOD5" - a mesh-resolution-specific override, common in
+    Megascans-style libraries where most channels are shared across LODs but
+    e.g. normal maps have per-LOD variants), then matches the longest channel
+    alias as a trailing token separated by _ . or -.
+
+    .tx files (pass extension='.tx') can use one of two naming styles:
+        Albedo.tx                    - plain
+        Albedo_sRGB_ACEScg.jpg.tx    - annotated: colorspace tokens + the
+                                        "fake" source format before the real
+                                        .tx extension
+    Both resolve to the same (base, channel). The fake source-format
+    extension is stripped first, then up to 2 trailing "_token" segments are
+    stripped one at a time (retrying the channel match after each) - this
+    doesn't hardcode actual colorspace names (sRGB, ACEScg, Raw, ...) since
+    those vary widely across pipelines; it just tries "channel name plus 0,
+    1, or 2 extra tokens after it".
+
+    Returns:
+        (set_base, channel_key, udim, lod) if a channel suffix was found,
+        otherwise (stem, None, None, None). lod is a string like "LOD0", or
+        None if the filename has no LOD tag.
+    """
+    s = stem
+    udim = None
+    m = re.search(r'[._-](1\d{3})$', s)
+    if m:
+        udim = m.group(1)
+        s = s[:m.start()]
+
+    lod = None
+    m = _LOD_REGEX.search(s)
+    if m:
+        lod = f"LOD{m.group(1)}"
+        s = s[:m.start()]
+
+    if extension and extension.lower() == '.tx':
+        fake_ext = Path(s).suffix.lower()
+        if fake_ext in _TX_SOURCE_FORMAT_EXTENSIONS:
+            s = s[:-len(fake_ext)]
+
+        for attempt in range(3):  # 0, 1, then 2 trailing tokens stripped
+            base, channel = _match_channel_suffix(s)
+            if channel:
+                return base, channel, udim, lod
+            if attempt == 2 or '_' not in s:
+                break
+            s = s.rsplit('_', 1)[0]
+        return stem, None, None, None
+
+    base, channel = _match_channel_suffix(s)
+    if channel:
+        return base, channel, udim, lod
+    return stem, None, None, None
+
+
+# When the same (base name, channel, UDIM) exists in more than one file format
+# (e.g. Wall_baseColor.png AND Wall_baseColor.exr), only the highest-priority
+# extension is kept as part of the set; the rest are demoted to loose files.
+# Lower index = higher priority. .psd isn't typically wired directly into a
+# shader network, and .gif isn't a production texture format, so both sink to
+# the bottom; unrecognized extensions rank even lower than those. .tx is not
+# in this list - it never competes here, see group_texture_sets() below.
+_TEXTURE_EXTENSION_PRIORITY = [
+    '.exr', '.hdr', '.tif', '.tiff', '.png', '.jpg', '.jpeg', '.tga', '.psd', '.gif',
+]
+
+
+def _texture_extension_rank(path: Path) -> int:
+    """Lower = higher priority. Extensions outside the known list rank last."""
+    try:
+        return _TEXTURE_EXTENSION_PRIORITY.index(path.suffix.lower())
+    except ValueError:
+        return len(_TEXTURE_EXTENSION_PRIORITY)
+
+
+def _group_texture_sets_single_pass(file_paths: List[Path]):
+    """
+    Core grouping pass, run separately per extension partition (see
+    group_texture_sets). Groups files sharing a base name into sets covering
+    >= 2 distinct (channel, UDIM, LOD) variants - e.g. baseColor+roughness,
+    a single channel split across >= 2 UDIM tiles, or a channel with
+    per-LOD overrides (e.g. Normal_LOD0 + Normal_LOD5). Files that share
+    base name, channel, UDIM AND LOD (e.g. the same map exported as both
+    .png and .exr) describe the same variant, not two: only the
+    higher-priority format (see _TEXTURE_EXTENSION_PRIORITY) is kept in the
+    set, the other is demoted to a loose file.
+    """
+    sets = {}
+    singles = []
+
+    for path in file_paths:
+        base, channel, udim, lod = parse_texture_filename(path.stem, path.suffix)
+        if channel is None:
+            singles.append(path)
+            continue
+        key = base.lower()
+        if key not in sets:
+            sets[key] = {'display': base, 'variants': {}, 'extra_formats': []}
+
+        variant_key = (channel, udim, lod)
+        variants = sets[key]['variants']
+        existing = variants.get(variant_key)
+        if existing is None:
+            variants[variant_key] = path
+        elif _texture_extension_rank(path) < _texture_extension_rank(existing):
+            # New file's format outranks the one we already picked - swap in,
+            # demote the previous winner to a loose file, but remember it
+            # belonged to this set (surfaced as a "+N" badge indicator).
+            variants[variant_key] = path
+            sets[key]['extra_formats'].append(existing)
+        else:
+            sets[key]['extra_formats'].append(path)
+
+    result_sets = {}
+    for key, data in sets.items():
+        variants = data['variants']
+        # A real set needs >= 2 distinct (channel, UDIM, LOD) variants.
+        if len(variants) >= 2:
+            channels = {}
+            files = []
+            for (channel, _udim, _lod), path in variants.items():
+                channels.setdefault(channel, []).append(path)
+                files.append(path)
+            result_sets[data['display']] = {
+                'display': data['display'],
+                'channels': channels,
+                'files': files,
+                'extra_formats': data['extra_formats'],
+                # Raw (channel, UDIM, LOD) -> file lookup, for consumers that
+                # need to pick a specific LOD/UDIM variant (e.g. a future
+                # geo-import material builder). Not used by grouping/display
+                # yet, kept here so that info isn't thrown away.
+                'variant_map': dict(variants),
+            }
+            singles.extend(data['extra_formats'])
+        else:
+            singles.extend(variants.values())
+            singles.extend(data['extra_formats'])
+
+    return result_sets, singles
+
+
+def _is_annotated_tx(path: Path) -> bool:
+    """
+    True if a .tx filename carries a "fake" source-format extension before
+    the real .tx (e.g. "Albedo_sRGB_ACEScg.jpg.tx") - RenderMan txmake's
+    colorspace-tagged naming style, as opposed to a plain "Albedo.tx" export.
+    """
+    return Path(path.stem).suffix.lower() in _TX_SOURCE_FORMAT_EXTENSIONS
+
+
+def _merge_set_group(result_sets: dict, group_sets: dict, label: str):
+    """Merge group_sets into result_sets, renaming on name collision using `label`."""
+    for display_name, data in group_sets.items():
+        name = display_name
+        if name in result_sets:
+            name = f"{display_name} ({label})"
+            n = 2
+            while name in result_sets:
+                name = f"{display_name} ({label} {n})"
+                n += 1
+        data['display'] = name
+        result_sets[name] = data
+
+
+def group_texture_sets(file_paths: List[Path]):
+    """
+    Group texture files into texture sets by shared base name.
+
+    Files are first split into three independent pools, each grouped on its
+    own (never mixed/deduped across pools even if they'd share a base name):
+      1. Non-.tx "source" files.
+      2. Plain .tx exports (e.g. "Albedo.tx") - pre-baked, render-ready
+         textures, a distinct build output from the source files.
+      3. Colorspace-tagged .tx exports (e.g. "Albedo_sRGB_ACEScg.jpg.tx") -
+         a separate .tx export batch from #2, identified by the "fake"
+         source-format extension embedded before the real .tx. Even though a
+         plain and a tagged .tx can resolve to the same (channel, UDIM), they
+         come from different export batches and must stay separate sets, not
+         collapse into one set with a "+1 alternate format".
+
+    Args:
+        file_paths: List of Path objects (images only)
+
+    Returns:
+        (sets, singles) where:
+            sets: dict[str set_base] -> {
+                'display': str,
+                'channels': dict[channel_key] -> list[Path],
+                'files': list[Path],
+                'extra_formats': list[Path]  # demoted same-variant duplicates
+            }
+            singles: list[Path] that did not belong to any set
+    """
+    other_files = [p for p in file_paths if p.suffix.lower() != '.tx']
+    tx_plain_files = [p for p in file_paths if p.suffix.lower() == '.tx' and not _is_annotated_tx(p)]
+    tx_annotated_files = [p for p in file_paths if p.suffix.lower() == '.tx' and _is_annotated_tx(p)]
+
+    other_sets, other_singles = _group_texture_sets_single_pass(other_files)
+    tx_plain_sets, tx_plain_singles = _group_texture_sets_single_pass(tx_plain_files)
+    tx_annotated_sets, tx_annotated_singles = _group_texture_sets_single_pass(tx_annotated_files)
+
+    result_sets = dict(other_sets)
+    _merge_set_group(result_sets, tx_plain_sets, "TX")
+    _merge_set_group(result_sets, tx_annotated_sets, "TX Annotated")
+
+    singles = other_singles + tx_plain_singles + tx_annotated_singles
+    return result_sets, singles
+
+
+# Channel priority for choosing a texture set's representative (thumbnail) file.
+_TEXTURE_SET_THUMBNAIL_PRIORITY = [
+    "baseColor", "emission", "roughness", "metalness", "normal",
+    "height", "displacement", "opacity", "transmission", "ao",
+]
+
+
+def get_texture_set_thumbnail_path(channels: dict):
+    """Pick the representative file for a texture set (prefer baseColor)."""
+    for channel in _TEXTURE_SET_THUMBNAIL_PRIORITY:
+        files = channels.get(channel)
+        if files:
+            return files[0]
+    # Fallback: any file
+    for files in channels.values():
+        if files:
+            return files[0]
+    return None
+
+
+# ============================================================
+# Geo-import -> texture set matching (auto material build on import)
+# ============================================================
+
+_GEO_SUFFIX_REGEX = re.compile(r'_(High|LOD\d+)$', re.IGNORECASE)
+_RESOLUTION_TAG_REGEX = re.compile(r'_(\d+K)$', re.IGNORECASE)
+_TX_SET_SUFFIX_REGEX = re.compile(r' \(TX(?: Annotated)?(?: \d+)?\)$')
+_VAR_FOLDER_REGEX = re.compile(r'^Var\d+$', re.IGNORECASE)
+
+
+def strip_geo_suffix(name: str):
+    """
+    Strip a trailing mesh-resolution suffix from a geo file's base name.
+
+    Returns (base, suffix) where suffix is 'high', 'LOD0', 'LOD5', etc.
+    (normalized), or (name, None) if there's no such suffix.
+    """
+    m = _GEO_SUFFIX_REGEX.search(name)
+    if not m:
+        return name, None
+    raw = m.group(1)
+    base = name[:m.start()]
+    if raw.lower() == 'high':
+        return base, 'high'
+    return base, 'LOD' + raw[3:]
+
+
+def _strip_resolution_tag(name: str):
+    """Strip a trailing _<N>K resolution tag. Returns (base, tag) where tag
+    is like '4K' (normalized uppercase), or (name, None) if absent."""
+    m = _RESOLUTION_TAG_REGEX.search(name)
+    if not m:
+        return name, None
+    return name[:m.start()], m.group(1).upper()
+
+
+def find_texture_set_for_geo(geo_path):
+    """
+    Find the texture set matching an imported geo file, for auto material
+    building.
+
+    Searches the geo's own folder first (priority), then its immediate
+    subfolders, matching by base name once the geo's own LOD/High suffix and
+    the texture set's resolution tag (_2K/_4K/...) are stripped from each
+    side. When multiple candidates match (e.g. a 2K and a 4K set, or a
+    source set and its .tx counterpart), non-.tx sets are preferred over
+    .tx, and 4K is preferred over other resolutions.
+
+    Special case (Megascans "3D plant" layout): the geo can sit in a
+    "VarN" folder (Var1, Var2, ...) whose own name carries no material info,
+    with the shared texture set living in a sibling "Textures" folder (with
+    its own subfolders, e.g. Textures/Atlas) one level up from VarN. If the
+    normal search above finds nothing and the geo's parent folder is named
+    "VarN", that Textures tree is searched (recursively) and its single
+    texture set (if there's exactly one) is used - name matching doesn't
+    apply here since "Var1" isn't a material name.
+
+    Args:
+        geo_path: Path (or str) to the imported geo file.
+
+    Returns:
+        (texture_set_data, geo_suffix, is_var_match) - texture_set_data is
+        the matched set's dict (as returned by group_texture_sets(),
+        including 'variant_map'), or None if nothing matched. geo_suffix is
+        the geo's own 'high'/'LODn'/None tag, needed to later pick the right
+        channel variants via resolve_texture_set_channels(). is_var_match is
+        True when the match came from the "VarN" fallback (Megascans 3D
+        plants etc.), which typically don't need displacement - see the
+        'smart_import.var_import_displacement' setting.
+    """
+    geo_path = Path(geo_path)
+    geo_base, geo_suffix = strip_geo_suffix(geo_path.stem)
+    target = geo_base.lower()
+
+    def _images_in(directory, recursive=False):
+        try:
+            it = directory.rglob('*') if recursive else directory.iterdir()
+            return [p for p in it if p.is_file() and get_extension_category(p.suffix.lower()) == 'images']
+        except OSError:
+            return []
+
+    def _search(directory):
+        candidates = _images_in(directory)
+        if not candidates:
+            return None
+
+        sets, _ = group_texture_sets(candidates)
+
+        matches = []
+        for data in sets.values():
+            clean = _TX_SET_SUFFIX_REGEX.sub('', data['display'])
+            clean_base, res_tag = _strip_resolution_tag(clean)
+            if clean_base.lower() == target:
+                matches.append((data, res_tag))
+        if not matches:
+            return None
+
+        # Prefer non-.tx over .tx, then 4K resolution over other resolutions.
+        matches.sort(key=lambda m: (' (TX' in m[0]['display'], m[1] != '4K'))
+        return matches[0][0]
+
+    match = _search(geo_path.parent)
+    if match:
+        return match, geo_suffix, False
+
+    try:
+        subdirs = sorted((d for d in geo_path.parent.iterdir() if d.is_dir()), key=lambda d: d.name.lower())
+    except OSError:
+        subdirs = []
+    for sub in subdirs:
+        match = _search(sub)
+        if match:
+            return match, geo_suffix, False
+
+    # "VarN" fallback: look for a sibling "Textures" folder one level up.
+    if _VAR_FOLDER_REGEX.match(geo_path.parent.name):
+        asset_root = geo_path.parent.parent
+        textures_dir = None
+        try:
+            for d in asset_root.iterdir():
+                if d.is_dir() and d.name.lower() == 'textures':
+                    textures_dir = d
+                    break
+        except OSError:
+            pass
+
+        if textures_dir:
+            candidates = _images_in(textures_dir, recursive=True)
+            if candidates:
+                sets, _ = group_texture_sets(candidates)
+                non_tx = [d for d in sets.values() if ' (TX' not in d['display']]
+                pool = non_tx if non_tx else list(sets.values())
+                if len(pool) == 1:
+                    return pool[0], geo_suffix, True
+
+    return None, geo_suffix, False
+
+
+def resolve_texture_set_channels(variant_map: dict, geo_suffix, exclude_displacement=False):
+    """
+    Resolve a texture set's variant_map ((channel, UDIM, LOD) -> Path) down
+    to a single winning file per channel, for a specific geo variant.
+
+    Rules:
+      - Channels in TEXTURE_CHANNELS_NEVER_WIRED (ao/cavity/specular) are
+        excluded entirely.
+      - For the "high" geo variant, the special normalHigh channel
+        (NormalBump/BumpNormal/Normal_HF) is preferred as the normal input
+        if present.
+      - Otherwise (or if normalHigh is absent), normal - like every other
+        channel - prefers a variant tagged with the geo's own LOD, falling
+        back to LOD0, then to the untagged (no-LOD) variant if neither
+        exists.
+      - "High" geo never gets displacement/height (it's already the
+        fully-detailed mesh). exclude_displacement additionally drops them
+        for any geo variant - used for the "VarN" match case (Megascans
+        plants etc.), where displacement is opt-in via the
+        'smart_import.var_import_displacement' setting.
+
+    Args:
+        variant_map: dict[(channel, udim, lod)] -> Path, from a set built by
+            group_texture_sets()/_group_texture_sets_single_pass().
+        geo_suffix: 'high', 'LOD0'..'LODn', or None (from strip_geo_suffix).
+        exclude_displacement: if True, drop displacement/height regardless
+            of geo_suffix.
+
+    Returns:
+        dict[channel_key] -> str(path), ready for the shader network
+        generator's build_from_texture_sets().
+    """
+    by_channel = {}
+    for (channel, _udim, lod), path in variant_map.items():
+        by_channel.setdefault(channel, {}).setdefault(lod, path)
+
+    lod_order = []
+    if geo_suffix and geo_suffix != 'high':
+        lod_order.append(geo_suffix)
+    if 'LOD0' not in lod_order:
+        lod_order.append('LOD0')
+    lod_order.append(None)
+
+    def _pick(variants):
+        for lod in lod_order:
+            if lod in variants:
+                return variants[lod]
+        return None
+
+    result = {}
+
+    # Normal: "high" geo prefers the dedicated high-frequency channel.
+    normal_high = by_channel.get('normalHigh')
+    if geo_suffix == 'high' and normal_high:
+        result['normal'] = str(next(iter(normal_high.values())))
+    else:
+        normal_variants = by_channel.get('normal')
+        if normal_variants:
+            picked = _pick(normal_variants)
+            if picked:
+                result['normal'] = str(picked)
+
+    # "High" geo is already the fully-detailed mesh (no displacement/subdiv
+    # needed at render time) - exclude displacement/height so the shader
+    # builder's displacement chain (and its per-shape subdiv settings) never
+    # gets built for it.
+    skip_channels = {'normal', 'normalHigh'} | TEXTURE_CHANNELS_NEVER_WIRED
+    if geo_suffix == 'high' or exclude_displacement:
+        skip_channels |= {'displacement', 'height'}
+
+    for channel, variants in by_channel.items():
+        if channel in skip_channels:
+            continue
+        picked = _pick(variants)
+        if picked:
+            result[channel] = str(picked)
+
+    return result
+
 

@@ -1,17 +1,27 @@
 
-# DD Content Browser v1.6.0
+# DD Content Browser v2.0.0
 
 Content Browser for Maya by Denes Dankhazi
-Modern Maya Asset Browser for Autodesk Maya 2025+ (PySide6, Python 3.11+)
+Modern Maya Asset Browser for Autodesk Maya 2025+ (PySide6, Python 3.11 & 3.13)
 
 ---
 
 ## ✨ Overview
 
-DD Content Browser is a high-performance, feature-rich asset browser for Maya, designed for large production environments. It replaces the built-in browser with a fast, intuitive, and visually advanced interface with advanced features like video support, collections, tags, Quick View, and more.
+DD Content Browser is a high-performance, feature-rich asset browser for Maya, designed for large production environments. It replaces the built-in browser with a fast, intuitive, and visually advanced interface with advanced features like video support, texture sets, collections, tags, Quick View, and more.
 
 ---
 
+## 🔧 Maya & Python Compatibility
+
+DD Content Browser auto-detects the running Python interpreter and loads the matching set of bundled binary libraries (numpy, Pillow, OpenEXR, OpenImageIO, scikit-image, scipy, psd-tools, aggdraw) — no manual setup needed:
+
+- **Maya 2025 / 2026** (Python 3.11) → uses `external_libs_py311/`
+- **Maya 2027+** (Python 3.13) → uses `external_libs/`
+
+`get_external_libs_dir()` (in `utils.py`) picks the matching folder at import time based on `sys.version_info`. If a future Maya ships a different Python, add a new `external_libs_py3XX/` folder with matching wheels and it will be picked up automatically; otherwise it falls back to the default `external_libs/`.
+
+---
 
 ## 🚀 How to Install and Launch
 
@@ -74,6 +84,18 @@ Cheers, D
 - **Sort options** - Name, Size, Date, Type with ascending/descending toggle
 - **Visual indicators** - ▲▼ sort direction arrows
 
+### Texture Sets 🧩 ✨ **NEW!**
+- **Automatic PBR grouping** - Detects texture channels (baseColor, roughness, metalness, normal, height, displacement, emission, opacity, transmission, ao) sharing a base filename and groups them into a single set item
+- **UDIM-aware** - Multiple UDIM tiles per channel are counted and cached correctly
+- **"Texture Sets" toggle** - Grouped-set view vs. individual files (mutually exclusive with Sequences mode)
+- **"Show Only Sets" filter** - Hide loose/unmatched files, show only complete sets
+- **Advanced Filters integration** - Filter by "Texture Set" category (Set member / Loose file)
+- **Set badge & thumbnail** - File-count badge on the thumbnail, base-color image used as the set's preview
+- **Rich tooltip & metadata panel** - Lists every channel and the file(s) filling it, plus total set size
+- **Drag to build shader** - Drop a set into the Maya viewport to auto-generate a shader network (aiStandardSurface by default) wired to the set's channels
+- **Collections support** - Dragging a set into a Collection (or "Add to Collection") adds every file in the set; Collection view re-groups sets when Texture Sets mode is on
+- **Per-folder isolation** - Same-named sets in different folders stay fully separate (thumbnails, cache)
+
 ### Quick View System ✨ **NEW!**
 - **Space to open** - macOS Quick Look-style floating preview
 - **Frameless window** - Custom title bar with close button (Space/Escape)
@@ -88,6 +110,7 @@ Cheers, D
 - **Manual Collections** - Drag & drop file management with SQLite backend
 - **Virtual folder view** - Display files from multiple folders
 - **Middle-button drag** - Maya-style file adding to collections
+- **Texture set aware** - Dragging a texture set adds all its files; Collection view can re-group them back into sets
 - **Collection mode** - Blue breadcrumb indicator, exit button
 - **Context menus** - "Add to Collection >", "Remove from Collection"
 - **Export to folder** - Copy files with conflict handling (overwrite/skip/rename)
@@ -160,15 +183,18 @@ Cheers, D
 
 ### Supported Formats
 - **Maya**: `.ma`, `.mb`
-- **3D Models**: `.obj`, `.fbx`, `.abc`, `.usd`, `.usda`, `.usdc`, `.vdb`
+- **3D Models**: `.obj`, `.fbx`, `.abc`, `.usd`, `.vdb`, `.dae`, `.stl`
 - **Blender**: `.blend`
-- **Houdini**: `.hda`, `.hip`, `.hipnc`
-- **Substance**: `.sbs`, `.sbsar`
-- **Images**: `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, `.tga`, `.bmp`, `.exr`, `.hdr`, `.psd`
+- **Houdini**: `.hda`
+- **Substance**: `.sbsar`
+- **Images**: `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, `.tga`, `.exr`, `.hdr`, `.psd`, `.tx`, `.gif`
 - **Videos** ✨ **NEW!**: `.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`, `.m4v`, `.flv`, `.wmv`
 - **Documents**: `.pdf`
 - **Scripts**: `.py`, `.mel`
-- **Text**: `.txt`, `.md`, `.json`, `.xml`
+- **Text**: `.txt`
+- **Other**: `.abr`
+
+*(Central definition lives in `FILE_TYPE_REGISTRY`, `utils.py` — extend via Settings → Filters, no code changes needed.)*
 
 ### External Libraries
 - **PySide6** - Qt for Python (UI framework)
@@ -176,9 +202,13 @@ Cheers, D
 - **OpenCV (cv2)** - Advanced image ops, 16/32-bit TIFF, video frames
 - **PyMuPDF** - PDF rendering
 - **OpenEXR** - HDR/EXR support with multi-channel
-- **NumPy** - Float processing (Maya 2025+)
+- **OpenImageIO** - `.tx` (RenderMan texture) loading, EXR fallback
+- **NumPy** - Float processing
 - **scikit-image** - Advanced image analysis
 - **psd-tools** - Photoshop PSD file support
+- **aggdraw** - Anti-aliased gradient icon rendering
+
+*(Bundled per Python version - see "Maya & Python Compatibility" above.)*
 
 ---
 
@@ -288,28 +318,29 @@ Commercial redistribution is not permitted without the author's permission.
 ## 🙏 Credits
 
 **Author:** Denes Dankhazi (ddankhazi)  
-**Version:** 1.6.0  
+**Version:** 2.0.0  
 **Maya Version:** 2025+ (PySide6)  
-**Python:** 3.11+  
+**Python:** 3.11 (Maya 2025/2026) & 3.13 (Maya 2027+)  
 **Blog & Portfolio:** [ddankhazi.com](https://ddankhazi.com)
 
 ---
 
-##  Planned Features (v2.0)
+##  Planned Features (Future)
+
+*Smart Material Generator (auto-shader from texture sets) shipped in v2.0 — see "Texture Sets" above.*
 
 ### High Priority:
-1. **Smart Material Generator** - Auto-generate aiStandardSurface from texture sets
-2. **Quixel Megascans Importer** - One-click optimized import with UDIM/LOD
-3. **SkyDome Auto-Linker** - Drag HDR → update aiSkyDomeLight path
-4. **Star/Color Rating** - Adobe Bridge-style organization (0-5 stars, 8 colors)
-5. **Enhanced Tag System** - Tag hierarchies, bulk operations, import/export
+1. **Quixel Megascans Importer** - One-click optimized import with UDIM/LOD
+2. **SkyDome Auto-Linker** - Drag HDR → update aiSkyDomeLight path
+3. **Star/Color Rating** - Adobe Bridge-style organization (0-5 stars, 8 colors)
+4. **Enhanced Tag System** - Tag hierarchies, bulk operations, import/export
 
 ### Medium Priority:
-6. **Texture Converter** - Batch format conversion with color space management
-7. **Real Maya Playblast** - Safe thumbnail generation (subprocess isolation)
-8. **Asset Metadata** - Scene stats (poly count, shader info)
-9. **Theme Support** - Dark/Light themes, custom colors
-10. **Version Control** - Git/Perforce integration
+5. **Texture Converter** - Batch format conversion with color space management
+6. **Real Maya Playblast** - Safe thumbnail generation (subprocess isolation)
+7. **Asset Metadata** - Scene stats (poly count, shader info)
+8. **Theme Support** - Dark/Light themes, custom colors
+9. **Version Control** - Git/Perforce integration
 
 ---
 

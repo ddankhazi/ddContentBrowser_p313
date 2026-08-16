@@ -157,6 +157,8 @@ class ThumbnailDelegate(QStyledItemDelegate):
             file_path_key = str(asset.file_path)
             if asset.is_sequence and asset.sequence:
                 file_path_key = str(asset.sequence.pattern)
+            elif getattr(asset, 'is_texture_set', False) and asset.texture_set:
+                file_path_key = "texset::" + str(asset.texture_set.directory) + "::" + str(asset.texture_set.name)
             
             thumbnail = self.memory_cache.get(file_path_key) if thumbnails_enabled else None
             
@@ -188,6 +190,12 @@ class ThumbnailDelegate(QStyledItemDelegate):
                     self._draw_sequence_badge(painter, thumb_x + offset_x, thumb_y + offset_y, 
                                             scaled.width(), scaled.height(), 
                                             asset.sequence.frame_count)
+                # Draw texture-set badge if this is a texture set
+                elif getattr(asset, 'is_texture_set', False) and asset.texture_set:
+                    self._draw_texture_set_badge(painter, thumb_x + offset_x, thumb_y + offset_y,
+                                                 scaled.width(), scaled.height(),
+                                                 len(asset.texture_set.files),
+                                                 len(asset.texture_set.extra_formats))
             else:
                 # Draw gradient placeholder (no scaling, always sharp!)
                 self.draw_gradient_placeholder(painter, thumb_rect, asset.extension)
@@ -277,6 +285,8 @@ class ThumbnailDelegate(QStyledItemDelegate):
             cache_key = str(asset.file_path)
             if asset.is_sequence and asset.sequence:
                 cache_key = str(asset.sequence.pattern)
+            elif getattr(asset, 'is_texture_set', False) and asset.texture_set:
+                cache_key = "texset::" + str(asset.texture_set.directory) + "::" + str(asset.texture_set.name)
             
             thumbnail = self.memory_cache.get(cache_key) if thumbnails_enabled else None
             if thumbnail and not thumbnail.isNull():
@@ -305,6 +315,12 @@ class ThumbnailDelegate(QStyledItemDelegate):
                     self._draw_sequence_badge(painter, thumb_x + offset_x, thumb_y + offset_y,
                                             scaled.width(), scaled.height(),
                                             asset.sequence.frame_count)
+                # Draw texture-set badge if this is a texture set
+                elif getattr(asset, 'is_texture_set', False) and asset.texture_set:
+                    self._draw_texture_set_badge(painter, thumb_x + offset_x, thumb_y + offset_y,
+                                                 scaled.width(), scaled.height(),
+                                                 len(asset.texture_set.files),
+                                                 len(asset.texture_set.extra_formats))
             else:
                 self.draw_gradient_placeholder(painter, thumb_rect, asset.extension)
         
@@ -405,6 +421,72 @@ class ThumbnailDelegate(QStyledItemDelegate):
         painter.drawRoundedRect(badge_rect, 2, 2)
         
         # Draw text
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+
+    def _draw_texture_set_badge(self, painter, x, y, width, height, map_count, extra_format_count=0):
+        """
+        Draw a texture-set badge (top-left) indicating a grouped PBR set.
+
+        Args:
+            painter: QPainter instance
+            x, y: Position of thumbnail
+            width, height: Actual displayed size of thumbnail
+            map_count: Number of files in the set
+            extra_format_count: Number of alternate-format duplicates that
+                were demoted out of the set (same channel+UDIM, lower-priority
+                extension) - shown as "+N" next to the count.
+        """
+        thumb_size = height
+
+        # Size scaling (mirror sequence badge proportions)
+        if thumb_size <= 24:
+            badge_height = 10
+            font_size = 7
+        elif thumb_size <= 32:
+            badge_height = 12
+            font_size = 8
+        elif thumb_size <= 48:
+            badge_height = 14
+            font_size = 9
+        elif thumb_size <= 64:
+            badge_height = 16
+            font_size = 10
+        else:
+            badge_height = max(18, int(thumb_size * 0.12))
+            font_size = max(10, int(badge_height * 0.6))
+
+        badge_margin = 2
+
+        # Compact for tiny thumbnails
+        if thumb_size <= 32:
+            badge_text = "SET"
+        elif extra_format_count > 0:
+            badge_text = f"SET · {map_count} +{extra_format_count}"
+        else:
+            badge_text = f"SET · {map_count}"
+
+        font = QFont()
+        font.setPixelSize(font_size)
+        font.setBold(True)
+        painter.setFont(font)
+
+        metrics = painter.fontMetrics()
+        text_width = metrics.horizontalAdvance(badge_text)
+
+        badge_width = text_width + badge_margin * 3
+        badge_rect = QRect(
+            x + badge_margin,           # Top-left (distinct from sequence's bottom-center)
+            y + badge_margin,
+            badge_width,
+            badge_height
+        )
+
+        # Teal/blue background to visually distinguish from sequence badge
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(20, 130, 160, 210)))
+        painter.drawRoundedRect(badge_rect, 2, 2)
+
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
 

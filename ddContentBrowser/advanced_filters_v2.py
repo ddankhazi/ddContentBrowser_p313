@@ -475,6 +475,16 @@ class AdvancedFiltersPanelV2(QWidget):
             
             if 'focal_length_category' in metadata:
                 category_values['Focal Length'][metadata['focal_length_category']] += 1
+            
+            # Texture Set membership (image files whose suffix maps to a PBR channel)
+            fp = metadata.get('file_path')
+            if fp:
+                from pathlib import Path as _P
+                from .utils import parse_texture_filename, get_extension_category
+                if get_extension_category(_P(fp).suffix.lower()) == 'images':
+                    _p = _P(fp)
+                    _b, _ch, _u, _lod = parse_texture_filename(_p.stem, _p.suffix)
+                    category_values['Texture Set']['Set member' if _ch is not None else 'Loose file'] += 1
         print(f"[TIMER]   - Aggregate metadata: {time.time() - start_aggregate:.3f}s")
         
         # Add Tags category (query from MetadataManager)
@@ -513,7 +523,7 @@ class AdvancedFiltersPanelV2(QWidget):
         # Create or update filter category widgets
         start_widgets = time.time()
         # Tags first, then other categories
-        category_order = ['Tags', 'File Type', 'Category', 'File Size', 'Resolution', 
+        category_order = ['Tags', 'Texture Set', 'File Type', 'Category', 'File Size', 'Resolution', 
                          'Aspect Ratio', 'Color Mode', 'Bit Depth',
                          'Camera', 'Lens', 'ISO', 'Aperture', 'Focal Length']
         
@@ -639,6 +649,13 @@ class AdvancedFiltersPanelV2(QWidget):
                     category_match = metadata.get('aperture_category') in selected_values
                 elif category_name == 'Focal Length':
                     category_match = metadata.get('focal_length_category') in selected_values
+                elif category_name == 'Texture Set':
+                    from pathlib import Path as _P
+                    from .utils import parse_texture_filename
+                    _p = _P(asset.file_path)
+                    _b, _ch, _u, _lod = parse_texture_filename(_p.stem, _p.suffix)
+                    val = 'Set member' if _ch is not None else 'Loose file'
+                    category_match = val in selected_values
                 elif category_name == 'Tags':
                     # Check if file has ANY of the selected tags (OR logic within Tags)
                     if self.metadata_manager:
@@ -673,10 +690,10 @@ class AdvancedFiltersPanelV2(QWidget):
         
         print(f"[AdvancedFilters] Applied filters: {len(filtered_assets)} assets (updated _ungrouped_assets)")
         
-        # CRITICAL: If sequence mode is ON, reapply grouping to the filtered assets
-        # This ensures the UI shows grouped sequences after filtering
-        if self.file_model.sequence_mode:
-            print(f"[AdvancedFilters] Sequence mode is ON - reapplying grouping after filter")
+        # CRITICAL: If sequence/texture-set mode is ON, reapply grouping to the filtered assets
+        # This ensures the UI shows grouped sequences/sets after filtering
+        if self.file_model.sequence_mode or getattr(self.file_model, 'texture_set_mode', False):
+            print(f"[AdvancedFilters] Grouping mode is ON - reapplying grouping after filter")
             self.file_model.reapplySequenceGrouping()
         else:
             # Only emit layoutChanged if we're NOT reapplying grouping (which emits it itself)

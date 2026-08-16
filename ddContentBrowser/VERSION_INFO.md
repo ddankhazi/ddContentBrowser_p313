@@ -1,6 +1,6 @@
 # Version Management
 
-## Current Version: 1.6.0
+## Current Version: 2.0.0
 
 ## How to Update Version
 
@@ -8,7 +8,7 @@ The version number is now centrally managed in **ONE PLACE ONLY**:
 
 **`ddContentBrowser/__init__.py`** (at the TOP, before any imports)
 ```python
-__version__ = '1.3.0'
+__version__ = '2.0.0'
 ```
 
 **IMPORTANT:** The version MUST be defined at the top of `__init__.py` BEFORE importing other modules, to avoid circular import issues.
@@ -26,7 +26,7 @@ __version__ = '1.3.0'
 ### To update the version:
 
 1. Open `ddContentBrowser/__init__.py`
-2. Change the `__version__ = '1.2.2'` line to your new version
+2. Change the `__version__ = '2.0.0'` line to your new version
 3. That's it! All other files will automatically use the new version.
 
 ### Benefits:

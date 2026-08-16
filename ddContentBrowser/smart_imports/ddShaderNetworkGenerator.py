@@ -5,6 +5,7 @@ import os
 import re
 import json
 import glob
+import hashlib
 
 import maya.cmds as cmds
 
@@ -18,6 +19,7 @@ _DEFAULT_CONFIG = {
         "roughness": ["roughness", "rough", "glossiness", "gloss"],
         "metalness": ["metalness", "metallic", "metal", "met"],
         "normal": ["normal", "normalmap", "nrm", "nor", "norm"],
+        "bump": ["bump", "bumpmap"],
         "height": ["height", "heightmap", "bumpheight"],
         "displacement": ["displacement", "disp", "displ", "displace"],
         "emission": ["emission", "emissive", "emit"],
@@ -475,6 +477,13 @@ def _create_file_node(label, texture_path_or_pattern, is_udim, colorspace, place
                 ud = os.path.join(os.path.dirname(texture_path_or_pattern), ud)
                 cmds.setAttr(node + ".fileTextureName", ud, type="string")
 
+    # .tx files are already baked to the render engine's native/working color
+    # space (RenderMan txmake, etc.) - applying any further color transform on
+    # top would double-convert them. Force Raw regardless of what the caller
+    # requested for this channel (e.g. baseColor normally wants sRGB).
+    if os.path.splitext(texture_path_or_pattern)[1].lower() == ".tx":
+        colorspace = "Raw"
+
     # Force color space and ignore file-rule mapping
     _set_file_colorspace(node, colorspace)
 
@@ -499,11 +508,12 @@ def _create_file_node(label, texture_path_or_pattern, is_udim, colorspace, place
                 cmds.connectAttr(p2d + "." + a, node + "." + a, f=True)
             except Exception:
                 pass
-        for a in ["outUV", "outUvFilterSize"]:
+        # UV coordinate + filter size use different destination attr names on the file node
+        for src_attr, dst_attr in (("outUV", "uvCoord"), ("outUvFilterSize", "uvFilterSize")):
             try:
-                cmds.connectAttr(p2d + "." + a, node + "." + a, f=True)
-            except Exception:
-                pass
+                cmds.connectAttr(p2d + "." + src_attr, node + "." + dst_attr, f=True)
+            except Exception as e:
+                print("[ShaderGen] UV connect failed ({0}->{1}): {2}".format(src_attr, dst_attr, e))
 
     return node
 
@@ -567,6 +577,26 @@ def _ensure_normal_chain(label, file_node, material):
     _connect_if_free(file_node + ".outColor", n_node + ".input")
     # aiNormalMap.outValue -> material.normalCamera (only if free)
     _connect_if_free(n_node + ".outValue", material + ".normalCamera")
+
+
+def _ensure_bump2d_chain(label, file_node, material):
+    """Wire a bump map through Maya's native bump2d node.
+
+    Only called when a texture set has a bump channel but no normal map -
+    normal always takes priority over bump, so this is the fallback path.
+    """
+    b_name = label + "_bump2d"
+    if cmds.objExists(b_name) and cmds.nodeType(b_name) == "bump2d":
+        b_node = b_name
+    else:
+        b_node = cmds.shadingNode("bump2d", asUtility=True, n=b_name)
+
+    # file.outAlpha -> bump2d.bumpValue (standard Maya bump hookup - luminance in)
+    _connect_if_free(file_node + ".outAlpha", b_node + ".bumpValue")
+    # bump2d.outNormal -> material.normalCamera (only if free)
+    _connect_if_free(b_node + ".outNormal", material + ".normalCamera")
+
+    return b_node
 
     return n_node
 
@@ -767,4 +797,226 @@ def run(base_dir=None):
         _build_for_material(m, base_dir, mat_to_shapes[m])
 
     print("[ShaderGen] Done.")
+
+
+# =====================================================================
+# Texture-set driven build (used by DD Content Browser drag & drop)
+# =====================================================================
+
+def _sanitize_name(name):
+    """Turn an arbitrary set name into a valid Maya node base name."""
+    s = re.sub(r'[^0-9a-zA-Z_]', '_', str(name))
+    if s and s[0].isdigit():
+        s = "_" + s
+    return s or "texture_set"
+
+
+def _looks_like_udim(path):
+    """Return True if a texture path/filename contains a UDIM (1xxx) tile token."""
+    bn = os.path.basename(path or "")
+    udim_re = re.compile(CONFIG.get("udim_regex", r"(?:[\._-])(1\d{3})(?=[\._-]|$)"))
+    return bool(udim_re.search(bn))
+
+
+def _create_material(name, shader_type):
+    """Create a new surface material + shading group. Returns (material, sg)."""
+    if shader_type not in ("aiStandardSurface", "openPBRSurface"):
+        shader_type = "aiStandardSurface"
+    _ensure_mtoa()
+    material = cmds.shadingNode(shader_type, asShader=True, n=name)
+    sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, n=material + "SG")
+    try:
+        cmds.connectAttr(material + ".outColor", sg + ".surfaceShader", f=True)
+    except Exception as e:
+        print("[ShaderGen] Failed to connect material to SG: {0}".format(e))
+    return material, sg
+
+
+def _channels_signature(channels):
+    """
+    Stable signature for a resolved channel->file mapping. Used to decide
+    whether two texture-set builds should share one material (identical
+    inputs) or need separate ones - e.g. a "High" geo build has no
+    displacement channel while a LOD build does, or LOD0 vs LOD6 each pull
+    their own normal file even though every other channel is identical.
+    Same signature = same graph, safe to reuse; different signature = the
+    graph would actually differ, so a separate material is built.
+    """
+    key = "|".join("{0}={1}".format(ch, channels[ch]) for ch in sorted(channels.keys()))
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:10]
+
+
+_SIGNATURE_ATTR = "ddChannelSignature"
+
+
+def _find_reusable_material(base_name, shader_type, signature):
+    """
+    Find an existing material named base_name (or base_name<N> from Maya's
+    own uniquify-on-collision) of the right type, whose stamped channel
+    signature matches. Returns (material, sg), or (None, None) if none match.
+    """
+    name_re = re.compile(r'^' + re.escape(base_name) + r'\d*$')
+    for mat in cmds.ls(base_name + "*", type=shader_type) or []:
+        if not name_re.match(mat):
+            continue
+        if not cmds.attributeQuery(_SIGNATURE_ATTR, node=mat, exists=True):
+            continue
+        try:
+            if cmds.getAttr(mat + "." + _SIGNATURE_ATTR) != signature:
+                continue
+        except Exception:
+            continue
+        sgs = cmds.listConnections(mat, type="shadingEngine") or []
+        if sgs:
+            return mat, sgs[0]
+    return None, None
+
+
+def _stamp_material_signature(material, signature):
+    """Store the channel signature on a newly created material for future reuse checks."""
+    try:
+        if not cmds.attributeQuery(_SIGNATURE_ATTR, node=material, exists=True):
+            cmds.addAttr(material, longName=_SIGNATURE_ATTR, dataType="string")
+        cmds.setAttr(material + "." + _SIGNATURE_ATTR, signature, type="string")
+    except Exception as e:
+        print("[ShaderGen] Failed to stamp signature on {0}: {1}".format(material, e))
+
+
+def _get_or_create_material(base_name, shader_type, channels):
+    """
+    Reuse an existing material built from the exact same channel->file
+    mapping, or create a new one (uniquified by Maya if base_name is taken
+    by a material with a different signature). Returns (material, sg).
+    """
+    signature = _channels_signature(channels)
+
+    material, sg = _find_reusable_material(base_name, shader_type, signature)
+    if material:
+        print("[ShaderGen] Reusing existing material '{0}' (same channel set)".format(material))
+        return material, sg
+
+    material, sg = _create_material(base_name, shader_type)
+    _stamp_material_signature(material, signature)
+    return material, sg
+
+
+def _assign_material_to_shapes(sg, shapes):
+    """Assign a shading group to the given shapes."""
+    for sh in shapes:
+        try:
+            cmds.sets(sh, e=True, forceElement=sg)
+        except Exception as e:
+            print("[ShaderGen] Failed to assign material to {0}: {1}".format(sh, e))
+
+
+def _build_displacement_chain(material, disp_tex, shared_place2d, shapes_to_set):
+    """Build the offset->multiply->displacementShader chain for a material."""
+    sgs = _get_sg_nodes_for_material(material)
+    if any(_dst_has_input(sg + ".displacementShader") for sg in sgs):
+        if shapes_to_set:
+            _set_shape_disp_settings(shapes_to_set)
+        return
+
+    disp_file = _create_file_node(
+        "{0}_displacement".format(material), disp_tex, _looks_like_udim(disp_tex),
+        colorspace="Raw", place2d=shared_place2d
+    )
+    offset_node = _ensure_floatMath("{0}_disp_offset".format(material))
+    multiply_node = _ensure_floatMath("{0}_disp_multiply".format(material))
+
+    _connect_if_free(disp_file + ".outColorR", offset_node + ".floatA")
+    try:
+        ext = os.path.splitext(disp_tex)[1].lower()
+        offset_val = 0.0 if ext == ".exr" else -0.5
+        if cmds.getAttr(offset_node + ".floatB") != offset_val:
+            cmds.setAttr(offset_node + ".floatB", offset_val)
+    except Exception:
+        pass
+
+    _connect_if_free(offset_node + ".outFloat", multiply_node + ".floatA")
+    try:
+        if cmds.getAttr(multiply_node + ".operation") != 2:
+            cmds.setAttr(multiply_node + ".operation", 2)
+    except Exception:
+        pass
+
+    disp_shd = _ensure_displacement_shader("{0}_displacementShader".format(material))
+    _connect_if_free(multiply_node + ".outFloat", disp_shd + ".displacement")
+    for sg in sgs:
+        _connect_if_free(disp_shd + ".displacement", sg + ".displacementShader")
+
+    if shapes_to_set:
+        _set_shape_disp_settings(shapes_to_set)
+
+
+def build_from_texture_sets(texture_sets, shader_type="aiStandardSurface", assign_to_selection=True):
+    """
+    Build shader network(s) from explicit texture set(s).
+
+    Args:
+        texture_sets: list of dicts: {"name": str, "channels": {channel_key: path}}
+        shader_type: "aiStandardSurface" or "openPBRSurface"
+        assign_to_selection: if True and geometry is selected (and a single set is
+                             dropped), assign the generated material to the selection.
+    """
+    if not texture_sets:
+        print("[ShaderGen] No texture sets provided.")
+        return []
+
+    _ensure_mtoa()
+
+    selected_shapes = _shapes_from_selection() if assign_to_selection else []
+    # Only auto-assign when a single set is dropped onto a selection (unambiguous)
+    do_assign = bool(selected_shapes) and len(texture_sets) == 1
+
+    channel_cs = {
+        "baseColor": "sRGB", "emission": "sRGB",
+        "roughness": "Raw", "metalness": "Raw", "normal": "Raw",
+        "opacity": "Raw", "transmission": "Raw", "height": "Raw", "displacement": "Raw",
+    }
+    supported = ["baseColor", "roughness", "metalness", "normal", "emission", "opacity", "transmission"]
+
+    created = []
+    for ts in texture_sets:
+        set_name = ts.get("name") or "texture_set"
+        channels = ts.get("channels") or {}
+
+        material, sg = _get_or_create_material(_sanitize_name(set_name) + "_MAT", shader_type, channels)
+        created.append(material)
+        shared_place2d = _get_or_create_shared_place2d(material)
+
+        for ch in supported:
+            path = channels.get(ch)
+            if not path:
+                continue
+            fnode = _create_file_node(
+                "{0}_{1}".format(material, ch), path, _looks_like_udim(path),
+                colorspace=channel_cs.get(ch, "Raw"), place2d=shared_place2d
+            )
+            _connect_channel(material, ch, fnode)
+
+        # Bump: normal always takes priority. Only wire bump (via bump2d)
+        # when there's no normal map in this set.
+        bump_path = channels.get("bump")
+        if bump_path and not channels.get("normal"):
+            bfile = _create_file_node(
+                "{0}_bump".format(material), bump_path, _looks_like_udim(bump_path),
+                colorspace="Raw", place2d=shared_place2d
+            )
+            _ensure_bump2d_chain(material + "_bump", bfile, material)
+
+        # Displacement: prefer displacement, else height as displacement
+        disp_path = channels.get("displacement") or channels.get("height")
+        if disp_path:
+            _build_displacement_chain(material, disp_path, shared_place2d,
+                                      selected_shapes if do_assign else [])
+
+        if do_assign:
+            _assign_material_to_shapes(sg, selected_shapes)
+
+        print("[ShaderGen] Built material '{0}' from set '{1}'".format(material, set_name))
+
+    print("[ShaderGen] Done. Created {0} material(s).".format(len(created)))
+    return created
+
 
