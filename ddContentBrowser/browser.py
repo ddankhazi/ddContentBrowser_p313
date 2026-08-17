@@ -1028,7 +1028,20 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.thumbnails_enabled_checkbox.setChecked(self.config.config.get("thumbnails_enabled", True))
         self.thumbnails_enabled_checkbox.setToolTip("Enable/disable thumbnail generation and loading")
         view_toolbar.addWidget(self.thumbnails_enabled_checkbox)
-        
+
+        # Separate toggle for folder *preview thumbnails specifically - the
+        # DB lookup + (first-visit) filesystem scan for these has its own
+        # cost independent of file thumbnails, so a user can keep file
+        # thumbnails on but turn this off when browsing a folder with
+        # thousands of subfolders.
+        self.folder_thumbnails_enabled_checkbox = QtWidgets.QCheckBox("Folder Thumbnails")
+        self.folder_thumbnails_enabled_checkbox.setChecked(self.config.config.get("folder_thumbnails_enabled", True))
+        self.folder_thumbnails_enabled_checkbox.setToolTip(
+            "Enable/disable showing a folder's *preview image as its thumbnail.\n"
+            "Turn off to speed up browsing folders with thousands of subfolders."
+        )
+        view_toolbar.addWidget(self.folder_thumbnails_enabled_checkbox)
+
         # Sequence mode toggle checkbox (will be initialized later from settings)
         self.sequence_mode_checkbox = QtWidgets.QCheckBox("Sequences")
         self.sequence_mode_checkbox.setToolTip("Group image sequences into single items\n(e.g. render_0001-0120.jpg → render_####.jpg)")
@@ -1111,6 +1124,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         
         # File list with custom delegate - Use MayaStyleListView
         self.file_model = FileSystemModel()
+        self.file_model.thumbnails_enabled = self.thumbnails_enabled_checkbox.isChecked()
+        self.file_model.folder_thumbnails_enabled = self.folder_thumbnails_enabled_checkbox.isChecked()
         self.file_list = MayaStyleListView()
         self.file_list.setModel(self.file_model)
         self.file_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -1334,7 +1349,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.grid_mode_btn.clicked.connect(lambda: self.set_view_mode(True))
         self.size_slider.valueChanged.connect(self.on_size_slider_changed)
         self.thumbnails_enabled_checkbox.stateChanged.connect(self.on_thumbnails_toggle)
-        
+        self.folder_thumbnails_enabled_checkbox.stateChanged.connect(self.on_folder_thumbnails_toggle)
+
         # Navigation connections
         # self.recent_list.itemClicked.connect(self.navigate_from_recent)  # Removed - now using dropdown menu
         self.favorites_list.itemClicked.connect(self.navigate_from_favorites)
@@ -1957,11 +1973,16 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     def on_thumbnails_toggle(self, state):
         """Handle thumbnail enable/disable toggle"""
         enabled = self.thumbnails_enabled_checkbox.isChecked()
-        
+
         # Save to config
         self.config.config["thumbnails_enabled"] = enabled
         self.config.save_config()
-        
+
+        # Push to the model - it has no widget access of its own, and skips
+        # folder-preview resolution (DB lookups + filesystem scans) entirely
+        # while thumbnails are off (see FileSystemModel._resolve_folder_previews)
+        self.file_model.thumbnails_enabled = enabled
+
         if enabled:
             # Re-enable thumbnails - request visible items
             QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
@@ -1969,10 +1990,40 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             # Clear thumbnail queue when disabled
             if hasattr(self, 'thumbnail_generator'):
                 self.thumbnail_generator.clear_queue()
-        
+
         # Schedule deferred update (Qt will refresh automatically)
         self.file_list.scheduleDelayedItemsLayout()
-    
+
+    def on_folder_thumbnails_toggle(self, state):
+        """Handle folder-preview-thumbnail enable/disable toggle (separate from the main Thumbnails one)"""
+        enabled = self.folder_thumbnails_enabled_checkbox.isChecked()
+
+        # Save to config
+        self.config.config["folder_thumbnails_enabled"] = enabled
+        self.config.save_config()
+
+        # Push to the model - future directory listings skip/do the
+        # DB lookup + filesystem scan (see FileSystemModel._resolve_folder_previews)
+        self.file_model.folder_thumbnails_enabled = enabled
+
+        if enabled and self.file_model.thumbnails_enabled:
+            # Re-resolve for whatever's already loaded in the CURRENT view
+            # too - otherwise a folder visited while this was off never got
+            # its folder_preview_path set, and re-enabling wouldn't show
+            # anything until the next full directory reload (F5).
+            self.file_model._resolve_folder_previews(self.file_model.assets)
+
+        # The delegate also checks this live at paint time, so already-
+        # resolved folder previews in the CURRENT listing hide/show
+        # immediately too, without needing to reload the directory.
+        self.file_list.scheduleDelayedItemsLayout()
+        self.file_list.viewport().update()
+
+        # Request thumbnail generation for any newly-revealed folder previews
+        if enabled:
+            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+
+
     def browse_for_folder(self):
         """Browse for folder dialog"""
         current_path = self.breadcrumb.current_path or str(Path.home())
@@ -2870,6 +2921,56 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 # Not importable - show message and offer to open with default app
                 self.safe_show_status(f"Cannot import {asset.extension} files to Maya. Use 'Open' to view.", 4000)
     
+    def _tif_conversion_progress_callback(self):
+        """
+        Create a small progress dialog + callback for TIF conversion
+        (see _convert_channels_with_progress / the convert_to_tif setting).
+        A short setMinimumDuration keeps it from flashing on-screen for the
+        common fast case (a handful of textures converts in ~1s).
+
+        Returns (progress_dialog, callback) - callback(done, total) updates
+        the dialog; caller is responsible for closing progress_dialog when done.
+        """
+        progress = QtWidgets.QProgressDialog("Converting textures to TIF...", None, 0, 0, self)
+        progress.setWindowTitle("Texture Set")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(400)
+        progress.setCancelButton(None)
+
+        def _on_progress(done, total):
+            if progress.maximum() != total:
+                progress.setMaximum(total)
+            progress.setLabelText(f"Converting textures to TIF... ({done}/{total})")
+            progress.setValue(done)
+            QtWidgets.QApplication.processEvents()
+
+        return progress, _on_progress
+
+    def _convert_channels_with_progress(self, channels_list):
+        """
+        Convert JPG/PNG/TGA textures across one or more texture sets to TIF
+        (if the "convert_to_tif" setting is on), showing a single progress
+        dialog for the whole batch - not one per set, so dropping/importing
+        several sets at once still shows one accurate running count.
+
+        Args:
+            channels_list: list of dict[channel_key] -> list[Path], one per
+                texture set.
+
+        Returns:
+            The same-shaped list, converted if the setting is on, unchanged
+            otherwise.
+        """
+        if not self.settings_manager.get('smart_import', 'convert_to_tif', False):
+            return channels_list
+
+        from .utils import convert_texture_sets_to_tif
+        progress, on_progress = self._tif_conversion_progress_callback()
+        try:
+            return convert_texture_sets_to_tif(channels_list, progress_callback=on_progress)
+        finally:
+            progress.close()
+
     def _build_texture_set_shaders(self, ts_assets):
         """Build shader network(s) from texture-set asset(s) via the generator module."""
         if not MAYA_AVAILABLE:
@@ -2877,9 +2978,11 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             return
         if not ts_assets:
             return
+        from .utils import channel_paths_from_channels
+        converted = self._convert_channels_with_progress([a.texture_set.channels for a in ts_assets])
         sets = [
-            {'name': a.texture_set.name, 'channels': a.texture_set.channel_paths}
-            for a in ts_assets
+            {'name': a.texture_set.name, 'channels': channel_paths_from_channels(c)}
+            for a, c in zip(ts_assets, converted)
         ]
         shader_type = self.settings_manager.get('smart_import', 'shader_type', 'aiStandardSurface')
         try:
@@ -2923,7 +3026,16 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 'smart_import', 'var_import_displacement', False
             )
 
-            channels = resolve_texture_set_channels(ts_data['variant_map'], geo_suffix, exclude_displacement)
+            variant_map = ts_data['variant_map']
+            if self.settings_manager.get('smart_import', 'convert_to_tif', False):
+                from .utils import convert_variant_map_to_tif
+                progress, on_progress = self._tif_conversion_progress_callback()
+                try:
+                    variant_map = convert_variant_map_to_tif(variant_map, progress_callback=on_progress)
+                finally:
+                    progress.close()
+
+            channels = resolve_texture_set_channels(variant_map, geo_suffix, exclude_displacement)
             if not channels:
                 return
 
@@ -3973,7 +4085,19 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # CLEAR thumbnail generator queue when refreshing
         if hasattr(self, 'thumbnail_generator'):
             self.thumbnail_generator.clear_queue()
-        
+
+        # Also drop the cached "does this subfolder have a *preview image"
+        # status so F5 re-checks it (not just the directory listing itself -
+        # the cache lives in the metadata DB, outside the directory cache
+        # that file_model.refresh(force=True) below already bypasses).
+        if self.file_model.current_path is not None:
+            try:
+                from .utils import invalidate_folder_previews
+                subfolders = [p for p in self.file_model.current_path.iterdir() if p.is_dir()]
+                invalidate_folder_previews(subfolders)
+            except OSError:
+                pass
+
         self.file_model.refresh(force=True)
         self.safe_show_status("Refreshed (cache bypassed)")
         QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
@@ -4495,19 +4619,20 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 
                 menu.addSeparator()
                 
-                # Regenerate thumbnail (only for files with thumbnails)
+                # Regenerate thumbnail - for files, or folders (re-checks for
+                # a *preview image, see regenerate_selected_thumbnails())
+                regen_thumb_text = f"🔄 Regenerate Thumbnail" if len(selected_assets) == 1 else f"🔄 Regenerate {len(selected_assets)} Thumbnails"
+                regen_thumb_action = menu.addAction(regen_thumb_text)
+                regen_thumb_action.triggered.connect(self.regenerate_selected_thumbnails)
+
                 if not asset.is_folder:
-                    regen_thumb_text = f"🔄 Regenerate Thumbnail" if len(selected_assets) == 1 else f"🔄 Regenerate {len(selected_assets)} Thumbnails"
-                    regen_thumb_action = menu.addAction(regen_thumb_text)
-                    regen_thumb_action.triggered.connect(self.regenerate_selected_thumbnails)
-                    
                     # Auto-detect Color Space (only for HDR/EXR/TX files)
                     hdr_files = [a for a in selected_assets if str(a.file_path).lower().endswith(('.exr', '.hdr', '.tx'))]
                     if hdr_files:
                         auto_tag_text = f"🎨 Auto-detect Color Space" if len(hdr_files) == 1 else f"🎨 Auto-detect Color Space ({len(hdr_files)} files)"
                         auto_tag_action = menu.addAction(auto_tag_text)
                         auto_tag_action.triggered.connect(self.auto_detect_colorspace_for_selected)
-                    
+
                     menu.addSeparator()
                 
                 properties_action = menu.addAction("ℹ️ Properties")
@@ -4662,19 +4787,39 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     def regenerate_selected_thumbnails(self):
         """Regenerate thumbnails for selected files by clearing their cache entries"""
         selected_assets = self.get_selected_assets()
-        
+
         if not selected_assets:
             return
-        
-        # Filter out folders - only regenerate for files
+
         file_assets = [asset for asset in selected_assets if not asset.is_folder]
-        
-        if not file_assets:
+        folder_assets = [asset for asset in selected_assets if asset.is_folder]
+
+        if not file_assets and not folder_assets:
             self.safe_show_status("No files selected for thumbnail regeneration")
             return
-        
-        # Clear thumbnail cache for each file (and all frames if sequence)
+
         cleared_count = 0
+
+        # Folders: re-check for a *preview image right now (the metadata
+        # cache is invalidated then immediately re-scanned, since a simple
+        # cache-clear doesn't recreate the AssetItem the way F5's directory
+        # rescan does - so folder_preview_path has to be refreshed here).
+        if folder_assets:
+            try:
+                from .utils import invalidate_folder_previews, resolve_folder_previews
+                folder_paths = [asset.file_path for asset in folder_assets]
+                invalidate_folder_previews(folder_paths)
+                previews = resolve_folder_previews(folder_paths)
+                for asset in folder_assets:
+                    preview = previews.get(asset.file_path)
+                    asset.folder_preview_path = preview
+                    asset.should_generate_thumbnail = bool(preview)
+                    self.disk_cache.clear_thumbnail(asset.file_path)
+                    cleared_count += 1
+            except Exception as e:
+                print(f"Failed to refresh folder preview for selection: {e}")
+
+        # Clear thumbnail cache for each file (and all frames if sequence)
         for asset in file_assets:
             try:
                 # If it's a sequence, clear cache for all frames

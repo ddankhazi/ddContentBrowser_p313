@@ -483,7 +483,7 @@ class AdvancedFiltersPanelV2(QWidget):
                 from .utils import parse_texture_filename, get_extension_category
                 if get_extension_category(_P(fp).suffix.lower()) == 'images':
                     _p = _P(fp)
-                    _b, _ch, _u, _lod = parse_texture_filename(_p.stem, _p.suffix)
+                    _b, _ch, _u, _lod, _alias = parse_texture_filename(_p.stem, _p.suffix)
                     category_values['Texture Set']['Set member' if _ch is not None else 'Loose file'] += 1
         print(f"[TIMER]   - Aggregate metadata: {time.time() - start_aggregate:.3f}s")
         
@@ -653,7 +653,7 @@ class AdvancedFiltersPanelV2(QWidget):
                     from pathlib import Path as _P
                     from .utils import parse_texture_filename
                     _p = _P(asset.file_path)
-                    _b, _ch, _u, _lod = parse_texture_filename(_p.stem, _p.suffix)
+                    _b, _ch, _u, _lod, _alias = parse_texture_filename(_p.stem, _p.suffix)
                     val = 'Set member' if _ch is not None else 'Loose file'
                     category_match = val in selected_values
                 elif category_name == 'Tags':

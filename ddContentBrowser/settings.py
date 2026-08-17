@@ -91,8 +91,9 @@ class SettingsManager:
             },
             # Smart import / shader generation
             "smart_import": {
-                "shader_type": "aiStandardSurface",  # aiStandardSurface or openPBRSurface
-                "var_import_displacement": False  # Displacement for VarN-matched (Megascans plant) assets
+                "shader_type": "aiStandardSurface",  # aiStandardSurface, openPBRSurface, or dGecko
+                "var_import_displacement": False,  # Displacement for VarN-matched (Megascans plant) assets
+                "convert_to_tif": False  # Convert jpg/png/tga channel textures to TIF (LZW) before building
             }
         }
     
@@ -1494,7 +1495,7 @@ class TextureSetSettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings_manager
         self.setWindowTitle("Texture Set Settings")
-        self.resize(440, 320)
+        self.resize(440, 420)
         self.init_ui()
 
     def init_ui(self):
@@ -1506,7 +1507,7 @@ class TextureSetSettingsDialog(QDialog):
         type_layout = QHBoxLayout()
         type_layout.addWidget(QLabel("Shader Type:"))
         self.shader_type_combo = QComboBox()
-        self.shader_type_combo.addItems(["aiStandardSurface", "openPBRSurface"])
+        self.shader_type_combo.addItems(["aiStandardSurface", "openPBRSurface", "dGecko"])
         current_shader = self.settings.get("smart_import", "shader_type", "aiStandardSurface")
         idx = self.shader_type_combo.findText(current_shader)
         self.shader_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -1541,6 +1542,25 @@ class TextureSetSettingsDialog(QDialog):
         auto_import_group.setLayout(auto_import_layout)
         layout.addWidget(auto_import_group)
 
+        format_group = QGroupBox("Texture Format")
+        format_layout = QVBoxLayout()
+
+        self.convert_to_tif_cb = QCheckBox("Convert JPG/PNG/TGA inputs to TIF (LZW) before building")
+        self.convert_to_tif_cb.setChecked(self.settings.get("smart_import", "convert_to_tif", False))
+        format_layout.addWidget(self.convert_to_tif_cb)
+
+        format_info = QLabel(
+            "ℹ Converts non-EXR raster channel textures to a sibling .tif next to the source "
+            "(skipped if an up-to-date .tif already exists) so they can be layer-edited in "
+            "Photoshop. EXR is left untouched."
+        )
+        format_info.setStyleSheet("color: #888; font-size: 10px;")
+        format_info.setWordWrap(True)
+        format_layout.addWidget(format_info)
+
+        format_group.setLayout(format_layout)
+        layout.addWidget(format_group)
+
         layout.addStretch()
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1552,6 +1572,7 @@ class TextureSetSettingsDialog(QDialog):
         """Save settings and close dialog"""
         self.settings.set("smart_import", "shader_type", self.shader_type_combo.currentText())
         self.settings.set("smart_import", "var_import_displacement", self.var_displacement_cb.isChecked())
+        self.settings.set("smart_import", "convert_to_tif", self.convert_to_tif_cb.isChecked())
 
         if self.settings.save():
             self.settings_changed.emit()

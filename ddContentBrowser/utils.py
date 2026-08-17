@@ -973,21 +973,26 @@ def format_sequence_pattern(base_name: str, padding: int, separator: str, extens
 # smart_imports/ddShaderNetworkGenerator.json so grouping and shader
 # building agree on which suffix maps to which material channel.
 TEXTURE_CHANNEL_ALIASES = {
-    "baseColor":    ["basecolor", "base_color", "albedo", "diffuse", "diffuse_color", "diff", "color", "col"],
-    "roughness":    ["roughness", "rough", "glossiness", "gloss"],
+    "baseColor":    ["basecolor", "base_color", "albedo", "diffuse", "diffuse_color", "diff", "color", "col", "clr"],
+    "roughness":    ["roughness", "rough", "glossiness", "gloss", "rgh"],
     "metalness":    ["metalness", "metallic", "metal", "met"],
-    "normal":       ["normal", "normalmap", "normal_gl", "normal_dx", "normalgl", "normaldx", "nrm", "nor", "norm", "n"],
+    "normal":       ["normal", "normalmap", "normal_gl", "normal_dx", "normalgl", "normaldx",
+                      "nor_gl", "nor_dx", "norgl", "nordx", "nrm", "nor", "norm", "n"],
     # High-poly-only normal variant (baked bump-into-normal for the "High" LOD).
     # Two unrelated naming conventions map to the same channel: the compound
     # "NormalBump"/"BumpNormal", and a plain "Normal" with an "_HF" (High
     # Frequency) suffix - both are used the same way, only for High geo.
     "normalHigh":   ["normalbump", "bumpnormal", "normal_hf", "normalhf"],
     "bump":         ["bump", "bumpmap"],
-    "height":       ["height", "heightmap", "bumpheight"],
+    "height":       ["height", "heightmap", "bumpheight", "heightpn"],
     "displacement": ["displacement", "disp", "displ", "displace"],
     "emission":     ["emission", "emissive", "emit"],
-    "opacity":      ["opacity", "alpha", "cutout", "cutoutopacity", "mask"],
+    "opacity":      ["opacity", "alpha", "cutout", "cutoutopacity", "mask", "geometrymask", "geometry_mask"],
     "transmission": ["transmission", "refraction", "refract"],
+    # Diffuse/subsurface-style transmission (e.g. leaves, paper) - distinct
+    # from "transmission" above, which is specular/refractive (glass-like,
+    # IOR-based). Not the same shader input, so not merged into that channel.
+    "translucency": ["translucency", "translucent"],
     "ao":           ["ao", "ambientocclusion", "ambient_occlusion", "occlusion", "occ"],
     "cavity":       ["cavity"],
     "specular":     ["specular", "spec"],
@@ -1021,7 +1026,7 @@ _TEXTURE_ALIAS_LOOKUP = _build_texture_alias_lookup()
 
 def _match_channel_suffix(s):
     """Match the longest known channel alias as a trailing token of s.
-    Returns (base, channel), or (None, None) if nothing matches."""
+    Returns (base, channel, alias), or (None, None, None) if nothing matches."""
     low = s.lower()
     for alias, channel in _TEXTURE_ALIAS_LOOKUP:
         for sep in ('_', '-', '.'):
@@ -1029,22 +1034,44 @@ def _match_channel_suffix(s):
             if low.endswith(token):
                 base = s[:len(s) - len(token)]
                 if base:
-                    return base, channel
-    return None, None
+                    return base, channel, alias
+    return None, None, None
 
 
 _LOD_REGEX = re.compile(r'[._-]lod(\d+)$', re.IGNORECASE)
 
 
+def _strip_trailing_lod(s):
+    """Strip a trailing _LODn tag. Returns (remaining, lod) - lod is 'LODn', or None if absent."""
+    m = _LOD_REGEX.search(s)
+    if m:
+        return s[:m.start()], f"LOD{m.group(1)}"
+    return s, None
+
+
 def parse_texture_filename(stem: str, extension: str = None):
     """
-    Parse a texture filename stem into (set_base, channel, udim, lod).
+    Parse a texture filename stem into (set_base, channel, udim, lod, alias).
 
     Strips a trailing UDIM (1xxx) token, then a trailing LOD tag (e.g.
     "_LOD0", "_LOD5" - a mesh-resolution-specific override, common in
     Megascans-style libraries where most channels are shared across LODs but
     e.g. normal maps have per-LOD variants), then matches the longest channel
     alias as a trailing token separated by _ . or -.
+
+    The LOD tag can sit in either of two positions, both handled here:
+        base_channel_LODn   (Megascans style, e.g. "Wall_Normal_LOD0")
+        base_LODn_channel   (textures.com style, e.g. "..._LOD0_height")
+    The first is caught by the trailing-LOD strip below (before channel
+    matching); the second only becomes visible after the channel suffix is
+    removed, so it's re-checked on the leftover base.
+
+    A trailing resolution tag (e.g. "_4k", common on textures.com/Poliigon
+    exports: "Lantern_01_brass_diff_4k") sits after the channel suffix, so
+    it's stripped before channel matching too - but re-attached to the
+    returned base afterwards, since find_texture_set_for_geo() relies on
+    the set's display name still carrying it to prefer a 4K set over a 2K
+    one for the same asset.
 
     .tx files (pass extension='.tx') can use one of two naming styles:
         Albedo.tx                    - plain
@@ -1059,9 +1086,13 @@ def parse_texture_filename(stem: str, extension: str = None):
     1, or 2 extra tokens after it".
 
     Returns:
-        (set_base, channel_key, udim, lod) if a channel suffix was found,
-        otherwise (stem, None, None, None). lod is a string like "LOD0", or
-        None if the filename has no LOD tag.
+        (set_base, channel_key, udim, lod, alias) if a channel suffix was
+        found, otherwise (stem, None, None, None, None). lod is a string
+        like "LOD0", or None if the filename has no LOD tag. alias is the
+        specific matched suffix (e.g. "heightpn" vs "height") - some
+        channels have multiple aliases that aren't interchangeable quality-
+        wise (see _ALIAS_PRIORITY_OVERRIDES), so the caller needs to know
+        exactly which one matched, not just the resolved channel.
     """
     s = stem
     udim = None
@@ -1070,11 +1101,8 @@ def parse_texture_filename(stem: str, extension: str = None):
         udim = m.group(1)
         s = s[:m.start()]
 
-    lod = None
-    m = _LOD_REGEX.search(s)
-    if m:
-        lod = f"LOD{m.group(1)}"
-        s = s[:m.start()]
+    s, lod = _strip_trailing_lod(s)
+    s, res_tag = _strip_resolution_tag(s)
 
     if extension and extension.lower() == '.tx':
         fake_ext = Path(s).suffix.lower()
@@ -1082,18 +1110,26 @@ def parse_texture_filename(stem: str, extension: str = None):
             s = s[:-len(fake_ext)]
 
         for attempt in range(3):  # 0, 1, then 2 trailing tokens stripped
-            base, channel = _match_channel_suffix(s)
+            base, channel, alias = _match_channel_suffix(s)
             if channel:
-                return base, channel, udim, lod
+                if lod is None:
+                    base, lod = _strip_trailing_lod(base)
+                if res_tag:
+                    base = f"{base}_{res_tag}"
+                return base, channel, udim, lod, alias
             if attempt == 2 or '_' not in s:
                 break
             s = s.rsplit('_', 1)[0]
-        return stem, None, None, None
+        return stem, None, None, None, None
 
-    base, channel = _match_channel_suffix(s)
+    base, channel, alias = _match_channel_suffix(s)
     if channel:
-        return base, channel, udim, lod
-    return stem, None, None, None
+        if lod is None:
+            base, lod = _strip_trailing_lod(base)
+        if res_tag:
+            base = f"{base}_{res_tag}"
+        return base, channel, udim, lod, alias
+    return stem, None, None, None, None
 
 
 # When the same (base name, channel, UDIM) exists in more than one file format
@@ -1116,6 +1152,21 @@ def _texture_extension_rank(path: Path) -> int:
         return len(_TEXTURE_EXTENSION_PRIORITY)
 
 
+# Some channels have multiple aliases that resolve to the same channel key
+# but aren't equally good - e.g. a "_heightPN" export should win the channel
+# slot over a plain "_height" of the same UDIM/LOD, not just be a same-
+# quality alternate spelling. Lower = higher priority; an alias not listed
+# here (or a channel not listed at all) ranks 1 (same as the average case),
+# so this only kicks in for channels that actually need it.
+_ALIAS_PRIORITY_OVERRIDES = {
+    "height": {"heightpn": 0},
+}
+
+
+def _alias_rank(channel, alias):
+    return _ALIAS_PRIORITY_OVERRIDES.get(channel, {}).get(alias, 1)
+
+
 def _group_texture_sets_single_pass(file_paths: List[Path]):
     """
     Core grouping pass, run separately per extension partition (see
@@ -1124,15 +1175,19 @@ def _group_texture_sets_single_pass(file_paths: List[Path]):
     a single channel split across >= 2 UDIM tiles, or a channel with
     per-LOD overrides (e.g. Normal_LOD0 + Normal_LOD5). Files that share
     base name, channel, UDIM AND LOD (e.g. the same map exported as both
-    .png and .exr) describe the same variant, not two: only the
-    higher-priority format (see _TEXTURE_EXTENSION_PRIORITY) is kept in the
-    set, the other is demoted to a loose file.
+    .png and .exr, or a plain vs. "PN" height export) describe the same
+    variant, not two: only the higher-priority one (alias priority first,
+    see _ALIAS_PRIORITY_OVERRIDES, then file format, see
+    _TEXTURE_EXTENSION_PRIORITY) is kept in the set, the other is demoted to
+    a loose file - this is the whole point of the texture set view: an
+    active set member is never also shown standalone, only the demoted
+    loser is.
     """
     sets = {}
     singles = []
 
     for path in file_paths:
-        base, channel, udim, lod = parse_texture_filename(path.stem, path.suffix)
+        base, channel, udim, lod, alias = parse_texture_filename(path.stem, path.suffix)
         if channel is None:
             singles.append(path)
             continue
@@ -1144,15 +1199,19 @@ def _group_texture_sets_single_pass(file_paths: List[Path]):
         variants = sets[key]['variants']
         existing = variants.get(variant_key)
         if existing is None:
-            variants[variant_key] = path
-        elif _texture_extension_rank(path) < _texture_extension_rank(existing):
-            # New file's format outranks the one we already picked - swap in,
-            # demote the previous winner to a loose file, but remember it
-            # belonged to this set (surfaced as a "+N" badge indicator).
-            variants[variant_key] = path
-            sets[key]['extra_formats'].append(existing)
+            variants[variant_key] = (path, alias)
         else:
-            sets[key]['extra_formats'].append(path)
+            existing_path, existing_alias = existing
+            new_rank = (_alias_rank(channel, alias), _texture_extension_rank(path))
+            existing_rank = (_alias_rank(channel, existing_alias), _texture_extension_rank(existing_path))
+            if new_rank < existing_rank:
+                # New file outranks the one we already picked - swap in,
+                # demote the previous winner to a loose file, but remember it
+                # belonged to this set (surfaced as a "+N" badge indicator).
+                variants[variant_key] = (path, alias)
+                sets[key]['extra_formats'].append(existing_path)
+            else:
+                sets[key]['extra_formats'].append(path)
 
     result_sets = {}
     for key, data in sets.items():
@@ -1161,7 +1220,7 @@ def _group_texture_sets_single_pass(file_paths: List[Path]):
         if len(variants) >= 2:
             channels = {}
             files = []
-            for (channel, _udim, _lod), path in variants.items():
+            for (channel, _udim, _lod), (path, _alias) in variants.items():
                 channels.setdefault(channel, []).append(path)
                 files.append(path)
             result_sets[data['display']] = {
@@ -1173,11 +1232,14 @@ def _group_texture_sets_single_pass(file_paths: List[Path]):
                 # need to pick a specific LOD/UDIM variant (e.g. a future
                 # geo-import material builder). Not used by grouping/display
                 # yet, kept here so that info isn't thrown away.
-                'variant_map': dict(variants),
+                'variant_map': {k: v[0] for k, v in variants.items()},
             }
-            singles.extend(data['extra_formats'])
+            # extra_formats belong to this set (tracked for the "+N" badge/
+            # tooltip) but must NOT also appear as standalone tiles - once a
+            # file is part of a set, winner or demoted duplicate, it's never
+            # shown separately. That's the whole point of the texture set view.
         else:
-            singles.extend(variants.values())
+            singles.extend(path for path, _alias in variants.values())
             singles.extend(data['extra_formats'])
 
     return result_sets, singles
@@ -1231,7 +1293,7 @@ def group_texture_sets(file_paths: List[Path]):
                 'display': str,
                 'channels': dict[channel_key] -> list[Path],
                 'files': list[Path],
-                'extra_formats': list[Path]  # demoted same-variant duplicates
+                'extra_formats': list[Path]  # demoted same-variant duplicates, badge/tooltip only - never standalone tiles
             }
             singles: list[Path] that did not belong to any set
     """
@@ -1249,6 +1311,149 @@ def group_texture_sets(file_paths: List[Path]):
 
     singles = other_singles + tx_plain_singles + tx_annotated_singles
     return result_sets, singles
+
+
+# Raster formats that can be converted to TIF - EXR (already lossless/HDR-
+# capable) and .tx (pre-baked render-ready) are intentionally excluded.
+_TIF_CONVERTIBLE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tga'}
+
+
+def _convert_single_to_tif(path: Path) -> Path:
+    """
+    Convert one texture to a sibling .tif (LZW) next to it, if needed.
+
+    Written next to the source (not a cache folder) so the result becomes a
+    genuine texture set member - the existing extension-priority grouping
+    (see _group_texture_sets_single_pass) already prefers .tif over
+    .jpg/.png/.tga, so it's picked up automatically on the next scan without
+    any special-case logic.
+
+    Returns the .tif path (existing or freshly converted), or the original
+    path unchanged if conversion isn't applicable/fails.
+    """
+    if path.suffix.lower() not in _TIF_CONVERTIBLE_EXTENSIONS:
+        return path
+
+    tif_path = path.with_suffix('.tif')
+    try:
+        if tif_path.exists() and tif_path.stat().st_mtime >= path.stat().st_mtime:
+            return tif_path  # already converted and up to date
+    except OSError:
+        pass
+
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            img.load()
+            img.save(str(tif_path), format='TIFF', compression='tiff_lzw')
+        return tif_path
+    except Exception as e:
+        print(f"[TIFConvert] Failed to convert {path} to TIF: {e}")
+        return path
+
+
+def _convert_paths_to_tif(paths, progress_callback=None) -> dict:
+    """Convert an iterable of Paths (skipping non-convertible ones) to .tif
+    in parallel. Returns {original_path: result_path} for the ones actually
+    attempted (empty dict if nothing in `paths` was convertible).
+
+    progress_callback, if given, is called as progress_callback(done, total)
+    after each file finishes - in actual completion order (as_completed),
+    not submission order, so it reflects real progress under parallelism."""
+    to_convert = [p for p in paths if p.suffix.lower() in _TIF_CONVERTIBLE_EXTENSIONS]
+    if not to_convert:
+        return {}
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    total = len(to_convert)
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(8, total)) as executor:
+        futures = {executor.submit(_convert_single_to_tif, p): p for p in to_convert}
+        done = 0
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                results[path] = future.result()
+            except Exception as e:
+                print(f"[TIFConvert] Failed to convert {path} to TIF: {e}")
+                results[path] = path
+            done += 1
+            if progress_callback:
+                progress_callback(done, total)
+    return results
+
+
+def convert_channel_paths_to_tif(channels: dict, progress_callback=None) -> dict:
+    """
+    Convert a texture set's non-EXR raster channel files (.jpg/.jpeg/.png/
+    .tga) to sibling .tif (LZW), for pipelines that prefer TIF for its
+    Photoshop layer support. UDIM tiles are each converted individually
+    (channels[key] already lists every tile as a separate Path - see
+    _group_texture_sets_single_pass), not just the first/representative one.
+
+    Conversions run in parallel (PIL releases the GIL during image codec
+    work, so threading gives a real speedup) and are skipped per-file if an
+    up-to-date .tif sibling already exists, so repeat builds are effectively
+    free. progress_callback(done, total), if given, is called after each
+    file finishes.
+
+    Args:
+        channels: dict[channel_key] -> list[Path], as produced by
+            group_texture_sets()/TextureSet.channels.
+
+    Returns:
+        A new dict with the same shape; convertible paths are swapped to
+        their .tif counterparts, everything else passes through unchanged.
+    """
+    results = _convert_paths_to_tif((p for files in channels.values() for p in files), progress_callback)
+    if not results:
+        return channels
+    return {channel: [results.get(p, p) for p in files] for channel, files in channels.items()}
+
+
+def convert_variant_map_to_tif(variant_map: dict, progress_callback=None) -> dict:
+    """
+    Same conversion as convert_channel_paths_to_tif(), but for the flat
+    (channel, UDIM, LOD) -> Path shape used by find_texture_set_for_geo()/
+    resolve_texture_set_channels() - resolve_texture_set_channels() already
+    collapses to one file per channel (discarding the other UDIM tiles), so
+    conversion has to happen here, on the full variant_map, first.
+    """
+    results = _convert_paths_to_tif(variant_map.values(), progress_callback)
+    if not results:
+        return variant_map
+    return {key: results.get(p, p) for key, p in variant_map.items()}
+
+
+def convert_texture_sets_to_tif(channels_list, progress_callback=None):
+    """
+    Convert non-EXR raster textures across MULTIPLE texture sets in one
+    combined pass, so progress_callback(done, total) reflects the whole
+    batch (e.g. several sets dragged/dropped together) instead of resetting
+    back to 0 for each set.
+
+    Args:
+        channels_list: list of dict[channel_key] -> list[Path], one per
+            texture set (as produced by group_texture_sets()/TextureSet.channels).
+
+    Returns:
+        A new list of dicts, same shape/order as channels_list, with
+        convertible paths swapped to their .tif counterparts.
+    """
+    all_paths = (p for channels in channels_list for files in channels.values() for p in files)
+    results = _convert_paths_to_tif(all_paths, progress_callback)
+    if not results:
+        return channels_list
+    return [
+        {channel: [results.get(p, p) for p in files] for channel, files in channels.items()}
+        for channels in channels_list
+    ]
+
+
+def channel_paths_from_channels(channels: dict) -> dict:
+    """dict[channel]->list[Path] -> dict[channel]->str(first path). Mirrors
+    TextureSet.channel_paths, for callers working with a converted (or
+    otherwise transformed) channels dict rather than a live TextureSet."""
+    return {channel: str(files[0]) for channel, files in channels.items() if files}
 
 
 # Channel priority for choosing a texture set's representative (thumbnail) file.
@@ -1269,6 +1474,107 @@ def get_texture_set_thumbnail_path(channels: dict):
         if files:
             return files[0]
     return None
+
+
+# ============================================================
+# Folder preview thumbnails (a *preview.<ext> image inside a folder is
+# shown as its thumbnail instead of the generic folder icon)
+# ============================================================
+
+# Sentinel distinguishing "not present in the batch cache lookup result"
+# (never checked) from an actual cached value of None (checked, no preview).
+_NOT_CACHED = object()
+
+
+def find_folder_preview_file(folder_path) -> Optional[Path]:
+    """
+    Look for an image directly inside folder_path (non-recursive) whose
+    filename (without extension) ends in "preview" - e.g. "AssetPreview.png"
+    or "preview.jpg". Returns the first match, or None.
+    """
+    folder_path = Path(folder_path)
+    try:
+        for entry in os.scandir(folder_path):
+            if not entry.is_file():
+                continue
+            p = Path(entry.path)
+            if not p.stem.lower().endswith('preview'):
+                continue
+            if get_extension_category(p.suffix.lower()) == 'images':
+                return p
+    except OSError:
+        pass
+    return None
+
+
+def resolve_folder_previews(folder_paths) -> dict:
+    """
+    Resolve which of the given folders have a *preview image inside them,
+    using the metadata DB (folder_preview_cache table) so a folder already
+    checked isn't re-scanned on every directory listing - only the first
+    time it's seen, or after invalidate_folder_previews() clears it (F5,
+    manual "regenerate thumbnail").
+
+    Args:
+        folder_paths: iterable of folder Path objects.
+
+    Returns:
+        dict[Path] -> Path: only folders that DO have a preview are present
+        (absent, not None, for folders without one - use .get(folder)).
+    """
+    folder_paths = list(folder_paths)
+    if not folder_paths:
+        return {}
+
+    try:
+        from .metadata import get_metadata_manager
+        mm = get_metadata_manager()
+    except Exception:
+        mm = None
+
+    results = {}
+    to_scan = folder_paths
+    if mm is not None:
+        # One batched lookup instead of one SELECT per folder - matters at
+        # directory-listing scale (e.g. thousands of subfolders).
+        cached = mm.get_folder_previews_batch(str(f) for f in folder_paths)
+        to_scan = []
+        for folder in folder_paths:
+            cached_path = cached.get(str(folder), _NOT_CACHED)
+            if cached_path is _NOT_CACHED:
+                to_scan.append(folder)
+            elif cached_path:
+                results[folder] = Path(cached_path)
+
+    if to_scan:
+        # Independent, I/O-bound filesystem/network scans (only for folders
+        # never checked before) - run in parallel instead of one at a time,
+        # same reasoning as the TIF conversion's thread pool. Higher worker
+        # count than that one since this is pure I/O wait (network latency),
+        # not CPU-bound codec work.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(16, len(to_scan))) as executor:
+            scanned = dict(zip(to_scan, executor.map(find_folder_preview_file, to_scan)))
+
+        newly_checked = {}
+        for folder, preview in scanned.items():
+            newly_checked[str(folder)] = str(preview) if preview else None
+            if preview:
+                results[folder] = preview
+        if mm is not None:
+            mm.set_folder_previews_batch(newly_checked)
+
+    return results
+
+
+def invalidate_folder_previews(folder_paths):
+    """Drop cached folder-preview entries so the next listing re-scans them
+    (F5 / manual "regenerate thumbnail" on folders)."""
+    try:
+        from .metadata import get_metadata_manager
+        get_metadata_manager().clear_folder_previews(str(p) for p in folder_paths)
+    except Exception as e:
+        print(f"[FolderPreview] Failed to invalidate cache: {e}")
 
 
 # ============================================================
@@ -1321,12 +1627,16 @@ def find_texture_set_for_geo(geo_path):
 
     Special case (Megascans "3D plant" layout): the geo can sit in a
     "VarN" folder (Var1, Var2, ...) whose own name carries no material info,
-    with the shared texture set living in a sibling "Textures" folder (with
-    its own subfolders, e.g. Textures/Atlas) one level up from VarN. If the
-    normal search above finds nothing and the geo's parent folder is named
-    "VarN", that Textures tree is searched (recursively) and its single
-    texture set (if there's exactly one) is used - name matching doesn't
-    apply here since "Var1" isn't a material name.
+    with the shared texture set living in a sibling "Textures" folder one
+    level up from VarN. If the normal search above finds nothing and the
+    geo's parent folder is named "VarN", that Textures folder is searched
+    for its single texture set (if there's exactly one) - name matching
+    doesn't apply here since "Var1" isn't a material name. Some assets ship
+    both an "Atlas" set (for the VarN mesh) and a separate "Billboard" set
+    (for a different, non-VarN impostor geo) side by side under Textures/ -
+    when an "Atlas" subfolder exists, only it is searched (a VarN mesh
+    always needs the Atlas set), otherwise the whole Textures tree is
+    searched recursively.
 
     Args:
         geo_path: Path (or str) to the imported geo file.
@@ -1398,7 +1708,26 @@ def find_texture_set_for_geo(geo_path):
             pass
 
         if textures_dir:
-            candidates = _images_in(textures_dir, recursive=True)
+            # Some 3D-plant assets ship BOTH an "Atlas" set (full 3D mesh,
+            # the VarN geo this fallback is for) and a "Billboard" set (a
+            # separate impostor-plane geo, not a VarN mesh) side by side
+            # under Textures/. Scanning the whole tree recursively would mix
+            # both sets together and produce >1 result, so the old "exactly
+            # one set found" check would fail and silently skip the match.
+            # Prefer the Atlas subfolder alone when present - that's always
+            # the one a VarN mesh needs; only fall back to scanning the
+            # whole tree if there's no dedicated Atlas subfolder.
+            atlas_dir = None
+            try:
+                for d in textures_dir.iterdir():
+                    if d.is_dir() and d.name.lower() == 'atlas':
+                        atlas_dir = d
+                        break
+            except OSError:
+                pass
+
+            search_dir = atlas_dir or textures_dir
+            candidates = _images_in(search_dir, recursive=True)
             if candidates:
                 sets, _ = group_texture_sets(candidates)
                 non_tx = [d for d in sets.values() if ' (TX' not in d['display']]

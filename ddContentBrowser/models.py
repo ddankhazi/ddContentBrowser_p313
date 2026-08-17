@@ -53,13 +53,41 @@ def apply_pending_texture_set_drop():
         print("[TextureSet] No pending texture set to build.")
         return
 
-    # Resolve shader type from settings (default aiStandardSurface)
+    # Resolve shader type / TIF-conversion settings (defaults if unavailable)
     shader_type = 'aiStandardSurface'
+    convert_to_tif = False
     try:
         from .settings import SettingsManager
-        shader_type = SettingsManager().get('smart_import', 'shader_type', 'aiStandardSurface')
+        _settings = SettingsManager()
+        shader_type = _settings.get('smart_import', 'shader_type', 'aiStandardSurface')
+        convert_to_tif = _settings.get('smart_import', 'convert_to_tif', False)
     except Exception as e:
-        print(f"[TextureSet] Could not read shader_type setting ({e}), using default.")
+        print(f"[TextureSet] Could not read smart_import settings ({e}), using defaults.")
+
+    # payload['sets'][i]['channels'] is still the list-based dict (channel ->
+    # list[Path], every UDIM tile kept separate) at this point - collapse it
+    # to channel -> str(path) now, converting to TIF first if that setting
+    # is on (so every tile gets converted, not just the first per channel).
+    # One combined batch (not per-set) so a multi-set drop shows one
+    # accurate running count, reusing the browser's progress dialog if it's
+    # running (this is a free function invoked from a MEL callback, so
+    # there's no `self` to hang a dialog off of otherwise).
+    from .utils import channel_paths_from_channels, convert_texture_sets_to_tif
+    channels_list = [ts['channels'] for ts in payload['sets']]
+    if convert_to_tif:
+        try:
+            from . import browser as _browser_mod
+            browser_instance = getattr(_browser_mod, '_content_browser_instance', None)
+        except Exception:
+            browser_instance = None
+        if browser_instance is not None:
+            channels_list = browser_instance._convert_channels_with_progress(channels_list)
+        else:
+            channels_list = convert_texture_sets_to_tif(channels_list)
+    sets = [
+        {'name': ts['name'], 'channels': channel_paths_from_channels(channels)}
+        for ts, channels in zip(payload['sets'], channels_list)
+    ]
 
     # Load the shader network generator module (standalone file, not a package)
     try:
@@ -73,7 +101,7 @@ def apply_pending_texture_set_drop():
         return
 
     try:
-        mod.build_from_texture_sets(payload['sets'], shader_type=shader_type)
+        mod.build_from_texture_sets(sets, shader_type=shader_type)
     except Exception as e:
         import traceback
         print(f"[TextureSet] Shader build failed: {e}")
@@ -228,10 +256,12 @@ class TextureSet:
         channels: dict[channel_key] -> list[Path] (UDIM tiles kept as list)
         files: flat list of all Path objects in the set
         directory: parent folder of the set
-        extra_formats: alternate-format duplicates demoted out of the set
-            (same channel+UDIM, lower-priority extension - e.g. a .png that
-            lost to a .tif of the same baseColor/UDIM). Shown as loose files
-            elsewhere, but counted on the set's badge as "+N".
+        extra_formats: alternate/lower-priority duplicates demoted out of the
+            set (same channel+UDIM+LOD - e.g. a .png that lost to a .tif of
+            the same baseColor/UDIM, or a plain height that lost to a
+            higher-priority "PN" height export). Never shown as standalone
+            tiles - only counted on the set's badge as "+N" and listed in
+            its tooltip.
     """
 
     def __init__(self, name, channels, files, extra_formats=None):
@@ -280,10 +310,13 @@ class TextureSet:
 class AssetItem:
     """Asset item representation with lazy stat loading"""
     
-    def __init__(self, file_path, lazy_load=False):
+    def __init__(self, file_path, lazy_load=False, is_dir=None):
         self.file_path = Path(file_path)
         self.name = self.file_path.name
-        self.is_folder = self.file_path.is_dir()
+        # Callers that already know this (e.g. from an os.scandir() DirEntry,
+        # which gets it for free) can pass is_dir directly to skip a second,
+        # separate stat() call here - doubly expensive over network drives.
+        self.is_folder = self.file_path.is_dir() if is_dir is None else is_dir
         self.extension = "" if self.is_folder else self.file_path.suffix.lower()
         
         # Image sequence support
@@ -293,7 +326,13 @@ class AssetItem:
         # Texture set support (PBR channel grouping)
         self.is_texture_set = False
         self.texture_set = None  # TextureSet object if is_texture_set=True
-        
+
+        # Folder preview thumbnail (*preview.<ext> image inside a folder,
+        # resolved externally after construction - see
+        # utils.resolve_folder_previews() - since it needs a metadata DB
+        # cache lookup/scan that doesn't belong in a plain constructor)
+        self.folder_preview_path = None
+
         # Lazy loading - csak akkor töltjük be a stat infót, ha kell
         self._stat_loaded = False
         self._size = None
@@ -448,7 +487,13 @@ class FileSystemModel(QAbstractListModel):
         self._file_path_to_row = {}  # Fast lookup: file_path_str -> row_index
         self.current_path = None
         self.filter_text = ""
-        
+        # Mirrors the browser's "Thumbnails" / "Folder Thumbnails" checkboxes
+        # (pushed in from browser.py, since the model has no widget access
+        # of its own) - both skip folder-preview resolution entirely when
+        # off, see _resolve_folder_previews().
+        self.thumbnails_enabled = True
+        self.folder_thumbnails_enabled = True
+
         # Base supported formats - from central FILE_TYPE_REGISTRY
         from .utils import get_all_supported_extensions, get_extensions_by_category
         self.base_formats = get_all_supported_extensions()
@@ -696,7 +741,12 @@ class FileSystemModel(QAbstractListModel):
                 
                 # Collect file paths as strings (memory efficient)
                 collected_paths = []
-                
+                # Path strings known to be directories (os.walk's own dirs
+                # list already tells us this for free) - lets AssetItem
+                # skip a redundant is_dir() stat call below, same as the
+                # non-recursive scandir() path.
+                collected_dirs = set()
+
                 for root, dirs, files in os.walk(self.current_path):
                     # Check for interrupt
                     if self._interrupt_search:
@@ -711,10 +761,14 @@ class FileSystemModel(QAbstractListModel):
                             if not dir_name.startswith('.'):
                                 if self.filter_text:
                                     if self._matches_search(dir_name, self.filter_text):
-                                        collected_paths.append(str(root_path / dir_name))
+                                        dir_path_str = str(root_path / dir_name)
+                                        collected_paths.append(dir_path_str)
+                                        collected_dirs.add(dir_path_str)
                                         loaded_count += 1
                                 else:
-                                    collected_paths.append(str(root_path / dir_name))
+                                    dir_path_str = str(root_path / dir_name)
+                                    collected_paths.append(dir_path_str)
+                                    collected_dirs.add(dir_path_str)
                                     loaded_count += 1
                     
                     # Add files
@@ -773,7 +827,7 @@ class FileSystemModel(QAbstractListModel):
                 self._current_display_limit = len(collected_paths)
                 
                 # Convert collected string paths to Path objects (lazy conversion)
-                all_items = [Path(p) for p in collected_paths]
+                all_items = [(Path(p), p in collected_dirs) for p in collected_paths]
                 
                 # Emit final progress
                 if is_search_mode:
@@ -891,20 +945,20 @@ class FileSystemModel(QAbstractListModel):
                         if is_directory:
                             # Add folder if folders are enabled
                             if self.show_folders:
-                                all_items.append(Path(entry.path))
+                                all_items.append((Path(entry.path), True))
                         else:
                             # Check file extension
                             ext = Path(entry.name).suffix.lower()
-                            
+
                             # Apply file type filters
                             if self.filter_file_types:
                                 # Only specific types
                                 if ext in self.filter_file_types and is_extension_supported(ext):
-                                    all_items.append(Path(entry.path))
+                                    all_items.append((Path(entry.path), False))
                             else:
                                 # All supported types (i.e. not individually disabled)
                                 if is_extension_supported(ext):
-                                    all_items.append(Path(entry.path))
+                                    all_items.append((Path(entry.path), False))
             
             # Only process if we didn't use cache
             if cached_assets is None:
@@ -913,16 +967,20 @@ class FileSystemModel(QAbstractListModel):
                 
                 # Filter based on search text (applies to both folders and files)
                 if self.filter_text:
-                    all_items = [f for f in all_items if self._matches_search(f.name, self.filter_text)]
+                    all_items = [(f, d) for f, d in all_items if self._matches_search(f.name, self.filter_text)]
                     if DEBUG_MODE:
                         print(f"[Model] After search filter: {len(all_items)} items")
-                
-                # Convert to AssetItem objects with LAZY LOADING
-                self.assets = [AssetItem(f, lazy_load=True) for f in all_items]
-                
+
+                # Convert to AssetItem objects with LAZY LOADING - is_dir
+                # passed straight from the scandir() DirEntry above so the
+                # constructor doesn't need a second stat() call to re-derive it.
+                self.assets = [AssetItem(f, lazy_load=True, is_dir=d) for f, d in all_items]
+
                 if DEBUG_MODE:
                     print(f"[Model] Created {len(self.assets)} AssetItem objects")
-                
+
+                self._resolve_folder_previews(self.assets)
+
                 # Apply advanced filters
                 # Ellenőrizzük, hogy kell-e stat info (méret/dátum szűrés)
                 needs_stat_for_filter = (
@@ -1128,6 +1186,38 @@ class FileSystemModel(QAbstractListModel):
             # No image files to group
             self.assets = folders + other_files
     
+    def _resolve_folder_previews(self, assets):
+        """
+        Set .folder_preview_path / .should_generate_thumbnail on folder
+        AssetItems that contain a *preview image, so the delegate renders
+        that image instead of the generic folder icon and the normal
+        thumbnail pipeline (memory/disk cache, background generation)
+        picks it up. Batched over all folders in this listing at once -
+        cheap after the first visit (see utils.resolve_folder_previews(),
+        cached in the metadata DB).
+        """
+        if not self.thumbnails_enabled or not self.folder_thumbnails_enabled:
+            # Nothing would be shown anyway - skip the DB/filesystem work
+            # entirely (this is exactly the case a user disables one of
+            # these for, to speed up browsing a folder with thousands of
+            # items).
+            return
+        folders = [a for a in assets if a.is_folder]
+        if not folders:
+            return
+        try:
+            from .utils import resolve_folder_previews
+            previews = resolve_folder_previews(a.file_path for a in folders)
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"[Model] Folder preview resolution failed: {e}")
+            return
+        for asset in folders:
+            preview = previews.get(asset.file_path)
+            if preview:
+                asset.folder_preview_path = preview
+                asset.should_generate_thumbnail = True
+
     def _group_texture_sets(self):
         """
         Group image files into PBR texture sets (per folder).
@@ -1645,9 +1735,12 @@ class FileSystemModel(QAbstractListModel):
         # Texture set drag -> generate shader network(s) from the dropped set(s)
         if texture_set_assets:
             global _PENDING_TEXTURE_SET_DROP
+            # List-based channels (not channel_paths) so
+            # apply_pending_texture_set_drop() can convert every UDIM tile
+            # to TIF if that setting is on, not just the first per channel.
             _PENDING_TEXTURE_SET_DROP = {
                 'sets': [
-                    {'name': a.texture_set.name, 'channels': a.texture_set.channel_paths}
+                    {'name': a.texture_set.name, 'channels': a.texture_set.channels}
                     for a in texture_set_assets
                 ]
             }
@@ -1802,6 +1895,7 @@ class FileSystemModel(QAbstractListModel):
         creation_start = time.time()
         additional_items = [Path(p) for p in additional_paths]
         additional_assets = [AssetItem(f, lazy_load=True) for f in additional_items]
+        self._resolve_folder_previews(additional_assets)
         creation_time = time.time() - creation_start
         print(f"   AssetItem creation took {creation_time:.2f}s")
         

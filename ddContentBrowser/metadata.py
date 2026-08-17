@@ -72,13 +72,27 @@ class MetadataManager:
             )
         ''')
         
+        # Folder preview cache: whether a folder contains a *preview.<ext>
+        # image (shown as the folder's thumbnail instead of the generic
+        # folder icon). NULL preview_path means "checked, no preview found" -
+        # distinct from "row absent" (never checked yet), so a folder isn't
+        # re-scanned on every directory listing. Cleared (rows deleted) on
+        # F5 / manual "regenerate thumbnail" to force a re-scan.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS folder_preview_cache (
+                folder_path TEXT PRIMARY KEY,
+                preview_path TEXT,
+                checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         # Create indexes for performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_rating ON file_metadata(rating)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_color ON file_metadata(color_label)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_category ON tags(category)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_path ON file_tags(file_path)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag_id)')
-        
+
         self.conn.commit()
     
     def load_default_tags(self, json_path: Path = None):
@@ -484,7 +498,86 @@ class MetadataManager:
         self.conn.commit()
         print(f"✓ Category '{category_name}' deleted ({len(tag_ids)} tags removed)")
         return True
-    
+
+    def get_folder_preview(self, folder_path: str) -> Tuple[bool, Optional[str]]:
+        """
+        Look up a folder's cached preview-file status.
+
+        Returns (was_checked, preview_path) - was_checked is False if this
+        folder has never been scanned (caller should scan and store the
+        result via set_folder_preview), True if it was (preview_path is the
+        cached path, or None if the folder was checked and has no preview).
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT preview_path FROM folder_preview_cache WHERE folder_path = ?', (folder_path,))
+        row = cursor.fetchone()
+        if row is None:
+            return False, None
+        return True, row['preview_path']
+
+    def get_folder_previews_batch(self, folder_paths) -> Dict[str, Optional[str]]:
+        """
+        Look up cached preview-file status for many folders in one round
+        trip instead of one SELECT per folder (matters at directory-listing
+        scale - e.g. 4000 subfolders). Chunked to stay under SQLite's
+        max-bound-variables limit on older builds.
+
+        Returns dict[folder_path] -> preview_path (or None) ONLY for
+        folders that were previously checked - a folder_path absent from
+        the result was never scanned (caller should scan + store it).
+        """
+        folder_paths = list(folder_paths)
+        if not folder_paths:
+            return {}
+        results = {}
+        cursor = self.conn.cursor()
+        chunk_size = 500
+        for i in range(0, len(folder_paths), chunk_size):
+            chunk = folder_paths[i:i + chunk_size]
+            placeholders = ','.join('?' * len(chunk))
+            cursor.execute(
+                f'SELECT folder_path, preview_path FROM folder_preview_cache WHERE folder_path IN ({placeholders})',
+                chunk
+            )
+            for row in cursor.fetchall():
+                results[row['folder_path']] = row['preview_path']
+        return results
+
+    def set_folder_preview(self, folder_path: str, preview_path: Optional[str]):
+        """Cache a folder's preview-file scan result (preview_path=None means "checked, none found")."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO folder_preview_cache (folder_path, preview_path)
+            VALUES (?, ?)
+            ON CONFLICT(folder_path) DO UPDATE SET
+                preview_path = excluded.preview_path,
+                checked_at = CURRENT_TIMESTAMP
+        ''', (folder_path, preview_path))
+        self.conn.commit()
+
+    def set_folder_previews_batch(self, results: Dict[str, Optional[str]]):
+        """Cache several folders' preview-file scan results in one transaction."""
+        if not results:
+            return
+        cursor = self.conn.cursor()
+        cursor.executemany('''
+            INSERT INTO folder_preview_cache (folder_path, preview_path)
+            VALUES (?, ?)
+            ON CONFLICT(folder_path) DO UPDATE SET
+                preview_path = excluded.preview_path,
+                checked_at = CURRENT_TIMESTAMP
+        ''', list(results.items()))
+        self.conn.commit()
+
+    def clear_folder_previews(self, folder_paths):
+        """Drop cached preview-file entries for the given folders, forcing a re-scan next time they're listed."""
+        folder_paths = list(folder_paths)
+        if not folder_paths:
+            return
+        cursor = self.conn.cursor()
+        cursor.executemany('DELETE FROM folder_preview_cache WHERE folder_path = ?', [(p,) for p in folder_paths])
+        self.conn.commit()
+
     def __enter__(self):
         return self
     

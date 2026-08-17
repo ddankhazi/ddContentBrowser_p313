@@ -132,26 +132,34 @@ class ThumbnailDelegate(QStyledItemDelegate):
         thumb_y = rect.y() + 5
         thumb_rect = QRect(thumb_x, thumb_y, thumb_size, thumb_size)
         
-        # Special handling for folders
-        if asset.is_folder:
+        # Check if thumbnails are enabled
+        thumbnails_enabled = True
+        if self.browser and hasattr(self.browser, 'thumbnails_enabled_checkbox'):
+            thumbnails_enabled = self.browser.thumbnails_enabled_checkbox.isChecked()
+        folder_thumbnails_enabled = True
+        if self.browser and hasattr(self.browser, 'folder_thumbnails_enabled_checkbox'):
+            folder_thumbnails_enabled = self.browser.folder_thumbnails_enabled_checkbox.isChecked()
+
+        # Special handling for folders - unless it has a *preview image AND
+        # both thumbnail toggles are enabled, in which case it falls through
+        # to the normal thumbnail rendering below. Checked live here (not
+        # just at listing time) so toggling "Folder Thumbnails" off/on takes
+        # effect immediately, without reloading the directory.
+        if asset.is_folder and (not thumbnails_enabled or not folder_thumbnails_enabled
+                                 or not getattr(asset, 'folder_preview_path', None)):
             # Draw folder icon (gray/neutral to not distract from files)
             painter.setPen(QPen(QColor(100, 100, 100), 2))
             painter.setBrush(QColor(160, 160, 160))
-            
+
             # Draw main folder body
             folder_body = QRect(thumb_x + 5, thumb_y + 10, thumb_size - 10, thumb_size - 15)
             painter.drawRoundedRect(folder_body, 4, 4)
-            
+
             # Draw folder tab
             tab_width = thumb_size // 3
             tab_rect = QRect(thumb_x + 5, thumb_y + 5, tab_width, 8)
             painter.drawRoundedRect(tab_rect, 2, 2)
         else:
-            # Check if thumbnails are enabled
-            thumbnails_enabled = True
-            if self.browser and hasattr(self.browser, 'thumbnails_enabled_checkbox'):
-                thumbnails_enabled = self.browser.thumbnails_enabled_checkbox.isChecked()
-            
             # Get thumbnail from cache only if enabled
             # Determine cache key
             file_path_key = str(asset.file_path)
@@ -196,6 +204,10 @@ class ThumbnailDelegate(QStyledItemDelegate):
                                                  scaled.width(), scaled.height(),
                                                  len(asset.texture_set.files),
                                                  len(asset.texture_set.extra_formats))
+                # Draw folder badge if this is a folder shown via its *preview image
+                elif asset.is_folder:
+                    self._draw_folder_badge(painter, thumb_x + offset_x, thumb_y + offset_y,
+                                            scaled.width(), scaled.height())
             else:
                 # Draw gradient placeholder (no scaling, always sharp!)
                 self.draw_gradient_placeholder(painter, thumb_rect, asset.extension)
@@ -263,23 +275,31 @@ class ThumbnailDelegate(QStyledItemDelegate):
         thumb_y = rect.y() + (rect.height() - thumb_size) // 2
         thumb_rect = QRect(thumb_x, thumb_y, thumb_size, thumb_size)
         
-        # Special handling for folders
-        if asset.is_folder:
+        # Check if thumbnails are enabled
+        thumbnails_enabled = True
+        if self.browser and hasattr(self.browser, 'thumbnails_enabled_checkbox'):
+            thumbnails_enabled = self.browser.thumbnails_enabled_checkbox.isChecked()
+        folder_thumbnails_enabled = True
+        if self.browser and hasattr(self.browser, 'folder_thumbnails_enabled_checkbox'):
+            folder_thumbnails_enabled = self.browser.folder_thumbnails_enabled_checkbox.isChecked()
+
+        # Special handling for folders - unless it has a *preview image AND
+        # both thumbnail toggles are enabled, in which case it falls through
+        # to the normal thumbnail rendering below. Checked live here (not
+        # just at listing time) so toggling "Folder Thumbnails" off/on takes
+        # effect immediately, without reloading the directory.
+        if asset.is_folder and (not thumbnails_enabled or not folder_thumbnails_enabled
+                                 or not getattr(asset, 'folder_preview_path', None)):
             # Draw folder icon - scale with thumb_size
             painter.setPen(QPen(QColor(100, 100, 100), max(1, thumb_size // 28)))
             painter.setBrush(QColor(160, 160, 160))
-            folder_body = QRect(thumb_x + 2, thumb_y + thumb_size // 4, 
+            folder_body = QRect(thumb_x + 2, thumb_y + thumb_size // 4,
                                thumb_size - 4, thumb_size - thumb_size // 4 - 2)
             painter.drawRoundedRect(folder_body, 2, 2)
-            tab_rect = QRect(thumb_x + 2, thumb_y + thumb_size // 7, 
+            tab_rect = QRect(thumb_x + 2, thumb_y + thumb_size // 7,
                             thumb_size // 3, thumb_size // 7)
             painter.drawRoundedRect(tab_rect, 1, 1)
         else:
-            # Check if thumbnails are enabled
-            thumbnails_enabled = True
-            if self.browser and hasattr(self.browser, 'thumbnails_enabled_checkbox'):
-                thumbnails_enabled = self.browser.thumbnails_enabled_checkbox.isChecked()
-            
             # Get thumbnail from cache only if enabled
             # For sequences, use pattern as cache key
             cache_key = str(asset.file_path)
@@ -321,9 +341,13 @@ class ThumbnailDelegate(QStyledItemDelegate):
                                                  scaled.width(), scaled.height(),
                                                  len(asset.texture_set.files),
                                                  len(asset.texture_set.extra_formats))
+                # Draw folder badge if this is a folder shown via its *preview image
+                elif asset.is_folder:
+                    self._draw_folder_badge(painter, thumb_x + offset_x, thumb_y + offset_y,
+                                            scaled.width(), scaled.height())
             else:
                 self.draw_gradient_placeholder(painter, thumb_rect, asset.extension)
-        
+
         # Draw file name next to thumbnail
         painter.setPen(text_color)
         text_x = thumb_x + thumb_size + 6
@@ -489,4 +513,42 @@ class ThumbnailDelegate(QStyledItemDelegate):
 
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+
+    def _draw_folder_badge(self, painter, x, y, width, height):
+        """
+        Draw a small folder-icon badge (bottom-right) on a folder's
+        *preview thumbnail, so it stays visually identifiable as a folder
+        rather than a regular image - bottom-right keeps it clear of the
+        sequence (bottom-center) and texture-set (top-left) badge spots,
+        though those never co-occur on a folder anyway.
+
+        A miniature of the plain folder icon itself (same colors and the
+        same proportional body/tab layout as the list-mode folder icon),
+        just scaled down to badge size, so it reads as "the same folder
+        icon" rather than a new/different shape.
+        """
+        thumb_size = height
+        if thumb_size <= 32:
+            badge_size = 16
+        elif thumb_size <= 48:
+            badge_size = 20
+        elif thumb_size <= 64:
+            badge_size = 24
+        else:
+            badge_size = max(26, int(thumb_size * 0.18))
+
+        badge_margin = 3
+        bx = x + width - badge_size - badge_margin
+        by = y + height - badge_size - badge_margin
+
+        # Same proportional layout as the list-mode plain folder icon
+        body_rect = QRect(bx + 2, by + badge_size // 4,
+                           badge_size - 4, badge_size - badge_size // 4 - 2)
+        tab_rect = QRect(bx + 2, by + badge_size // 7,
+                          badge_size // 3, badge_size // 7)
+
+        painter.setPen(QPen(QColor(100, 100, 100), max(1, badge_size // 14)))
+        painter.setBrush(QColor(160, 160, 160))
+        painter.drawRoundedRect(body_rect, 2, 2)
+        painter.drawRoundedRect(tab_rect, 1, 1)
 

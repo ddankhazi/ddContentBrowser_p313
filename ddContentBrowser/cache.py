@@ -351,7 +351,26 @@ class ThumbnailDiskCache:
             # Convert QPixmap to QImage for thread-safe saving
             # QPixmap.save() is NOT thread-safe, but QImage.save() IS
             image = pixmap.toImage()
-            
+
+            # JPEG has no alpha channel. Just converting a transparent image
+            # straight to JPEG discards the alpha byte and keeps whatever
+            # (often garbage/unrelated) RGB values were stored under the
+            # transparent pixels - e.g. a leftover render-background color
+            # baked into a "cutout" PNG - which then shows up as a solid
+            # wrong-colored background. Composite onto a deliberate neutral
+            # background first so transparency flattens predictably instead.
+            if image.hasAlphaChannel():
+                if PYSIDE_VERSION == 6:
+                    from PySide6.QtGui import QImage
+                else:
+                    from PySide2.QtGui import QImage
+                flattened = QImage(image.size(), QImage.Format_RGB32)
+                flattened.fill(QColor(45, 45, 45))
+                painter = QPainter(flattened)
+                painter.drawImage(0, 0, image)
+                painter.end()
+                image = flattened
+
             # Save as JPEG for smaller file size
             success = image.save(str(thumb_path), "JPEG", quality)
             
@@ -1158,7 +1177,14 @@ class ThumbnailGenerator(QThread):
                 rep_path = asset.texture_set.get_thumbnail_path()
                 if rep_path:
                     file_path = rep_path
-            
+
+            # Folder with a *preview image inside it: use that image for the
+            # thumbnail (file_path stays the folder's own path everywhere
+            # else - cache key, active_futures, thumbnail_ready signal - only
+            # this local reassignment picks the real pixel source).
+            if asset and getattr(asset, 'is_folder', False) and getattr(asset, 'folder_preview_path', None):
+                file_path = asset.folder_preview_path
+
             extension = os.path.splitext(str(file_path))[1].lower()
             
             # Get thumbnail method from config
@@ -1970,10 +1996,26 @@ class ThumbnailGenerator(QThread):
             with Image.open(file_path) as img:
                 width, height = img.size
                 min_dimension = min(width, height)
-                
+                has_alpha = img.mode in ('RGBA', 'LA', 'PA') or (img.mode == 'P' and 'transparency' in img.info)
+
             if DEBUG_MODE:
-                print(f"[OPENCV] Image size: {width}×{height}px (min={min_dimension}px)")
-            
+                print(f"[OPENCV] Image size: {width}×{height}px (min={min_dimension}px, alpha={has_alpha})")
+
+            # cv2.IMREAD_COLOR (used by every branch below) always forces a
+            # 3-channel read, silently discarding any alpha channel - and
+            # NOT by compositing against a background, just by dropping the
+            # alpha byte and keeping whatever RGB was stored underneath
+            # (often garbage/unrelated data from a "cutout" export), which
+            # then shows up as a solid wrong-colored thumbnail. Read
+            # alpha-having images IMREAD_UNCHANGED instead (skips the
+            # reduction-flag speedup for those - full-res, then cv2.resize()
+            # below still downsamples it) so _numpy_to_pixmap() gets the
+            # real 4-channel data and can render it properly.
+            if has_alpha:
+                if DEBUG_MODE:
+                    print(f"[OPENCV] Alpha channel present - using IMREAD_UNCHANGED (no reduction)")
+                return cv2.IMREAD_UNCHANGED
+
             # REDUCTION LOGIC (target: 256px minimum after reduction)
             # - < 512px     → Full resolution (360×360 stays 360×360)
             # - 512-1023px  → 1/2 reduction (512×512 → 256×256)

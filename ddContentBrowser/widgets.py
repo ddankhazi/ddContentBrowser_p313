@@ -2174,9 +2174,13 @@ class MayaStyleListView(QListView):
         if texture_set_assets and not is_middle_button:
             try:
                 from . import models as _models
+                # Stash the list-based channels (not channel_paths) so
+                # apply_pending_texture_set_drop() can still convert every
+                # UDIM tile to TIF if that setting is on, not just the
+                # first/representative one per channel.
                 _models._PENDING_TEXTURE_SET_DROP = {
                     'sets': [
-                        {'name': a.texture_set.name, 'channels': a.texture_set.channel_paths}
+                        {'name': a.texture_set.name, 'channels': a.texture_set.channels}
                         for a in texture_set_assets
                     ]
                 }

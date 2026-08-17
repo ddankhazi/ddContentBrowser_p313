@@ -60,7 +60,11 @@ Cheers, D
 
 ### File Operations
 - **Import & Reference** - Maya file operations with drag & drop
-- **Delete, Rename** - Single & batch operations with confirmation
+- **Delete, Rename** - Single & batch operations with confirmation (Recycle Bin or permanent via Shift+Delete)
+- **New Folder** - Create folders in place (Ctrl+Shift+N)
+- **Cut / Copy / Paste** - Standard clipboard file operations (Ctrl+X/C/V)
+- **Duplicate** - Copy selected files in place (Ctrl+D)
+- **Copy path to clipboard** - Text path copy (Ctrl+Shift+C)
 - **Batch Rename Dialog** - 7 rename rule types (Find/Replace, Prefix, Suffix, Numbering, Case, Regex, New Name)
 - **Multi-rule chains** - Apply sequential rename operations
 - **Open with default program** - Windows default app integration
@@ -176,7 +180,7 @@ Cheers, D
 
 ### File Type Registry ✨ **NEW!**
 - **Centralized definitions** - Single source in FILE_TYPE_REGISTRY (utils.py)
-- **9 categories** - maya, 3d_models, blender, houdini, substance, images, videos, pdf, scripts, text
+- **11 categories** - maya, 3d_models, blender, houdini, substance, images, pdf, scripts, text, video, other
 - **Config version system** - Automatic updates with user customization preservation
 - **Video support** - 8 formats with custom color schemes
 - **Helper functions** - get_extensions_by_category(), get_default_icon_colors()
@@ -219,10 +223,16 @@ Cheers, D
 | **Space**          | Quick View (floating preview)                    |
 | **F**              | Fit to view (in Quick View)                      |
 | **F5**             | Refresh current folder (force cache bypass)      |
-| **Delete**         | Delete selected files (with confirmation)        |
+| **Delete**         | Delete selected files to Recycle Bin             |
+| **Shift+Delete**   | Permanently delete selected files                |
 | **F2**             | Rename selected file                             |
 | **Ctrl+F**         | Focus search box                                 |
-| **Ctrl+C**         | Copy path to clipboard                           |
+| **Ctrl+Shift+N**   | Create new folder                                |
+| **Ctrl+C**         | Copy selected files to clipboard                 |
+| **Ctrl+Shift+C**   | Copy path to clipboard                           |
+| **Ctrl+X**         | Cut selected files to clipboard                  |
+| **Ctrl+V**         | Paste files from clipboard                       |
+| **Ctrl+D**         | Duplicate selected files                         |
 | **Enter**          | Import selected file                             |
 | **Backspace**      | Go to parent folder                              |
 | **Ctrl+Scroll**    | Zoom thumbnails                                  |
@@ -325,7 +335,7 @@ Commercial redistribution is not permitted without the author's permission.
 
 ---
 
-##  Planned Features (Future)
+## 🔮 Planned Features (Future)
 
 *Smart Material Generator (auto-shader from texture sets) shipped in v2.0 — see "Texture Sets" above.*
 
