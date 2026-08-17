@@ -3016,7 +3016,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         try:
             from .utils import find_texture_set_for_geo, resolve_texture_set_channels
 
-            ts_data, geo_suffix, is_var_match = find_texture_set_for_geo(geo_path)
+            preferred_resolution = self.settings_manager.get('smart_import', 'preferred_resolution', '4K')
+            ts_data, geo_suffix, is_var_match = find_texture_set_for_geo(geo_path, preferred_resolution)
             if not ts_data:
                 return
 
@@ -3709,6 +3710,22 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             if DEBUG_MODE:
                 print(f"[Browser] Updated file limits: recursive={max_recursive}, search={max_search}")
         
+        # Apply texture set detection settings to file model
+        group_tx_sets = self.settings_manager.get("smart_import", "group_tx_sets", False)
+        if hasattr(self, 'file_model'):
+            tx_setting_changed = self.file_model.group_tx_texture_sets != group_tx_sets
+            self.file_model.group_tx_texture_sets = group_tx_sets
+            # Only re-group if actively browsing (current_path set) in Texture
+            # Set mode - at startup nothing has loaded yet, so there's nothing
+            # to re-group.
+            if (tx_setting_changed and self.file_model.texture_set_mode
+                    and self.file_model.current_path is not None):
+                self.file_model.beginResetModel()
+                self.file_model.reapplySequenceGrouping()
+                self.file_model.endResetModel()
+                if DEBUG_MODE:
+                    print(f"[Browser] Re-grouped after 'Group TX-only texture sets' change: {group_tx_sets}")
+
         # Apply search/filter settings to file model
         case_sensitive = self.settings_manager.get("filters", "case_sensitive_search", False)
         regex_enabled = self.settings_manager.get("filters", "regex_search", False)

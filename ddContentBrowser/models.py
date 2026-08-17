@@ -535,7 +535,8 @@ class FileSystemModel(QAbstractListModel):
         # Texture set grouping (PBR channels grouped by shared base name)
         self.texture_set_mode = False  # When True, group texture sets into single items
         self.texture_sets_only = False  # When True (with texture_set_mode), hide non-set items
-        
+        self.group_tx_texture_sets = False  # When False, .tx files never form their own set (see Texture Set Settings)
+
         # Recursive subfolder browsing
         self.include_subfolders = False
         self.max_recursive_files = 10000  # Limit for "Include Subfolders" (shows all files)
@@ -1247,7 +1248,7 @@ class FileSystemModel(QAbstractListModel):
             path_to_asset = {a.file_path: a for a in folder_assets}
             image_paths = [a.file_path for a in folder_assets]
 
-            sets, singles = group_texture_sets(image_paths)
+            sets, singles = group_texture_sets(image_paths, group_tx_sets=self.group_tx_texture_sets)
 
             # Build a texture-set AssetItem per detected set
             for set_name, data in sets.items():

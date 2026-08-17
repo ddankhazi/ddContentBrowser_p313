@@ -91,7 +91,9 @@ class SettingsManager:
             },
             # Smart import / shader generation
             "smart_import": {
+                "group_tx_sets": False,  # Group .tx-only files into their own texture set
                 "shader_type": "aiStandardSurface",  # aiStandardSurface, openPBRSurface, or dGecko
+                "preferred_resolution": "4K",  # 1K/2K/4K/8K - wins when a geo-import match has multiple resolutions
                 "var_import_displacement": False,  # Displacement for VarN-matched (Megascans plant) assets
                 "convert_to_tif": False  # Convert jpg/png/tga channel textures to TIF (LZW) before building
             }
@@ -1495,11 +1497,31 @@ class TextureSetSettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings_manager
         self.setWindowTitle("Texture Set Settings")
-        self.resize(440, 420)
+        self.resize(440, 520)
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
+
+        detection_group = QGroupBox("Texture Set Detection")
+        detection_layout = QVBoxLayout()
+
+        self.group_tx_sets_cb = QCheckBox("Show .tx files as Texture Sets")
+        self.group_tx_sets_cb.setChecked(self.settings.get("smart_import", "group_tx_sets", False))
+        detection_layout.addWidget(self.group_tx_sets_cb)
+
+        detection_info = QLabel(
+            "ℹ When on, .tx files that share a base name are grouped and shown as their own "
+            "Texture Set (separate from any source-file set), and count toward \"Show Only "
+            "Sets\". Turn off to stop .tx files from ever being shown as a Texture Set - "
+            "they'll appear as plain loose files instead."
+        )
+        detection_info.setStyleSheet("color: #888; font-size: 10px;")
+        detection_info.setWordWrap(True)
+        detection_layout.addWidget(detection_info)
+
+        detection_group.setLayout(detection_layout)
+        layout.addWidget(detection_group)
 
         shader_group = QGroupBox("Shader Generation")
         shader_layout = QVBoxLayout()
@@ -1525,6 +1547,26 @@ class TextureSetSettingsDialog(QDialog):
 
         auto_import_group = QGroupBox("Auto Material Build on Geo Import")
         auto_import_layout = QVBoxLayout()
+
+        res_layout = QHBoxLayout()
+        res_layout.addWidget(QLabel("Preferred Resolution:"))
+        self.preferred_resolution_combo = QComboBox()
+        self.preferred_resolution_combo.addItems(["1K", "2K", "4K", "8K"])
+        current_res = self.settings.get("smart_import", "preferred_resolution", "4K")
+        idx = self.preferred_resolution_combo.findText(current_res)
+        self.preferred_resolution_combo.setCurrentIndex(idx if idx >= 0 else 2)
+        res_layout.addWidget(self.preferred_resolution_combo)
+        res_layout.addStretch()
+        auto_import_layout.addLayout(res_layout)
+
+        res_info = QLabel(
+            "ℹ When a matching asset has more than one resolution available (e.g. both a 2K "
+            "and a 4K texture set), this is the one that wins. Falls back to whatever "
+            "resolution exists if the preferred one isn't there."
+        )
+        res_info.setStyleSheet("color: #888; font-size: 10px;")
+        res_info.setWordWrap(True)
+        auto_import_layout.addWidget(res_info)
 
         self.var_displacement_cb = QCheckBox("Import displacement for VarN-style assets (Megascans plants, etc.)")
         self.var_displacement_cb.setChecked(self.settings.get("smart_import", "var_import_displacement", False))
@@ -1570,7 +1612,9 @@ class TextureSetSettingsDialog(QDialog):
 
     def accept_settings(self):
         """Save settings and close dialog"""
+        self.settings.set("smart_import", "group_tx_sets", self.group_tx_sets_cb.isChecked())
         self.settings.set("smart_import", "shader_type", self.shader_type_combo.currentText())
+        self.settings.set("smart_import", "preferred_resolution", self.preferred_resolution_combo.currentText())
         self.settings.set("smart_import", "var_import_displacement", self.var_displacement_cb.isChecked())
         self.settings.set("smart_import", "convert_to_tif", self.convert_to_tif_cb.isChecked())
 

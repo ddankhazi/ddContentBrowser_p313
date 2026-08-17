@@ -1268,7 +1268,7 @@ def _merge_set_group(result_sets: dict, group_sets: dict, label: str):
         result_sets[name] = data
 
 
-def group_texture_sets(file_paths: List[Path]):
+def group_texture_sets(file_paths: List[Path], group_tx_sets: bool = True):
     """
     Group texture files into texture sets by shared base name.
 
@@ -1286,6 +1286,11 @@ def group_texture_sets(file_paths: List[Path]):
 
     Args:
         file_paths: List of Path objects (images only)
+        group_tx_sets: if False, pools 2 and 3 are skipped entirely - .tx
+            files are never grouped into their own texture set (they're just
+            loose files), regardless of how many would otherwise match. Not
+            every workflow wants .tx-only sets listed; see the "Group
+            TX-only texture sets" option in Texture Set Settings.
 
     Returns:
         (sets, singles) where:
@@ -1298,10 +1303,15 @@ def group_texture_sets(file_paths: List[Path]):
             singles: list[Path] that did not belong to any set
     """
     other_files = [p for p in file_paths if p.suffix.lower() != '.tx']
+    other_sets, other_singles = _group_texture_sets_single_pass(other_files)
+
+    if not group_tx_sets:
+        tx_files = [p for p in file_paths if p.suffix.lower() == '.tx']
+        return other_sets, other_singles + tx_files
+
     tx_plain_files = [p for p in file_paths if p.suffix.lower() == '.tx' and not _is_annotated_tx(p)]
     tx_annotated_files = [p for p in file_paths if p.suffix.lower() == '.tx' and _is_annotated_tx(p)]
 
-    other_sets, other_singles = _group_texture_sets_single_pass(other_files)
     tx_plain_sets, tx_plain_singles = _group_texture_sets_single_pass(tx_plain_files)
     tx_annotated_sets, tx_annotated_singles = _group_texture_sets_single_pass(tx_annotated_files)
 
@@ -1613,7 +1623,7 @@ def _strip_resolution_tag(name: str):
     return name[:m.start()], m.group(1).upper()
 
 
-def find_texture_set_for_geo(geo_path):
+def find_texture_set_for_geo(geo_path, preferred_resolution="4K"):
     """
     Find the texture set matching an imported geo file, for auto material
     building.
@@ -1623,7 +1633,9 @@ def find_texture_set_for_geo(geo_path):
     the texture set's resolution tag (_2K/_4K/...) are stripped from each
     side. When multiple candidates match (e.g. a 2K and a 4K set, or a
     source set and its .tx counterpart), non-.tx sets are preferred over
-    .tx, and 4K is preferred over other resolutions.
+    .tx, and preferred_resolution (see the 'smart_import.preferred_resolution'
+    setting - '1K'/'2K'/'4K'/'8K') is preferred over other resolutions,
+    falling back to whichever resolution is actually available otherwise.
 
     Special case (Megascans "3D plant" layout): the geo can sit in a
     "VarN" folder (Var1, Var2, ...) whose own name carries no material info,
@@ -1678,8 +1690,8 @@ def find_texture_set_for_geo(geo_path):
         if not matches:
             return None
 
-        # Prefer non-.tx over .tx, then 4K resolution over other resolutions.
-        matches.sort(key=lambda m: (' (TX' in m[0]['display'], m[1] != '4K'))
+        # Prefer non-.tx over .tx, then the preferred resolution over others.
+        matches.sort(key=lambda m: (' (TX' in m[0]['display'], m[1] != preferred_resolution))
         return matches[0][0]
 
     match = _search(geo_path.parent)

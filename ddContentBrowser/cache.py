@@ -269,6 +269,19 @@ class ThumbnailDiskCache:
         # Load or create cache info
         self.info_file = self.cache_dir / "cache_info.json"
         self.load_info()
+
+        # _check_cache_size() used to run a full directory glob+stat() (and,
+        # over the limit, _cleanup_old_cache() - another full glob+stat plus
+        # deletions) on EVERY set() call, unsynchronized. set() is submitted
+        # to the same worker thread pool as thumbnail generation, so with a
+        # large cache directory this both starved the pool of capacity for
+        # real decode work and let multiple threads race to delete the same
+        # "oldest" files concurrently (surfaced as WinError 2 "file not
+        # found" during save). Throttle to at most once per interval, and
+        # skip (don't block) if a check/cleanup is already running.
+        self._cache_size_lock = threading.Lock()
+        self._cache_size_check_interval = 10.0  # seconds
+        self._last_cache_size_check = 0.0
     
     def load_info(self):
         """Load cache information"""
@@ -498,12 +511,30 @@ class ThumbnailDiskCache:
         return total_size / (1024 * 1024)  # Convert to MB
     
     def _check_cache_size(self):
-        """Check cache size and cleanup if needed"""
-        current_size = self.get_cache_size()
-        
-        if current_size > self.max_size_mb:
-            print(f"Cache size {current_size:.1f}MB exceeds limit {self.max_size_mb}MB, cleaning up...")
-            self._cleanup_old_cache()
+        """
+        Check cache size and cleanup if needed.
+
+        Throttled + non-blocking-skip: this (and _cleanup_old_cache) walk the
+        entire cache directory, which can be many thousands of files. Called
+        from a worker-pool thread on every single set(), unsynchronized, that
+        used to mean concurrent full-directory scans competing with actual
+        thumbnail decode work for the same worker slots, and multiple threads
+        racing to delete the same "oldest" file during cleanup (WinError 2).
+        """
+        if not self._cache_size_lock.acquire(blocking=False):
+            return  # Another thread is already checking/cleaning - skip.
+        try:
+            now = time.time()
+            if now - self._last_cache_size_check < self._cache_size_check_interval:
+                return
+            self._last_cache_size_check = now
+
+            current_size = self.get_cache_size()
+            if current_size > self.max_size_mb:
+                print(f"Cache size {current_size:.1f}MB exceeds limit {self.max_size_mb}MB, cleaning up...")
+                self._cleanup_old_cache()
+        finally:
+            self._cache_size_lock.release()
     
     def _cleanup_old_cache(self):
         """Remove oldest thumbnails based on access time (LRU)"""
@@ -623,7 +654,21 @@ class ThumbnailGenerator(QThread):
             QImageReader.setAllocationLimit(1024)  # 1024 MB = 1 GB
         except Exception as e:
             print(f"[Cache] Could not set image allocation limit: {e}")
-        
+
+        # Disable OpenCV's own internal thread pool. cv2 defaults to using
+        # ALL cores for a single imread/resize/cvtColor call - fine when
+        # called from one thread, catastrophic here where up to max_workers
+        # threads each call cv2 concurrently (N workers x N internal cv2
+        # threads oversubscribes the CPU many times over). The worker pool
+        # below is already the parallelism; cv2 should stay single-threaded
+        # per call.
+        try:
+            import cv2
+            cv2.setNumThreads(1)
+            print(f"[ThumbnailGenerator]    OpenCV internal threading: disabled (setNumThreads(1))")
+        except Exception as e:
+            print(f"[Cache] Could not disable OpenCV internal threading: {e}")
+
         # Always print initialization info (even if DEBUG_MODE is off)
         print(f"[ThumbnailGenerator] ✨ Initialized with {max_workers} worker threads")
         print(f"[ThumbnailGenerator]    Thumbnail size: {thumbnail_size}px")
@@ -861,18 +906,21 @@ class ThumbnailGenerator(QThread):
                 # Yield to other threads briefly
                 self.msleep(1)
             
-            # Debug stats (periodic)
-            # Removed spammy STATS output - only log important events
-            # if DEBUG_MODE:
-            #     import time
-            #     current_time = time.time()
-            #     if current_time - self._last_stats_time > self._stats_interval:
-            #         self._last_stats_time = current_time
-            #         with self.futures_lock:
-            #             active_count = len(self.active_futures)
-            #         queue_size = len(self.queue)
-            #         result_queue_size = self.result_queue.qsize()
-            #         print(f"[STATS] Queue: {queue_size} | Active: {active_count} | Results: {result_queue_size} | Progress: {self.processed_count}/{self.total_count}")
+            # Debug stats (periodic) - re-enabled for perf investigation.
+            # Watch this while thumbnails slow down: if Active stays pinned at
+            # max_workers with Queue>0, workers are just slow (real decode cost).
+            # If Active drops below max_workers with Queue>0, something is
+            # preventing new submissions. If Results backs up, the main thread
+            # can't keep up converting/emitting (Stage 2 bottleneck).
+            if DEBUG_MODE:
+                current_time = time.time()
+                if current_time - self._last_stats_time > self._stats_interval:
+                    self._last_stats_time = current_time
+                    with self.futures_lock:
+                        active_count = len(self.active_futures)
+                    queue_size = len(self.queue)
+                    result_queue_size = self.result_queue.qsize()
+                    print(f"[STATS] Queue: {queue_size} | Active: {active_count}/{self.max_workers} | Results: {result_queue_size} | Progress: {self.processed_count}/{self.total_count}")
     
     def _submit_worker_job(self, file_path, file_mtime, asset, cache_key, is_sequence):
         """Submit a job to the worker pool (extracted helper method)."""
@@ -896,17 +944,18 @@ class ThumbnailGenerator(QThread):
                     print(f"[CACHE-THREAD] ⚠ Auto-tag failed: {tag_error}")
         
         self.cache_status.emit("generating")
-        
+
         # Submit worker job (CPU-intensive work happens here in parallel)
+        submit_time = time.time()
         future = self.executor.submit(
             self._generate_thumbnail_data,
             file_path,
             asset
         )
-        
+
         if DEBUG_MODE:
             print(f"[CACHE-THREAD] → Future created: {future}")
-        
+
         # IMPORTANT: Store metadata FIRST, then add callback
         # This prevents race condition where callback fires before metadata exists
         with self.futures_lock:
@@ -916,7 +965,8 @@ class ThumbnailGenerator(QThread):
                 'file_mtime': file_mtime,
                 'asset': asset,
                 'cache_key': cache_key,
-                'is_sequence': is_sequence
+                'is_sequence': is_sequence,
+                'submit_time': submit_time
             }
         
         # Add callback AFTER metadata is stored
@@ -973,12 +1023,15 @@ class ThumbnailGenerator(QThread):
         try:
             # Get result from future
             result_data = future.result()
-            
+
             if DEBUG_MODE:
                 import threading
                 thread_name = threading.current_thread().name
                 result_type = "SUCCESS" if result_data is not None else "NULL"
-                print(f"[{thread_name}] ✓ Worker completed: {Path(file_path).name} ({result_type})")
+                elapsed = time.time() - job_info.get('submit_time', time.time())
+                ext = Path(file_path).suffix.lower()
+                print(f"[{thread_name}] ✓ Worker completed: {Path(file_path).name} ({result_type}) "
+                      f"[{elapsed*1000:.0f}ms, {ext}]")
             
             # Put in result queue for main thread
             self.result_queue.put({
