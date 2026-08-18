@@ -628,6 +628,15 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Right panel - Preview (initially visible)
         self.preview_panel = PreviewPanel(self.settings_manager, config=self.config, metadata_manager=self.metadata_manager)
         self.content_splitter.addWidget(self.preview_panel)
+
+        # Let the preview panel show a selected folder's own thumbnail (if
+        # it has one - see resolve_folder_previews() in utils.py): a direct
+        # read-only handle to the memory cache for the synchronous check,
+        # and a callback to ask the browser to generate one on demand when
+        # it isn't cached yet (browser.py owns the enable-checks/disk-cache/
+        # generator-queue logic already, via request_folder_thumbnail_for_preview()).
+        self.preview_panel.memory_cache = self.memory_cache
+        self.preview_panel.request_folder_thumbnail = self.request_folder_thumbnail_for_preview
         
         # Set splitter initial sizes (20% nav, 50% browser, 30% preview)
         # Load saved splitter position or use default
@@ -694,7 +703,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             pass
     
     def create_menu_bar(self):
-        """Create menu bar with Settings and Tools menus"""
+        """Create menu bar with Settings, Tools, and Help menus"""
         menu_bar = self.menuBar()
 
         # In PySide6, QAction is in QtGui, in PySide2 it's in QtWidgets
@@ -735,7 +744,44 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             maya_status = QAction("⚠️ Standalone Mode (Maya features disabled)", self)
             maya_status.setEnabled(False)
             tools_menu.addAction(maya_status)
-    
+
+        # Help menu
+        help_menu = menu_bar.addMenu("Help")
+
+        documentation_action = QAction("Documentation...", self)
+        documentation_action.triggered.connect(self.show_help_dialog)
+        help_menu.addAction(documentation_action)
+
+    def show_help_dialog(self):
+        """Show the README as an in-app, rendered documentation dialog."""
+        readme_path = Path(__file__).parent / "README.md"
+        try:
+            readme_text = readme_path.read_text(encoding="utf-8")
+        except OSError as e:
+            self.safe_show_status(f"Could not open documentation: {e}")
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"DD Content Browser {__version__} - Documentation")
+        dialog.resize(900, 750)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        browser_view = QtWidgets.QTextBrowser(dialog)
+        browser_view.setOpenExternalLinks(True)
+        try:
+            browser_view.setMarkdown(readme_text)
+        except AttributeError:
+            # Qt < 5.14 has no Markdown support - fall back to plain text
+            browser_view.setPlainText(readme_text)
+        layout.addWidget(browser_view)
+
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        button_box.rejected.connect(dialog.accept)
+        layout.addWidget(button_box)
+
+        dialog.exec_()
+
     def create_toolbar(self, parent_layout):
         """Create toolbar"""
         toolbar_layout = QtWidgets.QHBoxLayout()
@@ -1705,7 +1751,25 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         if not path.exists() or not path.is_dir():
             self.safe_show_status(f"Invalid path: {path}")
             return
-        
+
+        # If this navigation goes UP the tree (Backspace, or clicking an
+        # ancestor segment in the breadcrumb), remember the folder we're
+        # coming FROM so it can be re-selected in the new listing below -
+        # the folder that leads back to where we just were. self.breadcrumb
+        # still holds the OLD path here, since set_path() (which overwrites
+        # it) hasn't run yet for this navigation.
+        select_after = None
+        old_path_str = self.breadcrumb.current_path
+        if old_path_str:
+            old_path = Path(old_path_str)
+            if old_path != path:
+                try:
+                    rel = old_path.relative_to(path)
+                except ValueError:
+                    rel = None
+                if rel is not None and rel.parts:
+                    select_after = path / rel.parts[0]
+
         # Exit collection mode if active
         if self.file_model.collection_mode:
             self.on_collection_cleared()
@@ -1793,7 +1857,24 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         
         # Request thumbnails for visible items
         QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
-    
+
+        # Re-select the folder we navigated up FROM, once the view has
+        # settled (rows exist synchronously after setPath(), but give the
+        # view a paint cycle before scrolling/selecting into it)
+        if select_after is not None:
+            QTimer.singleShot(100, lambda p=select_after: self._select_folder_after_navigate(p))
+
+    def _select_folder_after_navigate(self, target_path):
+        """Re-select target_path's row in the file list, if still present (see navigate_to_path)."""
+        for row in range(self.file_model.rowCount()):
+            index = self.file_model.index(row, 0)
+            asset = self.file_model.data(index, Qt.UserRole)
+            if asset and asset.is_folder and Path(asset.file_path) == target_path:
+                self.file_list.clearSelection()
+                self.file_list.setCurrentIndex(index)
+                self.file_list.scrollTo(index)
+                return
+
     def navigate_back(self):
         """Navigate to previous path in history (or exit collection view if active)"""
         # If in collection mode, exit it instead of navigating history
@@ -3157,10 +3238,55 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             self.safe_show_status(
                 f"✓ Auto-built material from texture set '{ts_data['display']}'", 3000
             )
+
+            if self.settings_manager.get('smart_import', 'import_lod_proxy', False):
+                shading_group = None
+                for s in shapes:
+                    sgs = cmds.listConnections(s, type='shadingEngine') or []
+                    if sgs:
+                        shading_group = sgs[0]
+                        break
+                self._try_import_lod_proxy(geo_path, geo_suffix, shading_group)
         except Exception as e:
             import traceback
             traceback.print_exc()
             print(f"[AutoMaterial] Failed for {geo_path.name}: {e}")
+
+    def _try_import_lod_proxy(self, geo_path, geo_suffix, shading_group):
+        """
+        Companion to _try_auto_assign_texture_set_material(): after a
+        "high"/untagged geo import gets its material built, also import a
+        lower-detail "LODN" proxy from the same folder (if one exists) and
+        assign it the SAME shading group - not a freshly built material, so
+        the proxy and the full-res geo genuinely share one material. Opt-in
+        via the 'smart_import.import_lod_proxy' setting; see
+        find_lod_proxy_for_geo() for the matching rules.
+        """
+        if not shading_group:
+            return
+        try:
+            from .utils import find_lod_proxy_for_geo, get_importable_extensions, get_maya_import_type
+
+            proxy_path = find_lod_proxy_for_geo(geo_path, geo_suffix, get_importable_extensions())
+            if not proxy_path:
+                return
+
+            file_type = get_maya_import_type(proxy_path.suffix)
+            kwargs = dict(i=True, ignoreVersion=True, mergeNamespacesOnClash=False,
+                          namespace=':', options='v=0', preserveReferences=True, returnNewNodes=True)
+            if file_type:
+                kwargs['type'] = file_type
+            new_nodes = cmds.file(str(proxy_path), **kwargs) or []
+
+            shapes = cmds.ls(new_nodes, dag=True, type=('mesh', 'nurbsSurface'), noIntermediate=True) or []
+            if not shapes:
+                return
+            cmds.sets(shapes, edit=True, forceElement=shading_group)
+            self.safe_show_status(f"✓ Imported LOD proxy '{proxy_path.name}' and assigned material", 3000)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[LODProxy] Failed for {geo_path.name}: {e}")
 
     def import_selected_file(self):
         """Import selected file or navigate into folder"""
@@ -3404,7 +3530,38 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         
         # Also update viewport for good measure
         self.file_list.viewport().update()
-    
+
+        # If the preview panel is waiting on this exact folder's thumbnail
+        # (see request_folder_thumbnail_for_preview()), push it there too
+        if hasattr(self, 'preview_panel'):
+            self.preview_panel.update_folder_thumbnail(file_path, pixmap)
+
+    def request_folder_thumbnail_for_preview(self, asset):
+        """
+        On-demand thumbnail generation for a single folder selected in the
+        preview panel (see PreviewPanel._show_folder_thumbnail() in
+        preview_panel.py). Same enable-checks/disk-cache/queue protocol as
+        request_thumbnails_for_visible_items(), just for one specific asset
+        instead of the visible batch - on_thumbnail_ready() pushes the
+        result back into the preview panel once it's done.
+        """
+        if not self.thumbnails_enabled_checkbox.isChecked() or not self.folder_thumbnails_enabled_checkbox.isChecked():
+            return
+        if not hasattr(self, 'thumbnail_generator'):
+            return
+
+        file_path_str = str(asset.file_path)
+        if self.memory_cache.get(file_path_str) is not None:
+            return
+
+        cached_from_disk = self.disk_cache.get(file_path_str, asset.modified_time)
+        if cached_from_disk:
+            self.memory_cache.set(file_path_str, cached_from_disk)
+            self.on_thumbnail_ready(file_path_str, cached_from_disk)
+            return
+
+        self.thumbnail_generator.add_to_queue(file_path_str, asset.modified_time, priority=True, asset=asset)
+
     def on_cache_status(self, status):
         """Handle cache status updates"""
         if status == "cache":

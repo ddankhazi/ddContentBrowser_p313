@@ -1767,6 +1767,63 @@ def find_texture_set_for_geo(geo_path, preferred_resolution="4K"):
     return None, geo_suffix, False
 
 
+def find_lod_proxy_for_geo(geo_path, geo_suffix, importable_extensions):
+    """
+    Look for a lower-detail "LODN" proxy geo next to a just-imported geo
+    file, for asset-library building where a lightweight stand-in is wanted
+    alongside the full-res import (see the 'smart_import.import_lod_proxy'
+    setting).
+
+    Only meaningful when the source geo is "high" or has no LOD/High suffix
+    at all - a geo that's itself already a LODN import doesn't need a
+    proxy, so this returns None immediately for that case. Only the geo's
+    own folder is searched (never subfolders): other importable 3D files
+    there are matched by base name (once each side's own suffix is
+    stripped via strip_geo_suffix()) and must carry a numbered "LODN" tag
+    themselves. Among matches, the highest N wins, since LOD numbers
+    increase with decreasing detail - that's the lightest proxy available.
+
+    Args:
+        geo_path: Path (or str) to the just-imported geo file.
+        geo_suffix: the source geo's own suffix from strip_geo_suffix()
+            ('high', 'LODn', or None).
+        importable_extensions: iterable of importable extensions (with or
+            without a leading '.') to consider as proxy candidates.
+
+    Returns:
+        Path to the chosen proxy file, or None if none matched.
+    """
+    if geo_suffix not in (None, 'high'):
+        return None
+
+    geo_path = Path(geo_path)
+    geo_base, _ = strip_geo_suffix(geo_path.stem)
+    target = geo_base.lower()
+    exts = {('.' + e.lstrip('.')).lower() for e in importable_extensions}
+
+    try:
+        candidates = [p for p in geo_path.parent.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    except OSError:
+        return None
+
+    best_path, best_n = None, -1
+    for p in sorted(candidates, key=lambda p: p.name.lower()):
+        if p == geo_path:
+            continue
+        base, suffix = strip_geo_suffix(p.stem)
+        if not suffix or not suffix.startswith('LOD') or base.lower() != target:
+            continue
+        try:
+            n = int(suffix[3:])
+        except ValueError:
+            continue
+        if n > best_n:
+            best_n = n
+            best_path = p
+
+    return best_path
+
+
 def resolve_texture_set_channels(variant_map: dict, geo_suffix, exclude_displacement=False):
     """
     Resolve a texture set's variant_map ((channel, UDIM, LOD) -> Path) down

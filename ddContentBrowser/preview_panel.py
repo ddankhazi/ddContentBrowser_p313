@@ -3595,6 +3595,105 @@ class PreviewPanel(QWidget):
             # Reset cursor to arrow
             self.graphics_view.viewport().setCursor(Qt.ArrowCursor)
     
+    def _load_folder_preview_pixmap(self, file_path_str, max_size=2048):
+        """
+        Load a folder's "*preview.<ext>" image file directly via
+        QImageReader, scaled down only if it exceeds max_size - same
+        approach as the standard-format branch of the main image loader
+        above, just reusable for an arbitrary path. Uses a larger cap than
+        the 1024 used there since this is meant to look good filling the
+        preview panel, not just help identify a file in the flat asset
+        list grid.
+
+        Returns a QPixmap, or None if the file couldn't be read (missing,
+        unsupported format, etc.) - callers should fall back to the small
+        generated thumbnail in that case.
+        """
+        try:
+            image_reader = QImageReader(file_path_str)
+            image_reader.setAllocationLimit(2048)
+            image_reader.setAutoTransform(True)
+            original_size = image_reader.size()
+            if original_size.isValid() and (original_size.width() > max_size or original_size.height() > max_size):
+                if original_size.width() > original_size.height():
+                    scaled_size = QSize(max_size, int(max_size * original_size.height() / original_size.width()))
+                else:
+                    scaled_size = QSize(int(max_size * original_size.width() / original_size.height()), max_size)
+                image_reader.setScaledSize(scaled_size)
+            image = image_reader.read()
+            if image.isNull():
+                return None
+            return QPixmap.fromImage(image)
+        except Exception:
+            return None
+
+    def _show_folder_thumbnail(self, asset):
+        """
+        Show a selected folder's own preview image, same as an image file
+        would show. Only folders that qualify for one at all (a
+        "*preview.<ext>" file inside them - see should_generate_thumbnail /
+        folder_preview_path on the AssetItem, set by
+        resolve_folder_previews() in utils.py) are considered; other
+        folders just show a blank preview area.
+
+        Prefers loading the actual preview image file directly (much
+        higher resolution, looks better filling the panel) over the small
+        generated thumbnail used in the flat asset list. Falls back to the
+        generated thumbnail if the preview file can't be loaded directly
+        (missing, or a format QImageReader doesn't support). If even that
+        isn't cached yet, asks the browser to generate one via
+        self.request_folder_thumbnail (wired in by ddContentBrowser after
+        construction) - browser.py's on_thumbnail_ready() calls back into
+        update_folder_thumbnail() once it's ready, refreshing this preview
+        if the folder is still the one selected at that point.
+        """
+        self.graphics_scene.clear()
+        if not getattr(asset, 'should_generate_thumbnail', False):
+            return
+
+        preview_path = getattr(asset, 'folder_preview_path', None)
+        if preview_path:
+            preview_path_str = str(preview_path)
+            if preview_path_str in self.preview_cache:
+                pixmap, _ = self.preview_cache[preview_path_str]
+            else:
+                pixmap = self._load_folder_preview_pixmap(preview_path_str)
+                if pixmap and not pixmap.isNull():
+                    self.add_to_cache(preview_path_str, pixmap, None)
+            if pixmap and not pixmap.isNull():
+                self.current_pixmap = pixmap
+                self.fit_pixmap_to_label()
+                return
+
+        cache_key = str(asset.file_path)
+        memory_cache = getattr(self, 'memory_cache', None)
+        pixmap = memory_cache.get(cache_key) if memory_cache else None
+        if pixmap and not pixmap.isNull():
+            self.current_pixmap = pixmap
+            self.fit_pixmap_to_label()
+            return
+
+        request_folder_thumbnail = getattr(self, 'request_folder_thumbnail', None)
+        if request_folder_thumbnail:
+            self._pending_folder_thumbnail_path = cache_key
+            request_folder_thumbnail(asset)
+
+    def update_folder_thumbnail(self, file_path, pixmap):
+        """
+        Called by browser.py's on_thumbnail_ready() when a folder thumbnail
+        requested from _show_folder_thumbnail() finishes generating -
+        refreshes the preview if that folder is still the current selection
+        (the user may have selected something else in the meantime).
+        """
+        if getattr(self, '_pending_folder_thumbnail_path', None) != file_path:
+            return
+        if not self.current_assets or len(self.current_assets) != 1:
+            return
+        if str(self.current_assets[0].file_path) != file_path:
+            return
+        self.current_pixmap = pixmap
+        self.fit_pixmap_to_label()
+
     def show_placeholder_with_text(self, text):
         """Show a placeholder text message in the preview area"""
         self.graphics_scene.clear()
@@ -4454,6 +4553,11 @@ class PreviewPanel(QWidget):
                     self.graphics_scene.clear()
                     self.current_text_item = None
                     self.add_metadata_row("⚠️", "Error", f"Load error: {str(e)}")
+        elif asset.is_folder:
+            # Folder - show its own thumbnail (a "*preview.<ext>" file
+            # inside it - see resolve_folder_previews() in utils.py), if it
+            # has one
+            self._show_folder_thumbnail(asset)
         elif asset.is_video_file:
             # Video file - extract middle frame for preview
             self.show_video_preview(asset)

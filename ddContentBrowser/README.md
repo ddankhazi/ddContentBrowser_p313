@@ -1,5 +1,5 @@
 
-# DD Content Browser v2.0.0
+# DD Content Browser v2.3.0
 
 Content Browser for Maya by Denes Dankhazi
 Modern Maya Asset Browser for Autodesk Maya 2025+ (PySide6, Python 3.11 & 3.13)
@@ -27,8 +27,9 @@ DD Content Browser auto-detects the running Python interpreter and loads the mat
 
 ### Installation
 
-1. Copy the full content into your Maya scripts folder:  
-	 `C:/Users/%USERPROFILE%/Documents/maya/2026/scripts/ddContentBrowser`
+1. Copy the full content into your Maya scripts folder, matching your Maya version:  
+	 `C:/Users/%USERPROFILE%/Documents/maya/2026/scripts/ddContentBrowser` (Maya 2025/2026)  
+	 `C:/Users/%USERPROFILE%/Documents/maya/2027/scripts/ddContentBrowser` (Maya 2027+)
 
 ### Launch from Maya (Python):
 
@@ -39,10 +40,12 @@ launch_no_reload()
 
 ### Portable Launcher
 
-- Install Python 3.11 if you don't have it yet.
+- Install Python 3.11 or 3.13 if you don't have it yet. `launch_standalone_portable.bat` specifically looks for 3.13 (via the `py -3.13` launcher, `python313`/`python` in PATH, or common install locations), but 3.11 works too as long as PySide6 and the other dependencies are available for it.
 - For the first launch use: `launch_standalone_portable.bat`  
-	(This will install PySide6 if you don't have it.)
+	(This checks for PySide6 and tells you to `pip install PySide6` if it's missing.)
 - After that you can use the silent launcher: `ddContentBrowser.pyw`
+
+This README is also available inside the tool itself, any time, via `Help > Documentation...` in the menu bar.
 
 Cheers, D
 
@@ -57,6 +60,7 @@ Cheers, D
 - **Back/forward navigation** with history (Alt+Left/Right)
 - **Multi-select favorites** - Batch add/remove, persistent storage
 - **Include subfolders** - Recursive directory browsing
+- **Up-navigation re-selects origin folder** - Backspace or clicking an ancestor breadcrumb segment re-selects the folder you just came from in the new listing
 
 ### File Operations
 - **Import & Reference** - Maya file operations with drag & drop
@@ -99,6 +103,15 @@ Cheers, D
 - **Drag to build shader** - Drop a set into the Maya viewport to auto-generate a shader network (aiStandardSurface by default) wired to the set's channels
 - **Collections support** - Dragging a set into a Collection (or "Add to Collection") adds every file in the set; Collection view re-groups sets when Texture Sets mode is on
 - **Per-folder isolation** - Same-named sets in different folders stay fully separate (thumbnails, cache)
+
+### Smart Import - Auto Material Build ✨ **NEW!**
+- **Automatic on geo import** - Importing a 3D file (own folder first, then subfolders) looks for a matching texture set and, if found, auto-builds and assigns a shader network to it - no manual drag-to-build needed
+- **Megascans "3D plant" support** - Recognizes the `VarN` folder layout (geo in `Var1`/`Var2`/... with textures in a sibling `Textures`/`Textures/Atlas` folder); handles assets that ship multiple resolution variants (e.g. both a 2K and 4K set) in the same Atlas folder
+- **LOD proxy auto-import** *(opt-in)* - When importing a "High" or untagged geo, also imports a lower-detail `LODN` file from the same folder (highest LOD number = lightest proxy) and assigns it the exact same material - handy for building asset libraries that need a lightweight stand-in geo
+- **Preferred resolution** - Picks the configured resolution (1K/2K/4K/8K) when a match has more than one available, falling back to whatever exists otherwise
+- **Shader type choice** - aiStandardSurface, openPBRSurface, or dGecko
+- **TIF conversion** - Optional auto-convert of JPG/PNG/TGA channel textures to TIF (LZW) before building
+- **Texture Set Settings dialog** (`Settings > Texture Set Settings...`) - Dedicated panel for all of the above, plus VarN displacement toggle and `.tx`-as-Texture-Set grouping
 
 ### Quick View System ✨ **NEW!**
 - **Space to open** - macOS Quick Look-style floating preview
@@ -143,6 +156,7 @@ Cheers, D
 - **Background modes** - Dark, light, checkerboard
 - **Password-protected PDFs** - User-friendly lock message
 - **Multi-file summary** - Resolution, size, date display
+- **Folder thumbnail preview** - Selecting a folder with its own preview image (a `*preview.<ext>` file inside it) shows that image full-size in the preview panel instead of the small grid thumbnail
 
 ### Batch Operations
 - **Batch Import** - Middle mouse drag to Maya viewport
@@ -328,7 +342,7 @@ Commercial redistribution is not permitted without the author's permission.
 ## 🙏 Credits
 
 **Author:** Denes Dankhazi (ddankhazi)  
-**Version:** 2.0.0  
+**Version:** 2.3.0  
 **Maya Version:** 2025+ (PySide6)  
 **Python:** 3.11 (Maya 2025/2026) & 3.13 (Maya 2027+)  
 **Blog & Portfolio:** [ddankhazi.com](https://ddankhazi.com)
@@ -337,13 +351,12 @@ Commercial redistribution is not permitted without the author's permission.
 
 ## 🔮 Planned Features (Future)
 
-*Smart Material Generator (auto-shader from texture sets) shipped in v2.0 — see "Texture Sets" above.*
+*Smart Material Generator (auto-shader from texture sets) shipped in v2.0 — see "Texture Sets" above. Automatic material build & LOD proxy import on geo import (incl. Megascans "3D plant" VarN/Atlas layouts) has since shipped too — see "Smart Import" above.*
 
 ### High Priority:
-1. **Quixel Megascans Importer** - One-click optimized import with UDIM/LOD
-2. **SkyDome Auto-Linker** - Drag HDR → update aiSkyDomeLight path
-3. **Star/Color Rating** - Adobe Bridge-style organization (0-5 stars, 8 colors)
-4. **Enhanced Tag System** - Tag hierarchies, bulk operations, import/export
+1. **SkyDome Auto-Linker** - Drag HDR → update aiSkyDomeLight path
+2. **Star/Color Rating** - Adobe Bridge-style organization (0-5 stars, 8 colors)
+3. **Enhanced Tag System** - Tag hierarchies, bulk operations, import/export
 
 ### Medium Priority:
 5. **Texture Converter** - Batch format conversion with color space management

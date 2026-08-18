@@ -95,7 +95,8 @@ class SettingsManager:
                 "shader_type": "aiStandardSurface",  # aiStandardSurface, openPBRSurface, or dGecko
                 "preferred_resolution": "4K",  # 1K/2K/4K/8K - wins when a geo-import match has multiple resolutions
                 "var_import_displacement": False,  # Displacement for VarN-matched (Megascans plant) assets
-                "convert_to_tif": False  # Convert jpg/png/tga channel textures to TIF (LZW) before building
+                "convert_to_tif": False,  # Convert jpg/png/tga channel textures to TIF (LZW) before building
+                "import_lod_proxy": False  # Also import a lower-detail LODN proxy next to a high/untagged geo import
             }
         }
     
@@ -1581,6 +1582,21 @@ class TextureSetSettingsDialog(QDialog):
         var_info.setWordWrap(True)
         auto_import_layout.addWidget(var_info)
 
+        self.import_lod_proxy_cb = QCheckBox("Also import a lower-detail LODN proxy geo next to the import")
+        self.import_lod_proxy_cb.setChecked(self.settings.get("smart_import", "import_lod_proxy", False))
+        auto_import_layout.addWidget(self.import_lod_proxy_cb)
+
+        lod_proxy_info = QLabel(
+            "ℹ Useful when building an asset library and a lightweight stand-in geo is needed "
+            "alongside the full asset. Only applies when importing a \"High\" or untagged geo "
+            "(a LODN import never needs one); looks in the same folder as the imported geo for "
+            "another LODN file with a matching name and picks the highest LOD number (the most "
+            "decimated one) as the proxy, assigning it the same material just built."
+        )
+        lod_proxy_info.setStyleSheet("color: #888; font-size: 10px;")
+        lod_proxy_info.setWordWrap(True)
+        auto_import_layout.addWidget(lod_proxy_info)
+
         auto_import_group.setLayout(auto_import_layout)
         layout.addWidget(auto_import_group)
 
@@ -1617,6 +1633,7 @@ class TextureSetSettingsDialog(QDialog):
         self.settings.set("smart_import", "preferred_resolution", self.preferred_resolution_combo.currentText())
         self.settings.set("smart_import", "var_import_displacement", self.var_displacement_cb.isChecked())
         self.settings.set("smart_import", "convert_to_tif", self.convert_to_tif_cb.isChecked())
+        self.settings.set("smart_import", "import_lod_proxy", self.import_lod_proxy_cb.isChecked())
 
         if self.settings.save():
             self.settings_changed.emit()
