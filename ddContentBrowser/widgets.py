@@ -66,21 +66,23 @@ except ImportError:
     # print("PyMuPDF not available - PDF preview will be limited")
 
 try:
-    from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
-                                    QLineEdit, QScrollArea, QFrame, QGroupBox, QCheckBox, 
+    from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+                                    QLineEdit, QScrollArea, QFrame, QGroupBox, QCheckBox,
                                     QSpinBox, QFormLayout, QDateEdit, QDialog, QGraphicsView,
-                                    QApplication, QListView, QListWidget, QCompleter, QAbstractItemView)
+                                    QApplication, QListView, QListWidget, QCompleter, QAbstractItemView, QMenu,
+                                    QGraphicsOpacityEffect)
     from PySide6.QtCore import Signal, Qt, QEvent, QPoint, QSize, QDate, QRect
-    from PySide6.QtGui import QPixmap, QColor, QPainter, QImageReader, QImage, QCursor, QFont
+    from PySide6.QtGui import QPixmap, QColor, QPainter, QImageReader, QImage, QCursor, QFont, QIcon
     from PySide6 import QtCore, QtGui, QtWidgets
     PYSIDE_VERSION = 6
 except ImportError:
     from PySide2.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                     QLineEdit, QScrollArea, QFrame, QGroupBox, QCheckBox,
                                     QSpinBox, QFormLayout, QDateEdit, QDialog, QGraphicsView,
-                                    QApplication, QListView, QListWidget, QCompleter, QAbstractItemView)
+                                    QApplication, QListView, QListWidget, QCompleter, QAbstractItemView, QMenu,
+                                    QGraphicsOpacityEffect)
     from PySide2.QtCore import Signal, Qt, QEvent, QPoint, QSize, QDate, QRect
-    from PySide2.QtGui import QPixmap, QColor, QPainter, QImageReader, QImage, QCursor, QFont
+    from PySide2.QtGui import QPixmap, QColor, QPainter, QImageReader, QImage, QCursor, QFont, QIcon
     from PySide2 import QtCore, QtGui, QtWidgets
     PYSIDE_VERSION = 2
 
@@ -477,6 +479,29 @@ class BreadcrumbWidget(QWidget):
         self.update_breadcrumbs()
 
 
+def _build_grey_folder_icon(size=16):
+    """
+    Draw a small folder icon in the app's own grey palette (same colors as
+    the plain-folder icon in delegates.py). Used instead of the color emoji
+    for the full-path search toggle - the emoji renders as a fixed yellow
+    glyph (Segoe UI Emoji's own COLR/CPAL colors), which a QSS 'color' rule
+    or opacity effect can't turn grey, so a hand-drawn icon is required to
+    actually look grey and match the rest of the UI.
+    """
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setPen(QColor(100, 100, 100))
+    painter.setBrush(QColor(160, 160, 160))
+    body_rect = QRect(1, size // 4, size - 2, size - size // 4 - 2)
+    tab_rect = QRect(1, size // 7, size // 2, size // 7)
+    painter.drawRect(tab_rect)
+    painter.drawRect(body_rect)
+    painter.end()
+    return QIcon(pixmap)
+
+
 class EnhancedSearchBar(QWidget):
     """Enhanced search bar with case-sensitive and regex toggles"""
     
@@ -497,7 +522,37 @@ class EnhancedSearchBar(QWidget):
         layout.setContentsMargins(0, 5, 0, 5)
         layout.setSpacing(5)
         
-        # Search input field (no icon before it)
+        # Recent searches dropdown - placed before the input, like a browser
+        # address bar's history dropdown. Populated/managed externally by
+        # browser.py, same pattern as the toolbar's recent-folders button:
+        # this widget just owns the button/menu (doesn't touch config
+        # itself); browser.py builds the menu actions and wires each one's
+        # triggered signal directly.
+        self.history_btn = QPushButton(u"\U0001F552")  # Clock emoji
+        self.history_btn.setMaximumWidth(30)
+        self.history_btn.setMinimumHeight(28)
+        self.history_btn.setMaximumHeight(28)
+        self.history_btn.setToolTip("Recent Searches")
+        self.history_btn.setStyleSheet("""
+            QPushButton {
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 2px;
+                background-color: #2a2a2a;
+                font-size: 13px;
+            }
+            QPushButton::menu-indicator {
+                width: 0px;
+            }
+            QPushButton:hover {
+                background-color: #3a3a3a;
+            }
+        """)
+        history_menu = QMenu(self.history_btn)
+        self.history_btn.setMenu(history_menu)
+        layout.addWidget(self.history_btn)
+
+        # Search input field
         self.search_input = QtWidgets.QLineEdit()
         self.search_input.setPlaceholderText("Search files... (Ctrl+F)")
         self.search_input.setMinimumWidth(300)
@@ -536,7 +591,40 @@ class EnhancedSearchBar(QWidget):
         self.search_btn.clicked.connect(self._on_search_clicked)
         self.search_btn.setEnabled(False)  # Initially disabled (not hidden)
         layout.addWidget(self.search_btn)
-        
+
+        # Fuzzy toggle button (fzf/VSCode "Ctrl+P" style subsequence match -
+        # mutually exclusive with regex, since they're different matching
+        # modes entirely; checking one unchecks the other). On by default -
+        # it's a superset of plain substring matching in practice (a
+        # contiguous substring is itself a valid subsequence), so leaving
+        # it on doesn't lose the old default behavior, just broadens it.
+        self.fuzzy_btn = QPushButton("~")
+        self.fuzzy_btn.setCheckable(True)
+        self.fuzzy_btn.setChecked(True)
+        self.fuzzy_btn.setToolTip("Fuzzy Search (e.g. \"rgh\" matches \"roughness\")")
+        self.fuzzy_btn.setMaximumWidth(35)
+        self.fuzzy_btn.setMinimumHeight(28)
+        self.fuzzy_btn.setMaximumHeight(28)
+        self.fuzzy_btn.setStyleSheet("""
+            QPushButton {
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 4px;
+                background-color: #2a2a2a;
+                font-family: 'Courier New', monospace;
+                font-weight: bold;
+            }
+            QPushButton:checked {
+                background-color: #4b7daa;
+                border-color: #5a8db8;
+            }
+            QPushButton:hover {
+                background-color: #3a3a3a;
+            }
+        """)
+        self.fuzzy_btn.clicked.connect(self._on_fuzzy_toggled)
+        layout.addWidget(self.fuzzy_btn)
+
         # Case-sensitive toggle button
         self.case_btn = QPushButton("Aa")
         self.case_btn.setCheckable(True)
@@ -587,7 +675,11 @@ class EnhancedSearchBar(QWidget):
         """)
         self.regex_btn.clicked.connect(self._on_options_changed)
         layout.addWidget(self.regex_btn)
-        
+
+        # Separator before the subfolders-related controls (same visual
+        # pattern as the toolbar's "  |  " separator before its Thumbnails checkbox)
+        layout.addWidget(QLabel("  |  "))
+
         # Subfolders checkbox - search in subfolders when enabled
         self.subfolders_checkbox = QCheckBox("Subfolders")
         self.subfolders_checkbox.setToolTip("Search in subfolders (manual trigger with search button)")
@@ -595,7 +687,50 @@ class EnhancedSearchBar(QWidget):
         # Use default checkbox style (same as Thumbnails and Sequences checkboxes)
         self.subfolders_checkbox.stateChanged.connect(self._on_subfolders_toggled)
         layout.addWidget(self.subfolders_checkbox)
-        
+
+        # Full-path toggle - match against the whole path instead of just
+        # the filename (e.g. to find everything under a folder named "Wall").
+        # Off by default (filename-only matches the old/expected behavior).
+        # Placed right after Subfolders since it only matters together with it
+        # (see browser.py's update_full_path_button_state, which greys this
+        # out when neither subfolder mode is on).
+        self.full_path_btn = QPushButton("")
+        self.full_path_btn.setIcon(_build_grey_folder_icon())
+        self.full_path_btn.setIconSize(QSize(15, 15))
+        self.full_path_btn.setCheckable(True)
+        self.full_path_btn.setToolTip("Search Full Path (not just filename)")
+        self.full_path_btn.setMaximumWidth(35)
+        self.full_path_btn.setMinimumHeight(28)
+        self.full_path_btn.setMaximumHeight(28)
+        self.full_path_btn.setStyleSheet("""
+            QPushButton {
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 2px;
+                background-color: #2a2a2a;
+                font-size: 13px;
+            }
+            QPushButton:checked {
+                background-color: #4b7daa;
+                border-color: #5a8db8;
+            }
+            QPushButton:hover {
+                background-color: #3a3a3a;
+            }
+            QPushButton:disabled {
+                background-color: transparent;
+                border-color: transparent;
+            }
+        """)
+        self.full_path_btn.clicked.connect(self._on_options_changed)
+        layout.addWidget(self.full_path_btn)
+        # Qt stylesheets can't dim the button's emoji glyph (color/opacity
+        # properties don't affect colored emoji glyphs), so a real
+        # QGraphicsOpacityEffect is used instead - see set_full_path_active().
+        self._full_path_opacity_effect = QGraphicsOpacityEffect(self.full_path_btn)
+        self._full_path_opacity_effect.setOpacity(1.0)
+        self.full_path_btn.setGraphicsEffect(self._full_path_opacity_effect)
+
         # Clear button (only visible when text present)
         self.clear_btn = QPushButton("❌")
         self.clear_btn.setMaximumWidth(30)
@@ -647,8 +782,17 @@ class EnhancedSearchBar(QWidget):
     
     def _on_options_changed(self):
         """Handle case/regex toggle change"""
+        # Regex and fuzzy are different matching modes - mutually exclusive
+        if self.regex_btn.isChecked() and self.fuzzy_btn.isChecked():
+            self.fuzzy_btn.setChecked(False)
         self.optionsChanged.emit()
-    
+
+    def _on_fuzzy_toggled(self):
+        """Handle fuzzy toggle change"""
+        if self.fuzzy_btn.isChecked() and self.regex_btn.isChecked():
+            self.regex_btn.setChecked(False)
+        self.optionsChanged.emit()
+
     def clear_search(self):
         """Clear search text"""
         self.search_input.clear()
@@ -675,7 +819,15 @@ class EnhancedSearchBar(QWidget):
     def is_regex_enabled(self):
         """Check if regex search is enabled"""
         return self.regex_btn.isChecked()
-    
+
+    def is_fuzzy_enabled(self):
+        """Check if fuzzy search is enabled"""
+        return self.fuzzy_btn.isChecked()
+
+    def is_full_path_enabled(self):
+        """Check if full-path search is enabled"""
+        return self.full_path_btn.isChecked()
+
     def is_subfolders_enabled(self):
         """Check if subfolder search is enabled"""
         return self.subfolders_checkbox.isChecked()
@@ -683,7 +835,11 @@ class EnhancedSearchBar(QWidget):
     def get_text(self):
         """Get current search text"""
         return self.search_input.text()
-    
+
+    def set_text(self, text):
+        """Set the search text (e.g. picking a recent search) - triggers the normal textChanged flow"""
+        self.search_input.setText(text)
+
     def set_case_sensitive(self, enabled):
         """Set case-sensitive mode"""
         self.case_btn.setChecked(enabled)
@@ -691,7 +847,24 @@ class EnhancedSearchBar(QWidget):
     def set_regex_enabled(self, enabled):
         """Set regex mode"""
         self.regex_btn.setChecked(enabled)
-    
+
+    def set_fuzzy_enabled(self, enabled):
+        """Set fuzzy mode"""
+        self.fuzzy_btn.setChecked(enabled)
+
+    def set_full_path_enabled(self, enabled):
+        """Set full-path search mode"""
+        self.full_path_btn.setChecked(enabled)
+
+    def set_full_path_active(self, active):
+        """
+        Enable/disable the full-path button AND visibly dim it when inactive.
+        Separate from set_full_path_enabled() (which sets the checked *value*) -
+        this controls whether the toggle can currently do anything at all.
+        """
+        self.full_path_btn.setEnabled(active)
+        self._full_path_opacity_effect.setOpacity(1.0 if active else 0.25)
+
     def set_subfolders_enabled(self, enabled):
         """Set subfolders search mode"""
         self.subfolders_checkbox.setChecked(enabled)

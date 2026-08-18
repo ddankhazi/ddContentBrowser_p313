@@ -152,7 +152,6 @@ def _channel_dst_attr(material, channel):
         }
 
     elif t == "dGecko":
-        # No transmission input in the studio's dGecko shader - not wired.
         mapping = {
             "baseColor":    ["diffuse_color"],
             "roughness":    ["reflection_roughness"],
@@ -161,6 +160,9 @@ def _channel_dst_attr(material, channel):
             "emission":     ["incandescence"],
             "opacity":      ["geometry_mask"],
             "translucency": ["translucency_color"],
+            # Not a weight like the other shader types - a filter-color
+            # style refraction input. See _ensure_dgecko_transmission().
+            "transmission": ["refraction_transparency"],
         }
 
     else:  # aiStandardSurface
@@ -721,6 +723,28 @@ def _ensure_translucency(material, file_node):
             print("[ShaderGen] translucency connection failed ({0}->{1}): {2}".format(file_node, dst, e))
 
 
+def _ensure_dgecko_transmission(material, file_node):
+    """
+    Wire dGecko's transmission (refraction) texture. Reference recipe:
+        defaultNavigation file -> <mat>.refraction_transparency
+        refraction_ior = 1.5
+        thin_walled = 1 (a safety default, not universally correct - the
+                          user may want to turn it back off for thick glass)
+    Attrs are set before the color connection, same convention as
+    _ensure_translucency().
+    """
+    dst = material + ".refraction_transparency"
+    if _dst_has_input(dst):
+        print("[ShaderGen] transmission already connected on {0}, skipping.".format(material))
+        return
+    _set_attr_safe(material + ".refraction_ior", 1.5)
+    _set_attr_safe(material + ".thin_walled", 1)
+    try:
+        cmds.defaultNavigation(connectToExisting=True, source=file_node, destination=dst)
+    except Exception as e:
+        print("[ShaderGen] transmission connection failed ({0}->{1}): {2}".format(file_node, dst, e))
+
+
 def _path_contains_megascans(path):
     """
     True if any path segment contains 'megascans' (case-insensitive).
@@ -772,8 +796,14 @@ def _connect_channel(material, channel, file_node, invert_normal_g=False):
 
 
     elif channel == "transmission":
-        # Weight is scalar
-        _connect_if_free(file_node + ".outColorR", dst)
+        if t == "dGecko":
+            _ensure_dgecko_transmission(material, file_node)
+        elif t == "openPBRSurface":
+            _set_attr_safe(material + ".geometryThinWalled", 1)
+            _connect_if_free(file_node + ".outAlpha", dst)
+        else:  # aiStandardSurface
+            _set_attr_safe(material + ".thinWalled", 1)
+            _connect_if_free(file_node + ".outAlpha", dst)
 
     elif channel == "translucency":
         _ensure_translucency(material, file_node)

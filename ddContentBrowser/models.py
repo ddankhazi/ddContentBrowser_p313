@@ -507,6 +507,8 @@ class FileSystemModel(QAbstractListModel):
         # Search options
         self.case_sensitive_search = False
         self.regex_search = False
+        self.fuzzy_search = True  # fzf/VSCode-style subsequence match, see utils.fuzzy_match() - on by default
+        self.search_full_path = False  # Match against the full path, not just the filename
         self.search_in_subfolders = False  # Search in subfolders when search text is present
         
         # Advanced filters
@@ -761,8 +763,8 @@ class FileSystemModel(QAbstractListModel):
                         for dir_name in dirs:
                             if not dir_name.startswith('.'):
                                 if self.filter_text:
-                                    if self._matches_search(dir_name, self.filter_text):
-                                        dir_path_str = str(root_path / dir_name)
+                                    dir_path_str = str(root_path / dir_name)
+                                    if self._matches_search(dir_name, self.filter_text, full_path=dir_path_str):
                                         collected_paths.append(dir_path_str)
                                         collected_dirs.add(dir_path_str)
                                         loaded_count += 1
@@ -771,19 +773,20 @@ class FileSystemModel(QAbstractListModel):
                                     collected_paths.append(dir_path_str)
                                     collected_dirs.add(dir_path_str)
                                     loaded_count += 1
-                    
+
                     # Add files
                     for file_name in files:
                         ext = os.path.splitext(file_name)[1].lower()
                         if is_extension_supported(ext):
                             if self.filter_file_types and ext not in self.filter_file_types:
                                 continue
-                            
+
                             file_count += 1
-                            
+
                             # Apply search filter if in search mode
                             if is_search_mode:
-                                if self._matches_search(file_name, self.filter_text):
+                                file_path_str = str(root_path / file_name)
+                                if self._matches_search(file_name, self.filter_text, full_path=file_path_str):
                                     collected_paths.append(str(root_path / file_name))
                                     match_count += 1
                                     loaded_count += 1
@@ -874,7 +877,7 @@ class FileSystemModel(QAbstractListModel):
                                 continue
                             # Apply search filter to folders too
                             if self.filter_text:
-                                if not self._matches_search(asset.name, self.filter_text):
+                                if not self._matches_search(asset.name, self.filter_text, full_path=str(asset.file_path)):
                                     continue
                             filtered_assets.append(asset)
                             continue
@@ -918,9 +921,9 @@ class FileSystemModel(QAbstractListModel):
                         
                         # Apply search filter
                         if self.filter_text:
-                            if not self._matches_search(asset.name, self.filter_text):
+                            if not self._matches_search(asset.name, self.filter_text, full_path=str(asset.file_path)):
                                 continue
-                        
+
                         filtered_assets.append(asset)
                     
                     self.assets = filtered_assets
@@ -968,7 +971,7 @@ class FileSystemModel(QAbstractListModel):
                 
                 # Filter based on search text (applies to both folders and files)
                 if self.filter_text:
-                    all_items = [(f, d) for f, d in all_items if self._matches_search(f.name, self.filter_text)]
+                    all_items = [(f, d) for f, d in all_items if self._matches_search(f.name, self.filter_text, full_path=str(f))]
                     if DEBUG_MODE:
                         print(f"[Model] After search filter: {len(all_items)} items")
 
@@ -1274,26 +1277,81 @@ class FileSystemModel(QAbstractListModel):
         if self.texture_sets_only:
             self.assets = [a for a in self.assets if a.is_folder or getattr(a, 'is_texture_set', False)]
     
-    def _matches_search(self, filename, search_text):
+    def _matches_search(self, filename, search_text, full_path=None):
         """
-        Check if filename matches search text
-        Supports case-sensitive and regex search based on settings
+        Check if filename (or full_path, in full-path search mode) matches
+        search text. Thin wrapper around _search_match_indices() - see that
+        method for the actual case-sensitive/regex/fuzzy matching logic
+        (shared with the highlight-drawing code in delegates.py, so both
+        always agree on what counts as a match).
         """
+        return self._search_match_indices(filename, search_text, full_path) is not None
+
+    def _search_match_indices(self, filename, search_text, full_path=None):
+        """
+        Match filename against search_text (case-sensitive/regex/fuzzy per
+        current settings) and return the character indices in the matched
+        string to highlight, or None if it doesn't match at all.
+
+        - fuzzy mode: the exact (possibly scattered) matched positions from
+          utils.fuzzy_match().
+        - regex mode: every index covered by re.search()'s matched span.
+        - plain substring mode (default): every index covered by the
+          substring match.
+        Regex takes priority over fuzzy if both are somehow on (they're
+        meant to be mutually exclusive modes in the UI).
+
+        If self.search_full_path is on and the caller provided full_path,
+        matching happens against full_path instead of filename (indices
+        then refer to positions in full_path, not filename) - falls back
+        to filename if full_path wasn't supplied.
+        """
+        if not search_text:
+            return None
+
+        target = full_path if (getattr(self, 'search_full_path', False) and full_path) else filename
+
         if self.regex_search:
-            # Regex search
             try:
                 import re
                 flags = 0 if self.case_sensitive_search else re.IGNORECASE
-                return bool(re.search(search_text, filename, flags))
+                m = re.search(search_text, target, flags)
+                if m:
+                    return list(range(m.start(), m.end()))
+                return None
             except re.error:
-                # Invalid regex - fall back to plain text search
-                pass
-        
+                pass  # Invalid regex - fall back to plain text search
+
+        if getattr(self, 'fuzzy_search', False):
+            from .utils import fuzzy_match
+            result = fuzzy_match(search_text, target)
+            return result[1] if result else None
+
         # Plain text search
-        if self.case_sensitive_search:
-            return search_text in filename
-        else:
-            return search_text.lower() in filename.lower()
+        haystack = target if self.case_sensitive_search else target.lower()
+        needle = search_text if self.case_sensitive_search else search_text.lower()
+        idx = haystack.find(needle)
+        if idx == -1:
+            return None
+        return list(range(idx, idx + len(needle)))
+
+    def get_search_highlight_indices(self, filename):
+        """
+        Public entry point for delegates.py: the character indices in
+        `filename` matched by the CURRENT search (self.filter_text), for
+        highlighting - or None if there's no active search / no match.
+
+        In full-path search mode this always returns None: the delegate
+        only draws the filename, and a match found purely in the directory
+        portion of the path has no corresponding position to highlight in
+        it (translating path-relative indices back onto just the filename,
+        for the subset of matches that happen to land inside it, isn't
+        worth the complexity for a highlight - filtering itself is
+        unaffected either way).
+        """
+        if not self.filter_text or getattr(self, 'search_full_path', False):
+            return None
+        return self._search_match_indices(filename, self.filter_text)
     
     def setSortOrder(self, column, ascending=True):
         """Set sort order"""
@@ -1547,7 +1605,8 @@ class FileSystemModel(QAbstractListModel):
             
             # Apply search filter (applies to both folders and files)
             if self.filter_text:
-                self.assets = [asset for asset in all_assets if self._matches_search(asset.name, self.filter_text)]
+                self.assets = [asset for asset in all_assets
+                               if self._matches_search(asset.name, self.filter_text, full_path=str(asset.file_path))]
             else:
                 self.assets = all_assets
 
@@ -1860,21 +1919,23 @@ class FileSystemModel(QAbstractListModel):
                     for dir_name in dirs:
                         if not dir_name.startswith('.'):
                             if self.filter_text:
-                                if self._matches_search(dir_name, self.filter_text):
-                                    all_paths.append(str(root_path / dir_name))
+                                dir_path_str = str(root_path / dir_name)
+                                if self._matches_search(dir_name, self.filter_text, full_path=dir_path_str):
+                                    all_paths.append(dir_path_str)
                             else:
                                 all_paths.append(str(root_path / dir_name))
-                
+
                 # Add files
                 for file_name in files:
                     ext = os.path.splitext(file_name)[1].lower()
                     if is_extension_supported(ext):
                         if self.filter_file_types and ext not in self.filter_file_types:
                             continue
-                        
+
                         if is_search_mode:
-                            if self._matches_search(file_name, self.filter_text):
-                                all_paths.append(str(root_path / file_name))
+                            file_path_str = str(root_path / file_name)
+                            if self._matches_search(file_name, self.filter_text, full_path=file_path_str):
+                                all_paths.append(file_path_str)
                         else:
                             all_paths.append(str(root_path / file_name))
             

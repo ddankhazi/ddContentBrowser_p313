@@ -1384,14 +1384,23 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Load search settings from settings manager and apply to search bar
         case_sensitive = self.settings_manager.get("filters", "case_sensitive_search", False)
         regex_enabled = self.settings_manager.get("filters", "regex_search", False)
+        fuzzy_enabled = self.settings_manager.get("filters", "fuzzy_search", True)
+        full_path_enabled = self.settings_manager.get("filters", "search_full_path", False)
         search_subfolders = self.settings_manager.get("filters", "search_in_subfolders", False)
         self.file_model.case_sensitive_search = case_sensitive
         self.file_model.regex_search = regex_enabled
+        self.file_model.fuzzy_search = fuzzy_enabled
+        self.file_model.search_full_path = full_path_enabled
         self.file_model.search_in_subfolders = search_subfolders
         self.search_bar.set_case_sensitive(case_sensitive)
         self.search_bar.set_regex_enabled(regex_enabled)
+        self.search_bar.set_fuzzy_enabled(fuzzy_enabled)
+        self.search_bar.set_full_path_enabled(full_path_enabled)
         self.search_bar.set_subfolders_enabled(search_subfolders)
-        
+        self.update_search_history_menu()  # Initialize recent-searches dropdown menu
+        self.update_full_path_button_state()  # Grey out full-path toggle if not in subfolder mode
+
+
         # Initialize Advanced Filters panel now that file_model exists
         self.init_advanced_filters()
         
@@ -1416,21 +1425,48 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             print("[Browser] Advanced Filters V2 panel initialized")
     
     def on_search_text_changed(self, text):
-        """Handle search text change (only called when Subfolders is OFF - real-time search)"""
+        """
+        Handle search text change (only called when Subfolders is OFF - real-time search).
+        Debounced (200ms) for non-empty text so a full model refresh doesn't run on
+        every single keystroke while typing - clearing the box (empty text) applies
+        immediately, since there's nothing expensive about reverting to "show everything".
+        """
+        if not hasattr(self, '_search_debounce_timer'):
+            self._search_debounce_timer = QTimer()
+            self._search_debounce_timer.setSingleShot(True)
+            self._search_debounce_timer.timeout.connect(self._apply_pending_search_text)
+        self._pending_search_text = text
+
+        if not text:
+            self._search_debounce_timer.stop()
+            self._apply_pending_search_text()
+            return
+
+        self._search_debounce_timer.start(200)
+
+    def _apply_pending_search_text(self):
+        """Actually apply the (possibly debounced) search text - see on_search_text_changed."""
+        text = self._pending_search_text
+
         # CLEAR thumbnail generator queue when search changes
         if hasattr(self, 'thumbnail_generator'):
             self.thumbnail_generator.clear_queue()
-        
+
         # If clearing search, clear progress display
         if not text:
             self.search_bar.clear_search_progress()
-        
+        else:
+            # Debounce already settled (200ms of no typing) - treat this as
+            # a "committed" search worth remembering.
+            self.config.add_recent_search(text)
+            self.update_search_history_menu()
+
         self.file_model.setFilterText(text)
         # Update match count (will be called after model refresh)
         QTimer.singleShot(50, self.update_search_match_count)
         # Request thumbnails for new filtered results
         QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
-    
+
     def on_subfolder_search_requested(self):
         """Handle manual subfolder search request (search button clicked or Enter pressed)"""
         # Get search text
@@ -1450,7 +1486,11 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         
         # Show initial progress
         self.search_bar.set_search_progress(0, 0)
-        
+
+        # Explicit search trigger (Enter/button) - always worth remembering
+        self.config.add_recent_search(search_text)
+        self.update_search_history_menu()
+
         # Trigger search with current text
         self.file_model.setFilterText(search_text)
         
@@ -1526,11 +1566,26 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             file_count = len(self.file_model.assets)
             self.safe_show_status(f"✓ Loaded {file_count} files from subfolders")
     
+    def update_full_path_button_state(self):
+        """
+        Full-path search only changes anything when actually searching
+        recursively (Include Subfolders, or the search bar's own Subfolders
+        toggle) - in a single, non-recursive folder view every visible item
+        shares the same parent path, so it can't discriminate anything.
+        Grey the toggle out otherwise so it doesn't look like a live option
+        with no effect.
+        """
+        subfolder_mode = self.include_subfolders_checkbox.isChecked() or self.search_bar.is_subfolders_enabled()
+        self.search_bar.set_full_path_active(subfolder_mode)
+
     def on_search_options_changed(self):
         """Handle search option (case/regex/subfolders) toggle"""
         self.file_model.case_sensitive_search = self.search_bar.is_case_sensitive()
         self.file_model.regex_search = self.search_bar.is_regex_enabled()
-        
+        self.file_model.fuzzy_search = self.search_bar.is_fuzzy_enabled()
+        self.file_model.search_full_path = self.search_bar.is_full_path_enabled()
+        self.update_full_path_button_state()
+
         # Check if subfolders setting changed
         old_subfolders = self.file_model.search_in_subfolders
         new_subfolders = self.search_bar.is_subfolders_enabled()
@@ -1541,6 +1596,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Save to settings
         self.settings_manager.set("filters", "case_sensitive_search", self.search_bar.is_case_sensitive())
         self.settings_manager.set("filters", "regex_search", self.search_bar.is_regex_enabled())
+        self.settings_manager.set("filters", "fuzzy_search", self.search_bar.is_fuzzy_enabled())
+        self.settings_manager.set("filters", "search_full_path", self.search_bar.is_full_path_enabled())
         self.settings_manager.set("filters", "search_in_subfolders", new_subfolders)
         self.settings_manager.save()
         
@@ -1598,7 +1655,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Handle both PySide2 (int) and PySide6 (enum) properly
         include_subfolders = bool(state == Qt.Checked or state == 2)
         self.file_model.include_subfolders = include_subfolders
-        
+        self.update_full_path_button_state()
+
         # Clear advanced filters when subfolders toggle (asset list will change)
         if hasattr(self, 'advanced_filters_panel'):
             print(f"[Browser] Subfolders toggled to {include_subfolders} - clearing advanced filters")
@@ -2152,7 +2210,43 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.update_recent_menu()
         self.update_recent_list()
         self.safe_show_status("Recent folders cleared")
-    
+
+    def update_search_history_menu(self):
+        """Update the search bar's recent-searches dropdown menu (same pattern as update_recent_menu)"""
+        menu = self.search_bar.history_btn.menu()
+        menu.clear()
+
+        from . import widgets
+        menu.setFont(QtGui.QFont(widgets.UI_FONT, 9))
+
+        recent_searches = self.config.config.get("recent_searches", [])
+
+        if not recent_searches:
+            no_recent_action = menu.addAction("No recent searches")
+            no_recent_action.setEnabled(False)
+        else:
+            for query in recent_searches:
+                action = menu.addAction(query)
+                action.triggered.connect(lambda checked=False, q=query: self.apply_recent_search(q))
+
+            menu.addSeparator()
+            clear_action = menu.addAction("Clear Recent Searches")
+            clear_action.triggered.connect(self.clear_recent_searches)
+
+    def apply_recent_search(self, query):
+        """Re-run a search picked from the recent-searches dropdown"""
+        self.search_bar.set_text(query)
+        if self.search_bar.is_subfolders_enabled():
+            # Subfolders mode needs an explicit trigger (matches typing behavior)
+            self.on_subfolder_search_requested()
+
+    def clear_recent_searches(self):
+        """Clear all recent searches"""
+        self.config.config["recent_searches"] = []
+        self.config.save_config()
+        self.update_search_history_menu()
+        self.safe_show_status("Recent searches cleared")
+
     def add_current_to_favorites(self):
         """Add current path to favorites"""
         current_path = self.breadcrumb.current_path.strip()

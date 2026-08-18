@@ -83,7 +83,60 @@ class ThumbnailDelegate(QStyledItemDelegate):
         
         text = extension[1:].upper() if len(extension) > 1 else "FILE"
         painter.drawText(rect, Qt.AlignCenter, text)
-        
+
+    def _get_search_highlight_indices(self, asset):
+        """Character indices in asset.name matched by the current search, or None (no active search / no match)."""
+        if not self.browser or not hasattr(self.browser, 'file_model'):
+            return None
+        try:
+            return self.browser.file_model.get_search_highlight_indices(asset.name)
+        except Exception:
+            return None
+
+    def _draw_highlighted_text(self, painter, rect, text, matched_indices, alignment, base_color, highlight_color):
+        """
+        Draw `text` inside `rect`, highlighting the characters at
+        matched_indices (current search-match positions, e.g. from fuzzy
+        search) in highlight_color/bold, everything else in base_color -
+        drawn character-by-character since QPainter has no built-in
+        partial-rich-text mode. Supports the two alignments actually used
+        in this delegate: Qt.AlignTop|Qt.AlignHCenter (grid mode) and
+        Qt.AlignVCenter/left (list mode).
+        """
+        if not matched_indices:
+            painter.setPen(base_color)
+            painter.drawText(rect, alignment, text)
+            return
+
+        matched_set = set(matched_indices)
+        metrics = painter.fontMetrics()
+        base_font = painter.font()
+        highlight_font = QFont(base_font)
+        highlight_font.setBold(True)
+
+        total_width = metrics.horizontalAdvance(text)
+        if alignment & Qt.AlignHCenter:
+            x = rect.x() + max(0, (rect.width() - total_width) // 2)
+        else:
+            x = rect.x()
+
+        if alignment & Qt.AlignVCenter:
+            y = rect.y() + (rect.height() + metrics.ascent() - metrics.descent()) // 2
+        else:
+            y = rect.y() + metrics.ascent()
+
+        for i, ch in enumerate(text):
+            if i in matched_set:
+                painter.setFont(highlight_font)
+                painter.setPen(highlight_color)
+            else:
+                painter.setFont(base_font)
+                painter.setPen(base_color)
+            painter.drawText(x, y, ch)
+            x += metrics.horizontalAdvance(ch)
+
+        painter.setFont(base_font)
+
     def sizeHint(self, option, index):
         """Return size hint for item"""
         if self.icon_mode:
@@ -213,20 +266,30 @@ class ThumbnailDelegate(QStyledItemDelegate):
                 self.draw_gradient_placeholder(painter, thumb_rect, asset.extension)
         
         # Draw file name below thumbnail
-        text_rect = QRect(rect.x(), thumb_y + thumb_size + 5, 
+        text_rect = QRect(rect.x(), thumb_y + thumb_size + 5,
                                 rect.width(), rect.height() - thumb_size - 10)
-        
-        painter.setPen(option.palette.text().color() if not (option.state & QStyle.State_Selected)
+
+        base_color = (option.palette.text().color() if not (option.state & QStyle.State_Selected)
                       else option.palette.highlightedText().color())
-        
+
         # Fixed font size for grid mode file names
         painter.setFont(QFont(UI_FONT, 9))
-        
+
         # Elide text if too long
         metrics = painter.fontMetrics()
         elided_text = metrics.elidedText(asset.name, Qt.ElideMiddle, text_rect.width() - 10)
-        painter.drawText(text_rect, Qt.AlignTop | Qt.AlignHCenter, elided_text)
-    
+
+        # Highlight the matched search characters - only when NOT elided,
+        # since matched_indices refer to positions in the full name and
+        # wouldn't line up with an elided (shortened) string.
+        highlight_indices = self._get_search_highlight_indices(asset) if elided_text == asset.name else None
+        if highlight_indices:
+            self._draw_highlighted_text(painter, text_rect, elided_text, highlight_indices,
+                                        Qt.AlignTop | Qt.AlignHCenter, base_color, QColor(93, 173, 226))
+        else:
+            painter.setPen(base_color)
+            painter.drawText(text_rect, Qt.AlignTop | Qt.AlignHCenter, elided_text)
+
     def _paint_list_mode(self, painter, option, asset):
         """Paint item in list mode with columns (Name, Type, Size, Date)"""
         rect = option.rect
@@ -349,13 +412,19 @@ class ThumbnailDelegate(QStyledItemDelegate):
                 self.draw_gradient_placeholder(painter, thumb_rect, asset.extension)
 
         # Draw file name next to thumbnail
-        painter.setPen(text_color)
         text_x = thumb_x + thumb_size + 6
         name_rect = QRect(text_x, rect.y(), name_width - thumb_size - 10, rect.height())
         # Fixed font size for file name (even in compact 16px rows)
         painter.setFont(QFont(UI_FONT, 9))
-        painter.drawText(name_rect, Qt.AlignVCenter, asset.name)
-        
+        highlight_indices = self._get_search_highlight_indices(asset)
+        if highlight_indices:
+            self._draw_highlighted_text(painter, name_rect, asset.name, highlight_indices,
+                                        Qt.AlignVCenter, text_color, QColor(93, 173, 226))
+        else:
+            painter.setPen(text_color)
+            painter.drawText(name_rect, Qt.AlignVCenter, asset.name)
+
+
         # ===== COLUMN 2: TYPE =====
         type_rect = QRect(type_x + 5, rect.y(), type_width - 10, rect.height())
         # Fixed font size for type column

@@ -23,6 +23,7 @@ class ContentBrowserConfig:
         self.default_config = {
             # Session State - Navigation & Bookmarks
             "recent_paths": [],
+            "recent_searches": [],
             "favorites": [],
             "last_path": str(Path.home()),
             
@@ -121,4 +122,17 @@ class ContentBrowserConfig:
         self.config["recent_paths"].insert(0, path)
         # Keep maximum 20 recent paths
         self.config["recent_paths"] = self.config["recent_paths"][:20]
+        self.save_config()
+
+    def add_recent_search(self, query):
+        """Add a search query to recent searches (same dedupe/cap pattern as add_recent_path)"""
+        query = str(query).strip()
+        if not query:
+            return
+        recent = self.config.setdefault("recent_searches", [])
+        if query in recent:
+            recent.remove(query)
+        recent.insert(0, query)
+        # Keep maximum 15 recent searches
+        self.config["recent_searches"] = recent[:15]
         self.save_config()

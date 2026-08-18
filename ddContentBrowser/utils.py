@@ -1830,3 +1830,83 @@ def resolve_texture_set_channels(variant_map: dict, geo_suffix, exclude_displace
     return result
 
 
+# ============================================================
+# Fuzzy filename search (fzf/VSCode "Ctrl+P" style subsequence matching)
+# ============================================================
+
+_FUZZY_SEPARATORS = set('_-. /\\')
+
+
+def fuzzy_match(query: str, text: str):
+    """
+    Subsequence fuzzy match: every character of `query` must appear in
+    `text`, in order, but not necessarily consecutively (e.g. "rgh" matches
+    "roughness" via r-o-u-**g**-**h**-ness). Case-insensitive - both
+    strings are lowercased internally.
+
+    This is a greedy scorer, not a full optimal-alignment algorithm (like
+    fzf's own Smith-Waterman-style matcher) - it always takes the first
+    valid position for each query character rather than searching every
+    possible alignment for the best-scoring one. That's a deliberate
+    simplicity/speed tradeoff: filenames are short, so a greedy pass is
+    plenty good in practice and stays O(len(text)) per file, which matters
+    when it runs against thousands of files per keystroke.
+
+    Scoring bonuses (higher = better match), used to rank/sort results:
+      - consecutive matched characters (a contiguous run scores much more
+        than the same characters scattered around)
+      - a match starting right at a word boundary (start of string, or
+        right after _/-/./space/\\ - e.g. matching "wall" at the start of
+        "Wall_baseColor" scores higher than matching it starting mid-word)
+      - the match starting at position 0 of the whole string
+
+    Args:
+        query: the search text (as typed by the user).
+        text: the filename (or other string) to test against.
+
+    Returns:
+        (score, matched_indices) if query is a subsequence of text -
+        matched_indices is a list of the same length as query, giving the
+        index in `text` each query character matched at (used for drawing
+        the "which letters matched" highlight). Returns None if query is
+        not a subsequence of text at all (no match).
+    """
+    if not query:
+        return (0.0, [])
+
+    q = query.lower()
+    t = text.lower()
+
+    indices = []
+    score = 0.0
+    search_from = 0
+    consecutive_run = 0
+
+    for qc in q:
+        pos = t.find(qc, search_from)
+        if pos == -1:
+            return None
+
+        if pos == search_from:
+            consecutive_run += 1
+            score += 15 + consecutive_run * 5  # escalating bonus for longer runs
+        else:
+            consecutive_run = 0
+            score += 1
+
+        if pos == 0 or t[pos - 1] in _FUZZY_SEPARATORS:
+            score += 10  # word-boundary bonus
+
+        indices.append(pos)
+        search_from = pos + 1
+
+    if indices[0] == 0:
+        score += 5  # whole match starts at the very beginning of the string
+
+    # Slight preference for shorter overall strings (less "noise" around
+    # the match), so e.g. "Wall" ranks "Wall.png" above "Wall_Detail_04_Extra.png".
+    score -= len(text) * 0.01
+
+    return (score, indices)
+
+
