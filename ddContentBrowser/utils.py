@@ -1642,8 +1642,13 @@ def find_texture_set_for_geo(geo_path, preferred_resolution="4K"):
     with the shared texture set living in a sibling "Textures" folder one
     level up from VarN. If the normal search above finds nothing and the
     geo's parent folder is named "VarN", that Textures folder is searched
-    for its single texture set (if there's exactly one) - name matching
-    doesn't apply here since "Var1" isn't a material name. Some assets ship
+    for its texture set - name matching doesn't apply here since "Var1"
+    isn't a material name, so instead all sets found must share the same
+    base name once resolution/.tx tags are stripped (e.g. a "qheqG_2K" and
+    "qheqG_4K" pair both resolve to "qheqG"), with the same non-.tx /
+    preferred_resolution tie-break the named search above uses. Genuinely
+    distinct base names (unrelated sets mixed together) still refuse to
+    guess. Some assets ship
     both an "Atlas" set (for the VarN mesh) and a separate "Billboard" set
     (for a different, non-VarN impostor geo) side by side under Textures/ -
     when an "Atlas" subfolder exists, only it is searched (a VarN mesh
@@ -1742,10 +1747,22 @@ def find_texture_set_for_geo(geo_path, preferred_resolution="4K"):
             candidates = _images_in(search_dir, recursive=True)
             if candidates:
                 sets, _ = group_texture_sets(candidates)
-                non_tx = [d for d in sets.values() if ' (TX' not in d['display']]
-                pool = non_tx if non_tx else list(sets.values())
-                if len(pool) == 1:
-                    return pool[0], geo_suffix, True
+                # Multiple sets can land here purely from resolution/.tx
+                # variants of the same material (e.g. "qheqG_2K" and
+                # "qheqG_4K" grouped as separate sets) - collapse those with
+                # the same non-.tx / preferred-resolution tie-break used by
+                # the named search above, rather than requiring there be
+                # only a single set. Genuinely distinct materials (e.g. an
+                # Atlas set mixed with a Billboard set when there's no
+                # dedicated Atlas subfolder) still refuse to guess.
+                tagged = []
+                for data in sets.values():
+                    clean = _TX_SET_SUFFIX_REGEX.sub('', data['display'])
+                    clean_base, res_tag = _strip_resolution_tag(clean)
+                    tagged.append((data, clean_base.lower(), res_tag))
+                if tagged and len({t[1] for t in tagged}) == 1:
+                    tagged.sort(key=lambda t: (' (TX' in t[0]['display'], t[2] != preferred_resolution))
+                    return tagged[0][0], geo_suffix, True
 
     return None, geo_suffix, False
 
