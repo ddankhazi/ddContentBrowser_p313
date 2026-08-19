@@ -111,13 +111,12 @@ except ImportError:
     print("[Preview Panel] Info: OpenCV not available - using QImageReader for TIFF")
 
 
-# Check for OpenEXR (for .exr files)
-try:
-    import OpenEXR
-    import Imath
-    OPENEXR_AVAILABLE = True
-except ImportError:
-    OPENEXR_AVAILABLE = False
+# Check for OpenEXR (for .exr files) - prefers the bundled build over
+# Maya's own older OpenEXR module (see utils.import_openexr())
+from .utils import import_openexr
+OpenEXR, Imath = import_openexr()
+OPENEXR_AVAILABLE = OpenEXR is not None
+if not OPENEXR_AVAILABLE:
     print("[Preview Panel] Info: OpenEXR not available - EXR support disabled")
 
 # Import sequence frame cache

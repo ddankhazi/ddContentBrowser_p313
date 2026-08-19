@@ -37,15 +37,13 @@ except ImportError:
     NUMPY_AVAILABLE = False
     print("NumPy not available")
 
-# Try to import OpenEXR for proper HDR/EXR support
-try:
-    import OpenEXR
-    import Imath
-    OPENEXR_AVAILABLE = True
-    # print(f"OpenEXR loaded - Full EXR support enabled")  # Commented to avoid duplicate messages
-except ImportError:
-    OPENEXR_AVAILABLE = False
-    # print("OpenEXR not available - EXR preview will be limited")
+# Try to import OpenEXR for proper HDR/EXR support (prefers the bundled
+# build over Maya's own older OpenEXR module - see utils.import_openexr())
+from .utils import import_openexr
+OpenEXR, Imath = import_openexr()
+OPENEXR_AVAILABLE = OpenEXR is not None
+# if not OPENEXR_AVAILABLE:
+#     print("OpenEXR not available - EXR preview will be limited")
 
 # Try to import OpenCV for Radiance HDR (.hdr) support
 try:

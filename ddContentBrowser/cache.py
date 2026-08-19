@@ -1623,9 +1623,11 @@ class ThumbnailGenerator(QThread):
         """
         try:
             import numpy as np
-            import OpenEXR
-            import Imath
-            
+            from .utils import import_openexr
+            OpenEXR, Imath = import_openexr()
+            if OpenEXR is None:
+                raise ImportError("OpenEXR not available")
+
             # Open EXR file
             exr_file = OpenEXR.InputFile(str(file_path))
             header = exr_file.header()
@@ -3601,11 +3603,14 @@ class ThumbnailGenerator(QThread):
         
         try:
             import numpy as np
-            
+
             # Try OpenEXR library first (fast, native)
             try:
-                import OpenEXR
-                
+                from .utils import import_openexr
+                OpenEXR, _Imath = import_openexr()
+                if OpenEXR is None:
+                    raise ImportError("OpenEXR not available")
+
                 if DEBUG_MODE:
                     print(f"[EXR-OPT] Loading EXR with OpenEXR library: {Path(file_path).name}")
                 

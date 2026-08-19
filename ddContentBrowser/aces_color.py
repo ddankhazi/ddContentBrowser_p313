@@ -378,13 +378,10 @@ def auto_tag_file_colorspace(file_path, metadata_manager=None):
     if extension == '.exr':
         try:
             # Try to read EXR metadata for detection
-            import sys
-            from .utils import get_external_libs_dir
-            external_libs = get_external_libs_dir()
-            if external_libs not in sys.path:
-                sys.path.append(external_libs)
-
-            import OpenEXR
+            from .utils import import_openexr
+            OpenEXR, _Imath = import_openexr()
+            if OpenEXR is None:
+                raise ImportError("OpenEXR not available")
             with OpenEXR.File(str(file_path)) as exr_file:
                 header = exr_file.header()
                 dw = header['dataWindow']

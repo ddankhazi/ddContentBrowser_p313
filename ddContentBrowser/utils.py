@@ -5,6 +5,7 @@ Helper functions for Maya integration and common operations
 
 import os
 import sys
+import threading
 
 
 def get_external_libs_dir():
@@ -23,6 +24,74 @@ def get_external_libs_dir():
     if os.path.isdir(versioned):
         return versioned
     return os.path.join(base, 'external_libs')
+
+
+_openexr_import_cache = {}
+_openexr_import_lock = threading.Lock()
+
+
+def import_openexr():
+    """
+    Import OpenEXR/Imath, preferring the bundled build in external_libs
+    over any OpenEXR module Maya itself ships on its default sys.path.
+
+    Maya (2026, and likely future versions too) bundles its own OpenEXR
+    Python module for its own internal use, implementing only the legacy
+    InputFile-style read API - not the newer .File API this codebase is
+    written against. Since callers normally add external_libs to sys.path
+    via append() (so Maya's own numpy/cv2/etc. still win, avoiding ABI
+    conflicts between differently-built copies of those), Maya's own
+    OpenEXR module wins that race too and gets imported instead of ours,
+    producing errors like "module 'OpenEXR' has no attribute 'File'".
+
+    This detects that case (bundled module found, but missing .File) and
+    forces a reload from external_libs specifically for OpenEXR/Imath,
+    without disturbing the general append-based priority used for
+    everything else. Cached after the first call - the reload only ever
+    needs to happen once per session.
+
+    Returns (OpenEXR, Imath) modules, or (None, None) if unavailable.
+    """
+    if 'result' in _openexr_import_cache:
+        return _openexr_import_cache['result']
+
+    # Thumbnail generation runs on worker threads, so this can be called
+    # concurrently on first use - the sys.modules/sys.path surgery below
+    # isn't safe to run from two threads at once.
+    with _openexr_import_lock:
+        if 'result' in _openexr_import_cache:
+            return _openexr_import_cache['result']
+
+        try:
+            import OpenEXR
+            import Imath
+        except ImportError:
+            OpenEXR = None
+            Imath = None
+
+        if OpenEXR is not None and not hasattr(OpenEXR, 'File'):
+            external_libs = get_external_libs_dir()
+            if os.path.isdir(external_libs):
+                sys.modules.pop('OpenEXR', None)
+                sys.modules.pop('Imath', None)
+                if external_libs in sys.path:
+                    sys.path.remove(external_libs)
+                sys.path.insert(0, external_libs)
+                try:
+                    import OpenEXR
+                    import Imath
+                except ImportError:
+                    OpenEXR = None
+                    Imath = None
+                finally:
+                    # Restore append-only priority for everything else
+                    # that shares this folder (numpy, cv2, ...).
+                    if external_libs in sys.path:
+                        sys.path.remove(external_libs)
+                    sys.path.append(external_libs)
+
+        _openexr_import_cache['result'] = (OpenEXR, Imath)
+        return OpenEXR, Imath
 
 
 # Maya imports
