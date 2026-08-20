@@ -46,7 +46,7 @@ def qt_message_handler(msg_type, context, message):
 qInstallMessageHandler(qt_message_handler)
 
 # Import HDR/EXR, OIIO and PDF loading from widgets
-from .widgets import load_hdr_exr_image, load_oiio_image, load_pdf_page, load_pdf_page_normalized
+from .widgets import load_hdr_exr_image, load_oiio_image, load_pdf_page, load_pdf_page_normalized, load_tiff_fast
 
 # UI Font - will be set by browser at runtime
 UI_FONT = "Segoe UI"
@@ -1139,6 +1139,40 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
             # Non-image file - show icon/placeholder
             self.show_placeholder(asset)
     
+    def _show_deep_exr_placeholder(self, filename):
+        """
+        Show a placeholder for deep/volumetric EXR files directly in the
+        graphics scene (matches preview_panel.py's show_deep_exr_placeholder()
+        visual style). This window has no self.label widget - that was a
+        leftover reference from an earlier draft, so setting text on it
+        just raised AttributeError (silently swallowed by the caller's
+        try/except), leaving Quick View blank for deep EXRs instead of
+        showing anything.
+        """
+        try:
+            from PySide6.QtGui import QPainter, QColor, QFont
+        except ImportError:
+            from PySide2.QtGui import QPainter, QColor, QFont
+
+        placeholder = QPixmap(500, 350)
+        placeholder.fill(QColor(60, 60, 60))
+
+        painter = QPainter(placeholder)
+        painter.setPen(QColor(180, 180, 180))
+        font = QFont(UI_FONT, 48)
+        painter.setFont(font)
+        painter.drawText(placeholder.rect(), Qt.AlignCenter, "🔍")
+
+        font = QFont(UI_FONT, 11)
+        painter.setFont(font)
+        text_rect = placeholder.rect().adjusted(20, 130, -20, 0)
+        painter.drawText(text_rect, Qt.AlignCenter | Qt.TextWordWrap,
+                          f"Deep EXR - No Preview\n\n{filename}\n\nDeep images contain multiple samples per pixel\nand are not supported for preview.")
+        painter.end()
+
+        self.graphics_scene.clear()
+        self.pixmap_item = self.graphics_scene.addPixmap(placeholder)
+
     def show_image_preview(self, file_path):
         """Show image preview"""
         # if DEBUG_MODE:
@@ -1174,7 +1208,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
             if file_path.suffix.lower() == '.tx':
                 # RenderMan .tx files - use OpenImageIO with ACES support
                 metadata_manager = self.browser.metadata_manager if hasattr(self.browser, 'metadata_manager') else None
-                result = load_oiio_image(str(file_path), max_size=3840, metadata_manager=metadata_manager)
+                result = load_oiio_image(str(file_path), max_size=3840, mip_level='auto', metadata_manager=metadata_manager)
                 if result and result[0]:
                     pixmap = result[0]  # Extract pixmap from tuple
             elif file_path.suffix.lower() in ['.exr', '.hdr']:
@@ -1195,15 +1229,15 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                 if is_deep:
                     # Deep EXR detected via tag - instant skip
                     print(f"⚡ Deep EXR detected via tag (instant) - no preview available")
-                    self.label.setText("Deep EXR - No Preview Available\n\nDeep images contain multiple samples per pixel\nand are not supported for preview.")
-                    self.label.setAlignment(Qt.AlignCenter)
+                    self._show_deep_exr_placeholder(file_path.name)
                     return
                 
                 # Use the same HDR/EXR loader as PreviewPanel
                 # NOTE: load_hdr_exr_image returns tuple (pixmap, resolution_str)
                 # Pass metadata_manager for ACES color management
                 metadata_manager = self.browser.metadata_manager if hasattr(self.browser, 'metadata_manager') else None
-                result = load_hdr_exr_image(str(file_path), metadata_manager=metadata_manager)
+                preview_max_size = self.browser.settings_manager.get("preview", "resolution", 1024) if hasattr(self.browser, 'settings_manager') else 1024
+                result = load_hdr_exr_image(str(file_path), max_size=preview_max_size, metadata_manager=metadata_manager)
                 if result and result[0]:
                     pixmap = result[0]  # Extract pixmap from tuple
                     # if DEBUG_MODE:
@@ -1218,8 +1252,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                             print(f"🔖 Tagged as 'deepdata' for future fast detection")
                         except:
                             pass
-                    self.label.setText("Deep EXR - No Preview Available\n\nDeep images contain multiple samples per pixel\nand are not supported for preview.")
-                    self.label.setAlignment(Qt.AlignCenter)
+                    self._show_deep_exr_placeholder(file_path.name)
                     return
                 # else:
                 #     if DEBUG_MODE:
@@ -1282,6 +1315,44 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                     except Exception as pil_error:
                         print(f"[QuickView] PIL TGA loading failed: {pil_error}")
                         pixmap = None
+                elif str(file_path).lower().endswith(('.tif', '.tiff')):
+                    # OpenImageIO native-format fast path (shared with Preview
+                    # panel) - ~2-2.5x faster than PIL/Qt for uncompressed TIFFs
+                    # and the only reliable decoder for uncompressed float32 TIFFs
+                    pixmap = None
+                    try:
+                        pixmap, _resolution = load_tiff_fast(str(file_path), max_size=8192)
+                    except Exception as oiio_error:
+                        print(f"[QuickView] OIIO TIFF fast-path failed: {oiio_error}")
+                    if pixmap is None or pixmap.isNull():
+                        # Fallback to PIL for anything OIIO itself can't open
+                        try:
+                            from PIL import Image
+                            Image.MAX_IMAGE_PIXELS = None
+                            pil_image = Image.open(str(file_path))
+                            if pil_image.mode not in ('RGB', 'L'):
+                                pil_image = pil_image.convert('RGB')
+                            elif pil_image.mode == 'L':
+                                pil_image = pil_image.convert('RGB')
+                            max_dimension = 8192
+                            if pil_image.width > max_dimension or pil_image.height > max_dimension:
+                                scale_factor = max_dimension / max(pil_image.width, pil_image.height)
+                                new_width = int(pil_image.width * scale_factor)
+                                new_height = int(pil_image.height * scale_factor)
+                                pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                            import numpy as np
+                            try:
+                                from PySide6.QtGui import QImage
+                            except ImportError:
+                                from PySide2.QtGui import QImage
+                            img_array = np.array(pil_image)
+                            height, width = img_array.shape[:2]
+                            bytes_per_line = width * 3
+                            q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
+                            pixmap = QPixmap.fromImage(q_image.copy())
+                        except Exception as pil_error:
+                            print(f"[QuickView] PIL TIFF fallback failed: {pil_error}")
+                            pixmap = None
                 elif str(file_path).lower().endswith('.psd'):
                     # PSD files: use PIL (fast and good quality)
                     try:
@@ -1971,8 +2042,8 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
         """Show multiple images and PDFs in PureRef-style flowing tile layout"""
         try:
             # Filter to images and PDFs
-            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tga', '.tif', '.tiff', 
-                               '.exr', '.hdr', '.gif', '.webp', '.psd']
+            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tga', '.tif', '.tiff',
+                               '.exr', '.hdr', '.gif', '.webp', '.psd', '.tx']
             
             supported_assets = []
             for a in assets:
@@ -2044,7 +2115,8 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                     
                     # Pass metadata_manager for ACES color management
                     metadata_manager = self.browser.metadata_manager if hasattr(self.browser, 'metadata_manager') else None
-                    result = load_hdr_exr_image(str(file_path), metadata_manager=metadata_manager)
+                    preview_max_size = self.browser.settings_manager.get("preview", "resolution", 1024) if hasattr(self.browser, 'settings_manager') else 1024
+                    result = load_hdr_exr_image(str(file_path), max_size=preview_max_size, metadata_manager=metadata_manager)
                     if result and result[0]:
                         pixmap = result[0]
                     elif result and result[1] and "Deep EXR" in str(result[1]):
@@ -2057,6 +2129,45 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                             except:
                                 pass
                         continue
+                    canvas_size = None  # Not a PDF
+                elif file_path.suffix.lower() == '.tx':
+                    # RenderMan .tx files - use OpenImageIO with ACES support
+                    metadata_manager = self.browser.metadata_manager if hasattr(self.browser, 'metadata_manager') else None
+                    preview_max_size = self.browser.settings_manager.get("preview", "resolution", 1024) if hasattr(self.browser, 'settings_manager') else 1024
+                    result = load_oiio_image(str(file_path), max_size=preview_max_size, mip_level='auto', metadata_manager=metadata_manager)
+                    if result and result[0]:
+                        pixmap = result[0]
+                    canvas_size = None  # Not a PDF
+                elif file_path.suffix.lower() in ['.tif', '.tiff']:
+                    # OpenImageIO native-format fast path (shared with Preview
+                    # panel/single-file Quick View) - ~2-2.5x faster than PIL/Qt
+                    # for uncompressed TIFFs, and the only reliable decoder for
+                    # uncompressed float32 TIFFs.
+                    try:
+                        pixmap, _resolution = load_tiff_fast(str(file_path), max_size=1024)
+                    except Exception as oiio_error:
+                        print(f"[QuickView Grid] OIIO TIFF fast-path failed: {oiio_error}")
+                        pixmap = None
+                    if pixmap is None or pixmap.isNull():
+                        # Fallback to PIL for anything OIIO itself can't open
+                        try:
+                            from PIL import Image
+                            Image.MAX_IMAGE_PIXELS = None
+                            pil_image = Image.open(str(file_path))
+                            if pil_image.mode not in ('RGB', 'L'):
+                                pil_image = pil_image.convert('RGB')
+                            elif pil_image.mode == 'L':
+                                pil_image = pil_image.convert('RGB')
+                            import numpy as np
+                            from PySide6.QtGui import QImage
+                            img_array = np.array(pil_image)
+                            height, width = img_array.shape[:2]
+                            bytes_per_line = width * 3
+                            q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
+                            pixmap = QPixmap.fromImage(q_image.copy())
+                        except Exception as pil_error:
+                            print(f"[QuickView Grid] PIL TIFF fallback failed: {pil_error}")
+                            pixmap = None
                     canvas_size = None  # Not a PDF
                 elif file_path.suffix.lower() in ['.tga', '.psd']:
                     # Use PIL for TGA files, psd-tools for PSD files

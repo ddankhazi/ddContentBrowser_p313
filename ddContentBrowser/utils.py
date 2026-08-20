@@ -26,6 +26,30 @@ def get_external_libs_dir():
     return os.path.join(base, 'external_libs')
 
 
+def get_mayapy_executable():
+    """
+    Locate mayapy.exe (Maya's standalone/headless Python interpreter) next
+    to the currently running Maya executable.
+
+    Used to spawn sequence-playback decode worker subprocesses (see
+    sequence_decode_worker.py) as genuinely separate OS processes rather
+    than threads within Maya's own process - confirmed necessary because
+    calling OpenImageIO/OpenCV concurrently from ThreadPoolExecutor worker
+    threads inside Maya's process crashed Maya outright (a native crash,
+    no Python traceback, immediately after the first background decode
+    requests were submitted).
+
+    Falls back to sys.executable if mayapy.exe isn't found next to it -
+    e.g. when testing standalone, where sys.executable already IS a plain
+    python.exe capable of running the worker script directly.
+    """
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    mayapy = os.path.join(exe_dir, 'mayapy.exe')
+    if os.path.isfile(mayapy):
+        return mayapy
+    return sys.executable
+
+
 _openexr_import_cache = {}
 _openexr_import_lock = threading.Lock()
 
@@ -92,6 +116,104 @@ def import_openexr():
 
         _openexr_import_cache['result'] = (OpenEXR, Imath)
         return OpenEXR, Imath
+
+
+def group_oiio_exr_channels(channelnames):
+    """
+    Group a flat OpenImageIO channel-name list the same way OpenEXR's
+    Python OpenEXR.File().channels() API groups them: channels sharing a
+    dotted prefix (or no prefix) whose suffixes include R, G, B (and
+    optionally A) collapse into one entry keyed by the prefix (or
+    "RGB"/"RGBA" when there's no prefix, e.g. plain "R"/"G"/"B" channels
+    group into "RGB", "diffuse.R"/"diffuse.G"/"diffuse.B" group into
+    "diffuse"); every other channel (Z, N.X, N.Y, N.Z, ...) keeps its own
+    full name as the key. Verified to match OpenEXR.File()'s real grouping
+    exactly against both single-layer and multi-AOV EXRs.
+
+    This lets code written against OpenEXR's grouped-dict API (see
+    read_exr_via_oiio() below) be ported to OpenImageIO without changing
+    the channel-name lookup/fallback logic itself - see
+    cache.py's _generate_exr_thumbnail_optimized() and preview_panel.py's
+    load_exr_channel() for both call sites.
+
+    Returns an OrderedDict: group key -> list of member channel names (in
+    R, G, B[, A] order for grouped entries; a single-item list otherwise),
+    in first-seen order.
+    """
+    from collections import OrderedDict
+
+    by_prefix = OrderedDict()
+    for name in channelnames:
+        if '.' in name:
+            prefix, suffix = name.rsplit('.', 1)
+        else:
+            prefix, suffix = '', name
+        by_prefix.setdefault(prefix, OrderedDict())[suffix] = name
+
+    groups = OrderedDict()
+    used = set()
+    for prefix, suffix_map in by_prefix.items():
+        if 'R' in suffix_map and 'G' in suffix_map and 'B' in suffix_map:
+            has_alpha = 'A' in suffix_map
+            key = prefix if prefix else ('RGBA' if has_alpha else 'RGB')
+            members = [suffix_map['R'], suffix_map['G'], suffix_map['B']]
+            if has_alpha:
+                members.append(suffix_map['A'])
+            groups[key] = members
+            used.update(members)
+    for name in channelnames:
+        if name not in used:
+            groups[name] = [name]
+    return groups
+
+
+def read_exr_via_oiio(file_path):
+    """
+    Read an EXR file's full pixel data via OpenImageIO - measured ~2-3x
+    faster than the OpenEXR Python binding (OpenEXR.File()) for typical
+    single-layer texture/HDRI EXRs, and still meaningfully faster on
+    multi-AOV render EXRs, in testing during a thumbnail-generation
+    performance investigation.
+
+    Returns (width, height, channels) where channels is a dict of
+    group-key -> numpy float32 array (2D for a single channel, 3D
+    (H,W,3)/(H,W,4) for a grouped RGB/RGBA/layer entry) - grouped via
+    group_oiio_exr_channels() so it has the same shape as iterating
+    OpenEXR.File().channels().items() and reading each entry's .pixels
+    (just without the .pixels attribute - index the dict value directly).
+
+    Raises OSError/ValueError on failure (missing file, unreadable
+    format, no pixel data, etc.) - callers should catch as part of their
+    existing error handling, same as they would OpenEXR.File() raising.
+    """
+    import sys
+    import numpy as np
+
+    external_libs = get_external_libs_dir()
+    if external_libs not in sys.path:
+        sys.path.append(external_libs)
+    from OpenImageIO import ImageInput
+
+    inp = ImageInput.open(str(file_path))
+    if not inp:
+        raise OSError(f"OpenImageIO could not open {file_path}")
+    spec = inp.spec()
+    width, height = spec.width, spec.height
+    pixels = inp.read_image()
+    inp.close()
+    if pixels is None:
+        raise ValueError(f"OpenImageIO returned no pixel data for {file_path}")
+
+    img = np.array(pixels, dtype=np.float32)
+    name_to_idx = {name: i for i, name in enumerate(spec.channelnames)}
+    grouped = group_oiio_exr_channels(spec.channelnames)
+
+    channels = {}
+    for key, members in grouped.items():
+        idxs = [name_to_idx[m] for m in members]
+        channels[key] = img[:, :, idxs] if len(idxs) > 1 else img[:, :, idxs[0]]
+
+    return width, height, channels
 
 
 # Maya imports

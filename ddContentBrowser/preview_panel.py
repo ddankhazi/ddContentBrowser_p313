@@ -1,4 +1,4 @@
-"""
+﻿"""
 DD Content Browser - Preview Panel Module
 Extracted from widgets.py for better maintainability
 
@@ -79,7 +79,7 @@ def qt_message_handler(msg_type, context, message):
 qInstallMessageHandler(qt_message_handler)
 
 # Debug mode flag
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 # Suppress OpenCV/FFmpeg verbose output
 import os
@@ -119,9 +119,16 @@ OPENEXR_AVAILABLE = OpenEXR is not None
 if not OPENEXR_AVAILABLE:
     print("[Preview Panel] Info: OpenEXR not available - EXR support disabled")
 
-# Import sequence frame cache
-# Cache system temporarily disabled
-# from .sequence_cache import SequenceFrameCache, SequencePreloader
+# Background-prefetching cache for image-sequence playback (EXR/HDR/TX/TIFF)
+from .sequence_cache import SequenceFrameCache, SequenceFramePrefetcher
+
+# Extensions decode_sequence_frame_raw() actually handles (sequence_decode.py) -
+# everything else (jpg/png/bmp/tga/psd/gif/webp) already decodes fast enough
+# synchronously, so prefetching them would just spam the worker processes with
+# requests that can never be cached (every request always misses, so the
+# in_flight guard can't stop it from resubmitting on every single frame change
+# during playback).
+SEQUENCE_PREFETCH_EXTENSIONS = {'.exr', '.hdr', '.tx', '.tif', '.tiff'}
 
 # Check for PyMuPDF (for PDF preview)
 try:
@@ -138,60 +145,41 @@ except ImportError:
 def is_deep_exr(file_path):
     """
     Check if an EXR file is a deep image (contains deep data)
-    
+
     Deep images store multiple samples per pixel and are not supported for preview.
-    
+
+    Uses OpenImageIO's spec.deep flag rather than OpenEXR.File() - the
+    latter can't even OPEN genuinely deep-scanline EXRs (raises
+    "Unable to query scanline information" before the header/type can be
+    inspected), so the old implementation's except clause silently caught
+    that and returned False for real deep files. That meant deep EXRs were
+    misdetected as normal, never showed the "Deep EXR - No Preview"
+    message, and just failed downstream instead with a generic error.
+
     Args:
         file_path: Path to EXR file
-        
+
     Returns:
         bool: True if file is a deep EXR, False otherwise
     """
-    if not OPENEXR_AVAILABLE:
-        return False
-    
     try:
-        with OpenEXR.File(str(file_path)) as exr_file:
-            header = exr_file.header()
-            
-            # FAST CHECK: Check if the header contains deep data indicator
-            # Deep images have a 'type' attribute set to 'deepscanline' or 'deeptile'
-            if 'type' in header:
-                type_value = header['type']
-                if isinstance(type_value, str):
-                    is_deep = 'deep' in type_value.lower()
-                    if is_deep:
-                        print(f"🔍 Detected deep EXR (type: {type_value})")
-                        return True
-                # In some versions, type is returned as bytes
-                elif isinstance(type_value, bytes):
-                    is_deep = b'deep' in type_value.lower()
-                    if is_deep:
-                        print(f"🔍 Detected deep EXR (type: {type_value})")
-                        return True
-            
-            # SLOWER CHECK: Only if header check didn't find it
-            # Some deep EXR files might not have explicit type field
-            # Check first channel's pixel dtype (don't check all channels for speed)
-            channels = exr_file.channels()
-            if channels:
-                # Just check the first channel
-                first_channel_name = next(iter(channels.keys()))
-                first_channel = channels[first_channel_name]
-                
-                try:
-                    pixels = first_channel.pixels
-                    # Deep data pixels return object arrays instead of numeric arrays
-                    if pixels is not None and hasattr(pixels, 'dtype'):
-                        import numpy as np
-                        if pixels.dtype == np.object_:
-                            print(f"🔍 Detected deep data in channel '{first_channel_name}' (dtype=object)")
-                            return True
-                except:
-                    pass
-            
+        import sys
+        from .utils import get_external_libs_dir
+        external_libs = get_external_libs_dir()
+        if external_libs not in sys.path:
+            sys.path.append(external_libs)
+        from OpenImageIO import ImageInput
+
+        inp = ImageInput.open(str(file_path))
+        if not inp:
             return False
-            
+        is_deep = bool(inp.spec().deep)
+        inp.close()
+
+        if is_deep:
+            print(f"🔍 Detected deep EXR: {Path(file_path).name}")
+        return is_deep
+
     except Exception as e:
         print(f"⚠️ Error checking if EXR is deep: {e}")
         return False
@@ -279,7 +267,7 @@ def load_hdr_exr_raw(file_path, max_size=2048):
             resolution_str = f"{width} x {height}"
             
             # Scale if needed
-            if width > max_size or height > max_size:
+            if max_size and (width > max_size or height > max_size):
                 scale = min(max_size / width, max_size / height)
                 new_width = int(width * scale)
                 new_height = int(height * scale)
@@ -409,7 +397,7 @@ def load_hdr_exr_raw(file_path, max_size=2048):
                     return None, None, None, None
                 
                 # Scale if needed
-                if width > max_size or height > max_size:
+                if max_size and (width > max_size or height > max_size):
                     scale = min(max_size / width, max_size / height)
                     new_width = int(width * scale)
                     new_height = int(height * scale)
@@ -1135,7 +1123,17 @@ class PreviewPanel(QWidget):
         self.hdr_cache_max_size = 5  # Only cache last 5 HDR raw data (they're big!)
         self.max_preview_size = 3840  # 4K preview resolution (3840px max, great quality!)
         self.max_hdr_cache_size = 5  # Maximum HDR cache items (for settings compatibility)
-        
+
+        # Background-prefetching cache for image-sequence playback
+        # (EXR/HDR/TX/TIFF - the formats expensive enough to be worth it)
+        sequence_cache_size_mb = self.settings.get("preview", "sequence_cache_size_mb", 1024) if self.settings else 1024
+        self.sequence_frame_cache = SequenceFrameCache(max_size_mb=sequence_cache_size_mb)
+        self.sequence_prefetcher = SequenceFramePrefetcher(max_workers=2)
+        self._sequence_prefetch_channel = None  # Current EXR channel being prefetched for
+        self._sequence_drain_timer = QtCore.QTimer()
+        self._sequence_drain_timer.timeout.connect(self._drain_sequence_prefetch)
+        self._sequence_drain_timer.start(80)  # ~12.5Hz - responsive without busy-polling
+
         # Text preview mode flag
         self.is_showing_text = False
         
@@ -1286,8 +1284,10 @@ class PreviewPanel(QWidget):
     
     def load_exr_channel(self, file_path, channel_name):
         """
-        Load a specific channel from an EXR file directly with OpenEXR
-        
+        Load a specific channel from an EXR file via OpenImageIO
+        (read_exr_via_oiio() in utils.py - ~2-3x faster than the OpenEXR
+        Python binding in testing, same channel grouping/fallback behavior)
+
         NOTE: This should only be called for non-deep EXR files.
         Deep EXR check should be done before calling this function.
         
@@ -1317,135 +1317,109 @@ class PreviewPanel(QWidget):
             if cache_key in self.preview_cache:
                 return self.preview_cache[cache_key]
             
-            import sys
-            import os
-            
-            # Add external_libs to path
-            from .utils import get_external_libs_dir
-            external_libs = get_external_libs_dir()
-            if external_libs not in sys.path:
-                sys.path.append(external_libs)
-            
-            import OpenEXR
             import numpy as np
-            
-            with OpenEXR.File(str(file_path)) as exr_file:
-                header = exr_file.header()
-                dw = header['dataWindow']
-                width = dw[1][0] - dw[0][0] + 1
-                height = dw[1][1] - dw[0][1] + 1
-                
-                channels = exr_file.channels()
-                channel_list = list(channels.keys())
-                
-                rgb = None
-                
-                # Try to load the requested channel
-                # 1. Try as direct channel name (e.g. "RGB", "RGBA")
-                if channel_name in channels:
-                    data = channels[channel_name].pixels
-                    if data is not None:
-                        if data.ndim == 3 and data.shape[2] >= 3:
-                            rgb = data[:, :, :3]  # Take RGB only
-                        elif data.ndim == 2:
-                            # Single channel, convert to RGB
+            from .utils import read_exr_via_oiio
+
+            # read_exr_via_oiio() loads via OpenImageIO (~2-3x faster than
+            # the OpenEXR Python binding in testing) and groups channels
+            # the same way OpenEXR.File().channels() does - e.g.
+            # "diffuse.R"/"diffuse.G"/"diffuse.B" become one "diffuse"-keyed
+            # 3-channel entry - so the channel-name lookup ladder below is
+            # unchanged from the OpenEXR-based version, just indexing the
+            # dict values directly instead of reading their .pixels.
+            width, height, channels = read_exr_via_oiio(str(file_path))
+            channel_list = list(channels.keys())
+
+            rgb = None
+
+            # Try to load the requested channel
+            # 1. Try as direct channel name (e.g. "RGB", "RGBA", "diffuse")
+            if channel_name in channels:
+                data = channels[channel_name]
+                if data.ndim == 3 and data.shape[2] >= 3:
+                    rgb = data[:, :, :3]  # Take RGB only
+                elif data.ndim == 2:
+                    # Single channel, convert to RGB
+                    rgb = np.stack([data, data, data], axis=2)
+                else:
+                    rgb = data
+
+            # 2. Try as prefix with .R .G .B (e.g. "diffuse" → "diffuse.R", "diffuse.G", "diffuse.B")
+            # - defensive fallback for the (grouping normally prevents this)
+            # case where a layer's R/G/B ended up as separate individual keys
+            if rgb is None:
+                r_name = f"{channel_name}.R"
+                g_name = f"{channel_name}.G"
+                b_name = f"{channel_name}.B"
+
+                if all(c in channels for c in [r_name, g_name, b_name]):
+                    try:
+                        rgb = np.stack([channels[r_name], channels[g_name], channels[b_name]], axis=2)
+                    except Exception:
+                        # Fallback: just use R channel as grayscale
+                        r = channels[r_name]
+                        if r.ndim == 2:
+                            rgb = np.stack([r, r, r], axis=2)
+                        else:
+                            print(f"❌ Cannot reshape channel data")
+                            return None, None
+
+            # 3. Try as single channel with common suffixes
+            if rgb is None:
+                for suffix in ['', '.R', '.r', '.x', '.X']:
+                    test_name = f"{channel_name}{suffix}"
+                    if test_name in channels:
+                        print(f"✅ Found single channel: {test_name}")
+                        data = channels[test_name]
+                        if data.ndim == 2:
                             rgb = np.stack([data, data, data], axis=2)
                         else:
                             rgb = data
-                
-                # 2. Try as prefix with .R .G .B (e.g. "diffuse" → "diffuse.R", "diffuse.G", "diffuse.B")
-                if rgb is None:
-                    r_name = f"{channel_name}.R"
-                    g_name = f"{channel_name}.G"
-                    b_name = f"{channel_name}.B"
-                    
-                    if all(c in channels for c in [r_name, g_name, b_name]):
-                        r = channels[r_name].pixels
-                        g = channels[g_name].pixels
-                        b = channels[b_name].pixels
-                        
-                        if r is not None and g is not None and b is not None:
-                            # Try to stack if possible
-                            try:
-                                rgb = np.stack([r, g, b], axis=2)
-                            except Exception as stack_error:
-                                # Fallback: just use R channel as grayscale
-                                if hasattr(r, 'ndim') and r.ndim == 2:
-                                    rgb = np.stack([r, r, r], axis=2)
-                                elif hasattr(r, '__len__'):
-                                    # Try to reshape from 1D array
-                                    try:
-                                        r_2d = np.array(r).reshape(height, width)
-                                        rgb = np.stack([r_2d, r_2d, r_2d], axis=2)
-                                    except:
-                                        print(f"❌ Cannot reshape channel data")
-                                        return None, None
-                
-                # 3. Try as single channel with common suffixes
-                if rgb is None:
-                    for suffix in ['', '.R', '.r', '.x', '.X']:
-                        test_name = f"{channel_name}{suffix}"
-                        if test_name in channels:
-                            print(f"✅ Found single channel: {test_name}")
-                            data = channels[test_name].pixels
-                            if data is not None:
-                                if hasattr(data, 'ndim') and data.ndim == 2:
-                                    rgb = np.stack([data, data, data], axis=2)
-                                elif hasattr(data, '__len__'):
-                                    # Try to reshape
-                                    try:
-                                        data_2d = np.array(data).reshape(height, width)
-                                        rgb = np.stack([data_2d, data_2d, data_2d], axis=2)
-                                    except:
-                                        pass
-                                else:
-                                    rgb = data
-                                if rgb is not None:
-                                    break
-                
-                if rgb is None:
-                    print(f"❌ Could not find channel '{channel_name}'")
-                    print(f"💡 Available channels: {', '.join(channel_list[:10])}{'...' if len(channel_list) > 10 else ''}")
-                    return None, None
-                
-                # Now we have rgb data (RAW float)
-                
-                # Convert float16 to float32
-                if rgb.dtype == np.float16:
-                    rgb = rgb.astype(np.float32)
-                
-                # Store ORIGINAL resolution BEFORE downsampling (for metadata display)
-                resolution_str = f"{width} x {height}"
-                
-                # Downsample to max preview size (4K) if needed
-                # This saves memory and improves tone mapping performance
-                import cv2
-                if width > self.max_preview_size or height > self.max_preview_size:
-                    scale = min(self.max_preview_size / width, self.max_preview_size / height)
-                    new_width = int(width * scale)
-                    new_height = int(height * scale)
-                    
-                    rgb = cv2.resize(rgb, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                    width, height = new_width, new_height
-                
-                # Store downsampled raw data in cache for high quality exposure adjustments
-                raw_cache_key = f"{file_path}#{channel_name}#raw"
-                self.hdr_raw_cache[raw_cache_key] = (rgb, width, height, resolution_str)
-                
-                # Apply tone mapping with current exposure using centralized function
-                # This handles ACES automatically based on file tags
-                pixmap = self.apply_hdr_tone_mapping(rgb, width, height, self.hdr_exposure, file_path=file_path)
-                
-                if not pixmap:
-                    print(f"❌ Tone mapping failed")
-                    return None, None
-                
-                # Cache the final pixmap with exposure key
-                cache_key = f"{file_path}#{channel_name}#{self.hdr_exposure:.1f}"
-                self.preview_cache[cache_key] = (pixmap, resolution_str)
-                
-                return pixmap, resolution_str
-                
+                        if rgb is not None:
+                            break
+
+            if rgb is None:
+                print(f"❌ Could not find channel '{channel_name}'")
+                print(f"💡 Available channels: {', '.join(channel_list[:10])}{'...' if len(channel_list) > 10 else ''}")
+                return None, None
+
+            # Now we have rgb data (RAW float) - read_exr_via_oiio() already
+            # returns float32, so this is normally a no-op defensive guard
+            if rgb.dtype == np.float16:
+                rgb = rgb.astype(np.float32)
+
+            # Store ORIGINAL resolution BEFORE downsampling (for metadata display)
+            resolution_str = f"{width} x {height}"
+
+            # Downsample to max preview size (4K) if needed
+            # This saves memory and improves tone mapping performance
+            import cv2
+            if self.max_preview_size and (width > self.max_preview_size or height > self.max_preview_size):
+                scale = min(self.max_preview_size / width, self.max_preview_size / height)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+
+                rgb = cv2.resize(rgb, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                width, height = new_width, new_height
+
+            # Store downsampled raw data in cache for high quality exposure adjustments
+            raw_cache_key = f"{file_path}#{channel_name}#raw"
+            self.hdr_raw_cache[raw_cache_key] = (rgb, width, height, resolution_str)
+
+            # Apply tone mapping with current exposure using centralized function
+            # This handles ACES automatically based on file tags
+            pixmap = self.apply_hdr_tone_mapping(rgb, width, height, self.hdr_exposure, file_path=file_path)
+
+            if not pixmap:
+                print(f"❌ Tone mapping failed")
+                return None, None
+
+            # Cache the final pixmap with exposure key
+            cache_key = f"{file_path}#{channel_name}#{self.hdr_exposure:.1f}"
+            self.preview_cache[cache_key] = (pixmap, resolution_str)
+
+            return pixmap, resolution_str
+
         except Exception as e:
             print(f"❌ Error loading EXR channel: {e}")
             import traceback
@@ -1476,45 +1450,52 @@ class PreviewPanel(QWidget):
                     print("⚠️ Tone mapping failed, reloading from disk...")
             
             print(f"🔄 Loading HDR file from disk...")
-            
+
             import sys
-            import os
-            import cv2
             import numpy as np
-            
+
             # Add external_libs to path
             from .utils import get_external_libs_dir
             external_libs = get_external_libs_dir()
             if external_libs not in sys.path:
                 sys.path.append(external_libs)
-            
-            # Load HDR with OpenCV (FULL RESOLUTION)
-            rgb = cv2.imread(str(file_path), cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
-            
-            if rgb is None:
-                print(f"❌ Failed to load HDR with OpenCV")
+            from OpenImageIO import ImageInput
+
+            # OpenImageIO instead of OpenCV - measured ~30% faster for
+            # Radiance HDR decode (see _generate_hdr_thumbnail_data() in
+            # cache.py for the benchmark). FULL RESOLUTION, same as before.
+            inp = ImageInput.open(str(file_path))
+            if not inp:
+                print(f"❌ Failed to load HDR with OpenImageIO")
                 return None, None
-            
-            # OpenCV loads as BGR, convert to RGB
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-            
+            spec = inp.spec()
+            width, height = spec.width, spec.height
+            pixels = inp.read_image()
+            inp.close()
+
+            if pixels is None:
+                print(f"❌ OpenImageIO returned no pixel data")
+                return None, None
+
+            rgb = np.array(pixels, dtype=np.float32)
+            if rgb.ndim == 2:
+                rgb = np.stack([rgb, rgb, rgb], axis=2)
+            elif rgb.ndim == 3 and rgb.shape[2] >= 4:
+                rgb = rgb[:, :, :3]  # Drop alpha (Radiance HDR has none anyway)
+
             # Get ORIGINAL resolution BEFORE downsampling (for metadata display)
-            height, width = rgb.shape[:2]
             resolution_str = f"{width} x {height}"
             
-            # Convert float16 to float32 if needed
-            if rgb.dtype == np.float16:
-                rgb = rgb.astype(np.float32)
-            
             # Downsample to max preview size (4K) if needed
-            if width > self.max_preview_size or height > self.max_preview_size:
+            if self.max_preview_size and (width > self.max_preview_size or height > self.max_preview_size):
+                import cv2
                 scale = min(self.max_preview_size / width, self.max_preview_size / height)
                 new_width = int(width * scale)
                 new_height = int(height * scale)
-                
+
                 rgb = cv2.resize(rgb, (new_width, new_height), interpolation=cv2.INTER_AREA)
                 width, height = new_width, new_height
-            
+
             # Store downsampled raw data in cache
             self.hdr_raw_cache[file_path] = (rgb, width, height, resolution_str)
             
@@ -2517,10 +2498,28 @@ class PreviewPanel(QWidget):
         """Actually apply the exposure change (called after debounce timer)"""
         if self.pending_exposure_value is None:
             return
-        
+
         exposure_stops = self.pending_exposure_value
         self.hdr_exposure = exposure_stops
-        
+
+        # Sequence playback: exposure is baked into the prefetch cache's
+        # stored pixels (see sequence_cache.py), so changing it means the
+        # current frame's old-exposure entry no longer matches - reload it
+        # (a normal cache-miss decode+tonemap) and re-point the background
+        # prefetch window at the new exposure so upcoming frames render at
+        # it too, instead of it only ever being applied to frames as they're
+        # first reached during playback.
+        if (self.current_assets and len(self.current_assets) == 1 and
+                self.current_assets[0].is_sequence and self.current_assets[0].sequence):
+            asset = self.current_assets[0]
+            sequence = asset.sequence
+            frame_index = self.sequence_playback.current_frame_index
+            if sequence.files and 0 <= frame_index < len(sequence.files):
+                frame_path = sequence.files[frame_index]
+                self.load_sequence_frame(frame_path, asset)
+                self._request_sequence_prefetch(sequence, frame_index, frame_path)
+            return
+
         # Check if we're viewing a specific EXR channel
         if self.current_exr_file_path and self.current_exr_channel:
             # Channel-specific raw data cache
@@ -3218,11 +3217,12 @@ class PreviewPanel(QWidget):
             elif file_ext.endswith('.tx'):
                 try:
                     from .widgets import load_oiio_image
-                    # Load full resolution (mip_level=0) for zoom mode
+                    # Auto-pick the smallest mip level that still covers the
+                    # zoom target size - same visual result as full-res + downscale, much faster
                     pixmap, resolution, metadata = load_oiio_image(
                         file_path_str,
                         max_size=4096,  # High quality zoom
-                        mip_level=0,
+                        mip_level='auto',
                         exposure=0.0,
                         metadata_manager=self.metadata_manager
                     )
@@ -4158,7 +4158,18 @@ class PreviewPanel(QWidget):
             # Show sequence playback controls
             self.sequence_playback.set_sequence(asset.sequence)
             self.sequence_playback.show()
-            
+
+            # Switching to a different sequence - drop stale prefetched frames
+            # and force EXR channel re-detection (see load_sequence_frame -
+            # different sequences can have different channel layouts)
+            previous_pattern = getattr(self, '_current_sequence_pattern', None)
+            if previous_pattern and previous_pattern != asset.sequence.pattern:
+                self.sequence_frame_cache.clear_sequence(previous_pattern)
+                self.current_exr_channels = []
+                self.current_exr_channel = None
+            self.sequence_prefetcher.clear_pending()
+            self._current_sequence_pattern = asset.sequence.pattern
+
             # Load and display the first frame by default (matching the frame counter)
             if asset.sequence.files:
                 first_frame_path = asset.sequence.files[0]
@@ -4167,7 +4178,10 @@ class PreviewPanel(QWidget):
                 self.sequence_playback.current_frame_index = 0
                 self.sequence_playback.timeline_slider.setValue(0)
                 self.sequence_playback.update_frame_label()
-            
+
+                # Kick off background prefetch for the frames ahead
+                self._request_sequence_prefetch(asset.sequence, 0, first_frame_path)
+
             # Add metadata for sequence before returning
             self.add_metadata_row("📄", "Name", asset.name)
             seq = asset.sequence
@@ -4262,11 +4276,11 @@ class PreviewPanel(QWidget):
                     if is_hdr_exr:
                         # Use imageio (HDR) or OpenEXR (EXR) with exposure control
                         # Higher quality preview: adjustable via settings
-                        
+                        is_deep = False
+
                         # === EXR Channel Detection ===
                         if file_ext.endswith('.exr'):
                             # FAST CHECK: Check if already tagged as deep data (from thumbnail generation)
-                            is_deep = False
                             if self.metadata_manager:
                                 file_metadata = self.metadata_manager.get_file_metadata(file_path_str)
                                 file_tags = file_metadata.get('tags', [])
@@ -4309,21 +4323,30 @@ class PreviewPanel(QWidget):
                             self.current_exr_channel = None
                             
                             pixmap, resolution_str = self.load_hdr_file(file_path_str)
-                        
-                        if pixmap:
-                            self.current_pixmap = pixmap
-                            self.add_to_cache(file_path_str, pixmap, resolution_str)
-                            self.fit_pixmap_to_label()
-                        else:
-                            # Check if it's a deep EXR
-                            if resolution_str and "Deep EXR" in resolution_str:
-                                self.graphics_scene.clear()
-                                self.current_text_item = None
-                                self.show_deep_exr_placeholder(asset.name)
+
+                        # is_deep already fully handled the UI via
+                        # show_deep_exr_placeholder() above - skip this
+                        # pixmap-based fallback entirely for that case, since
+                        # resolution_str was never set to a "Deep EXR"-
+                        # flagged value here (that's a separate calling
+                        # convention some other loaders use) and would
+                        # otherwise fall through to show_hdr_placeholder(),
+                        # clobbering the deep-EXR placeholder just shown.
+                        if not is_deep:
+                            if pixmap:
+                                self.current_pixmap = pixmap
+                                self.add_to_cache(file_path_str, pixmap, resolution_str)
+                                self.fit_pixmap_to_label()
                             else:
-                                self.graphics_scene.clear()
-                                self.current_text_item = None
-                                self.show_hdr_placeholder(asset.name)
+                                # Check if it's a deep EXR
+                                if resolution_str and "Deep EXR" in resolution_str:
+                                    self.graphics_scene.clear()
+                                    self.current_text_item = None
+                                    self.show_deep_exr_placeholder(asset.name)
+                                else:
+                                    self.graphics_scene.clear()
+                                    self.current_text_item = None
+                                    self.show_hdr_placeholder(asset.name)
                     else:
                         # Standard image formats (PNG, JPG, TIF, etc.) - NO exposure control
                         self.current_hdr_path = None
@@ -4337,7 +4360,7 @@ class PreviewPanel(QWidget):
                                 pixmap, resolution_str, metadata = load_oiio_image(
                                     file_path_str,
                                     max_size=1024,  # Preview size
-                                    mip_level=0,
+                                    mip_level='auto',
                                     exposure=0.0,
                                     metadata_manager=self.metadata_manager
                                 )
@@ -5411,7 +5434,7 @@ class PreviewPanel(QWidget):
             
             # Resize if too large (for performance)
             max_size = self.max_preview_size if hasattr(self, 'max_preview_size') else 1024
-            if width > max_size or height > max_size:
+            if max_size and (width > max_size or height > max_size):
                 scale = min(max_size / width, max_size / height)
                 new_width = int(width * scale)
                 new_height = int(height * scale)
@@ -5440,6 +5463,24 @@ class PreviewPanel(QWidget):
 
     def _load_tiff_preview_pixmap(self, file_path, max_size=1024):
         """Load TIFF preview pixmap with robust PIL/tifffile-first decoding."""
+        # 0) OpenImageIO with native pixel format - fastest single-decoder
+        # path, shared with Quick View (widgets.load_tiff_fast). Measured on
+        # real 4K Megascans TIFFs: ~2.3x faster than PIL for uncompressed
+        # uint8, ~1.6x faster for LZW-compressed, and it's the only one of
+        # the decoders below that handles uncompressed float32 TIFFs at all
+        # without falling all the way through to the tifffile/OIIO
+        # (float-forced) steps further down. Kept the existing
+        # PIL/tifffile/OpenCV/Qt chain below as a safety net for anything
+        # OIIO itself can't open.
+        try:
+            from .widgets import load_tiff_fast
+            pixmap, resolution_str = load_tiff_fast(file_path, max_size=max_size)
+            if pixmap and not pixmap.isNull():
+                return pixmap, resolution_str
+        except Exception as oiio_fast_error:
+            if DEBUG_MODE:
+                print(f"[Preview TIFF] OIIO fast-path failed: {oiio_fast_error}")
+
         try:
             # 1) PIL first (matches Quick View behavior)
             try:
@@ -5528,7 +5569,78 @@ class PreviewPanel(QWidget):
                 if DEBUG_MODE:
                     print(f"[Preview TIFF] tifffile failed: {tiff_error}")
 
-            # 3) OpenCV fallback
+            # 3) OpenImageIO - independent, robust TIFF decoder (doesn't
+            # depend on Pillow's plugin support or tifffile's optional
+            # imagecodecs package for less common pixel formats, e.g.
+            # 32-bit float RGBA with LZW compression, which fails PIL
+            # ("unknown pixel mode") and tifffile without imagecodecs
+            # installed - confirmed working via OIIO on a real such file).
+            try:
+                import sys
+                import numpy as np
+                from .utils import get_external_libs_dir
+                external_libs = get_external_libs_dir()
+                if external_libs not in sys.path:
+                    sys.path.append(external_libs)
+                from OpenImageIO import ImageInput
+
+                inp = ImageInput.open(str(file_path))
+                if inp:
+                    spec = inp.spec()
+                    w, h = spec.width, spec.height
+                    pixels = inp.read_image()
+                    inp.close()
+
+                    if pixels is not None:
+                        img_array = np.array(pixels)
+                        resolution_str = f"{w} x {h}"
+
+                        if img_array.ndim == 3:
+                            ch = img_array.shape[2]
+                            if ch == 1:
+                                img_array = img_array[:, :, 0]
+                            elif ch == 2:
+                                img_array = img_array[:, :, 0]
+                            elif ch >= 4:
+                                img_array = img_array[:, :, :3]
+
+                        if img_array.dtype.kind == 'f':
+                            img_array = np.nan_to_num(img_array, nan=0.0, posinf=1.0, neginf=0.0)
+                            max_val = float(np.max(img_array)) if img_array.size else 0.0
+                            if max_val > 1.0:
+                                p99 = float(np.percentile(img_array, 99)) if img_array.size else 255.0
+                                scale_max = p99 if p99 > 0 else max_val
+                                img_array = np.clip(img_array / max(scale_max, 1e-6), 0.0, 1.0)
+                            else:
+                                img_array = np.clip(img_array, 0.0, 1.0)
+                            img_array = (img_array * 255.0).astype(np.uint8)
+                        elif img_array.dtype != np.uint8:
+                            if img_array.dtype.kind in ('i', 'u'):
+                                info = np.iinfo(img_array.dtype)
+                                denom = float(max(info.max - info.min, 1))
+                                img_array = ((img_array.astype(np.float32) - info.min) / denom * 255.0).astype(np.uint8)
+                            else:
+                                img_array = np.clip(img_array, 0, 255).astype(np.uint8)
+
+                        if img_array.ndim == 2:
+                            img_array = np.stack([img_array, img_array, img_array], axis=2)
+
+                        from PIL import Image as PILImage
+                        pil_img = PILImage.fromarray(img_array)
+                        if pil_img.width > max_size or pil_img.height > max_size:
+                            pil_img.thumbnail((max_size, max_size), PILImage.Resampling.LANCZOS)
+
+                        img_array = np.array(pil_img)
+                        h2, w2 = img_array.shape[:2]
+                        q_image = QImage(img_array.tobytes(), w2, h2, w2 * 3, QImage.Format_RGB888)
+                        pixmap = QPixmap.fromImage(q_image.copy())
+                        if pixmap and not pixmap.isNull():
+                            return pixmap, resolution_str
+            except Exception as oiio_error:
+                if DEBUG_MODE:
+                    print(f"[Preview TIFF] OIIO fallback failed: {oiio_error}")
+
+            # 4) OpenCV fallback
             if OPENCV_AVAILABLE and NUMPY_AVAILABLE:
                 try:
                     import cv2
@@ -5580,7 +5692,7 @@ class PreviewPanel(QWidget):
                     if DEBUG_MODE:
                         print(f"[Preview TIFF] OpenCV fallback failed: {cv_error}")
 
-            # 4) Qt reader final fallback
+            # 5) Qt reader final fallback
             try:
                 image_reader = QImageReader(file_path)
                 image_reader.setAllocationLimit(2048)
@@ -7616,24 +7728,60 @@ class PreviewPanel(QWidget):
             self.config.config["preview_splitter_position"] = splitter_state
             self.config.save_config()
     
+    def _request_sequence_prefetch(self, sequence, current_index, current_frame_path):
+        """Kick off background decoding+tone-mapping of the frames around
+        current_index (EXR/HDR/TX/TIFF only - see decode_sequence_frame_raw).
+        The result is stored ready-to-display, baked at the current
+        exposure - call this again whenever exposure changes so the window
+        gets re-rendered at the new value."""
+        file_ext = str(current_frame_path).lower()
+        if os.path.splitext(file_ext)[1] not in SEQUENCE_PREFETCH_EXTENSIONS:
+            return
+        channel_name = self.current_exr_channel if file_ext.endswith('.exr') else None
+        self._sequence_prefetch_channel = channel_name
+        self.sequence_prefetcher.request(
+            sequence, current_index, self.sequence_frame_cache, self.max_preview_size,
+            channel_name=channel_name, exposure=self.hdr_exposure, metadata_manager=self.metadata_manager,
+            ahead=8, behind=2
+        )
+
+    def _drain_sequence_prefetch(self):
+        """Move any background-decoded sequence frames into the cache and
+        refresh the timeline slider's cache-visualization dots. Called on a
+        timer from PreviewPanel.__init__ regardless of whether a sequence
+        is currently showing - cheap no-op otherwise."""
+        if not (self.current_assets and len(self.current_assets) == 1 and
+                self.current_assets[0].is_sequence and self.current_assets[0].sequence):
+            return
+        newly_cached = self.sequence_prefetcher.drain(self.sequence_frame_cache)
+        if newly_cached:
+            sequence = self.current_assets[0].sequence
+            indices = self.sequence_frame_cache.cached_indices(
+                sequence.pattern, self._sequence_prefetch_channel, self.hdr_exposure
+            )
+            self.sequence_playback.timeline_slider.set_cached_frames(indices)
+
     def on_sequence_frame_changed(self, frame_index):
         """Handle sequence frame change from playback widget
-        
+
         Args:
             frame_index: 0-based index into sequence.files
         """
         if not self.current_assets or not self.current_assets[0].is_sequence:
             return
-        
+
         asset = self.current_assets[0]
         sequence = asset.sequence
-        
+
         if not sequence or frame_index >= len(sequence.files):
             return
-        
+
         # Get the frame Path object (sequence.files is a list of Path objects)
         frame_path = sequence.files[frame_index]
-        
+
+        # Keep the background prefetch window centered on the new frame
+        self._request_sequence_prefetch(sequence, frame_index, frame_path)
+
         # If in zoom mode, load the new frame directly into zoom without resetting
         if self.zoom_mode:
             # Update current_image_path to new frame
@@ -7793,15 +7941,28 @@ class PreviewPanel(QWidget):
             self.exposure_controls.show()
             # Keep current exposure value (don't reset for sequences)
             
-            # For EXR, detect channels (needed for zoom mode)
-            if file_ext.endswith('.exr') and OPENEXR_AVAILABLE:
+            if file_ext.endswith('.exr'):
+                # Keep current_exr_file_path pointing at THIS frame (cheap,
+                # no disk I/O) - the exposure-drag fast path looks up
+                # hdr_raw_cache by this exact path, so it must track the
+                # frame actually being shown even when channel detection
+                # below is skipped.
+                self.current_exr_file_path = file_path_str
+
+            # For EXR, detect channels (needed for zoom mode) - but only
+            # once per sequence, not on every frame. OpenEXR.File() just to
+            # list channel names measured ~90-100ms on its own; sibling
+            # frames of one render sequence essentially always share the
+            # same channel layout, and show_single_file()'s sequence-switch
+            # handler clears current_exr_channels when that assumption
+            # doesn't hold (a genuinely different sequence).
+            if file_ext.endswith('.exr') and OPENEXR_AVAILABLE and not self.current_exr_channels:
                 try:
                     with OpenEXR.File(file_path_str) as exr_file:
                         channels = exr_file.channels()
                         channel_names = list(channels.keys())
-                        
+
                     if channel_names:
-                        self.current_exr_file_path = file_path_str
                         self.current_exr_channels = channel_names
                         # Keep current channel if it exists, otherwise use first
                         if not self.current_exr_channel or self.current_exr_channel not in channel_names:
@@ -7812,11 +7973,43 @@ class PreviewPanel(QWidget):
             self.current_hdr_path = None
             self.exposure_controls.hide()
         
-        # Load the frame directly (no caching for now)
+        # Load the frame - check the background-prefetched cache first.
+        # decode_sequence_frame_raw() decodes AND tone-maps EXR/HDR/TX/TIFF
+        # frames ahead of the playhead in worker threads, so a hit here
+        # stores the FINISHED, display-ready image - the only work left is
+        # wrapping it in a QImage/QPixmap (a few ms), not re-running the
+        # tone-map math that made the decode expensive in the first place.
         pixmap = None
         resolution_str = None
         try:
-            if is_hdr_exr:
+            import time as _time
+            _t_start = _time.perf_counter()
+
+            channel_name = self.current_exr_channel if file_ext.endswith('.exr') else None
+            if os.path.splitext(file_ext)[1] in SEQUENCE_PREFETCH_EXTENSIONS:
+                cached = self.sequence_frame_cache.get(sequence.pattern, frame_index, channel_name, self.hdr_exposure)
+                if DEBUG_MODE:
+                    print(f"[SeqCache] frame {frame_index} ({Path(file_path_str).name}) "
+                          f"channel={channel_name} -> {'HIT' if cached is not None else 'MISS'}")
+            else:
+                cached = None
+
+            if cached is not None:
+                array = cached['array']
+                h, w = array.shape[:2]
+                q_image = QImage(array.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(q_image.copy())
+                resolution_str = cached['resolution_str']
+
+                if pixmap:
+                    self.current_pixmap = pixmap
+                    self.add_to_cache(file_path_str, pixmap, resolution_str)
+                    self.fit_pixmap_to_label()
+                if DEBUG_MODE:
+                    print(f"[SeqCache] frame {frame_index} HIT total={(_time.perf_counter()-_t_start)*1000:.1f}ms")
+
+            elif is_hdr_exr:
+                _t_decode_start = _time.perf_counter()
                 # For EXR with channels, load the specific channel
                 if file_ext.endswith('.exr') and self.current_exr_file_path and self.current_exr_channel:
                     # Load specific channel (handles caching internally)
@@ -7824,17 +8017,21 @@ class PreviewPanel(QWidget):
                 else:
                     # Load HDR/EXR with exposure (standard RGB)
                     rgb_raw, width, height, resolution_str = load_hdr_exr_raw(file_path_str, max_size=self.max_preview_size)
-                    
+
                     if rgb_raw is not None:
                         self.add_to_hdr_raw_cache(file_path_str, rgb_raw, width, height, resolution_str)
                         pixmap = self.apply_hdr_tone_mapping(rgb_raw, width, height, self.hdr_exposure, file_path=file_path_str)
                     else:
                         pixmap, resolution_str = load_hdr_exr_image(file_path_str, max_size=self.max_preview_size, exposure=self.hdr_exposure)
-                
+                _t_decode_done = _time.perf_counter()
+
                 if pixmap:
                     self.current_pixmap = pixmap
                     self.add_to_cache(file_path_str, pixmap, resolution_str)
                     self.fit_pixmap_to_label()
+                if DEBUG_MODE:
+                    print(f"[SeqCache] frame {frame_index} MISS decode+tonemap={(_t_decode_done-_t_decode_start)*1000:.1f}ms "
+                          f"total={(_time.perf_counter()-_t_start)*1000:.1f}ms")
             else:
                 # Standard image loading
                 if file_ext.endswith('.tx'):
@@ -7843,7 +8040,7 @@ class PreviewPanel(QWidget):
                         pixmap, resolution_str, metadata = load_oiio_image(
                             file_path_str,
                             max_size=1024,
-                            mip_level=0,
+                            mip_level='auto',
                             exposure=0.0,
                             metadata_manager=self.metadata_manager
                         )

@@ -68,6 +68,7 @@ class SettingsManager:
             "preview": {
                 "resolution": 1024,
                 "hdr_cache_size": 5,
+                "sequence_cache_size_mb": 1024,
                 "default_exposure": 0.0,
                 "auto_fit": True,
                 "background_mode": "dark_gray"  # dark_gray, light_gray, checkered, black, white
@@ -628,17 +629,23 @@ class PreviewSettingsTab(QWidget):
         res_layout = QHBoxLayout()
         res_layout.addWidget(QLabel("Resolution:"))
         self.resolution_combo = QComboBox()
-        self.resolution_combo.addItems(["512 px (Fast)", "1024 px (Balanced)", 
-                                       "2048 px (High Quality)", "4096 px (Maximum)"])
+        self.resolution_combo.addItems(["512 px (Fast)", "1024 px (Balanced)",
+                                       "2048 px (High Quality)", "4096 px (Maximum)",
+                                       "8192 px (8K)", "Off (Full Resolution)"])
         current_res = self.settings.get("preview", "resolution", 1024)
-        res_map = {512: 0, 1024: 1, 2048: 2, 4096: 3}
+        res_map = {512: 0, 1024: 1, 2048: 2, 4096: 3, 8192: 4, 0: 5}
         self.resolution_combo.setCurrentIndex(res_map.get(current_res, 1))
         res_layout.addWidget(self.resolution_combo)
         res_layout.addStretch()
         resolution_layout.addLayout(res_layout)
-        
-        res_info = QLabel("⚠ Higher resolution = slower HDR/EXR processing")
+
+        res_info = QLabel(
+            "⚠ Higher resolution = slower HDR/EXR processing. \"Off\" loads at the "
+            "file's native resolution with no downsampling - can be very slow for "
+            "large (8K+) files. Applies to both the preview panel and Quick View."
+        )
         res_info.setStyleSheet("color: #888; font-size: 10px;")
+        res_info.setWordWrap(True)
         resolution_layout.addWidget(res_info)
         
         resolution_group.setLayout(resolution_layout)
@@ -674,7 +681,34 @@ class PreviewSettingsTab(QWidget):
         
         hdr_group.setLayout(hdr_layout)
         layout.addWidget(hdr_group)
-        
+
+        # Sequence playback cache group
+        sequence_group = QGroupBox("Sequence Playback")
+        sequence_layout = QVBoxLayout()
+
+        seq_cache_layout = QHBoxLayout()
+        seq_cache_layout.addWidget(QLabel("Frame Cache Size:"))
+        self.sequence_cache_spin = QSpinBox()
+        self.sequence_cache_spin.setRange(128, 16384)
+        self.sequence_cache_spin.setSingleStep(128)
+        self.sequence_cache_spin.setValue(self.settings.get("preview", "sequence_cache_size_mb", 1024))
+        self.sequence_cache_spin.setSuffix(" MB")
+        seq_cache_layout.addWidget(self.sequence_cache_spin)
+        seq_cache_layout.addStretch()
+        sequence_layout.addLayout(seq_cache_layout)
+
+        seq_cache_info = QLabel(
+            "ℹ Background-decoded, ready-to-display frames (EXR/HDR/TX/TIFF) kept "
+            "in RAM around the current playhead, like RV's frame cache. Larger = "
+            "more of the sequence stays instantly playable once cached."
+        )
+        seq_cache_info.setStyleSheet("color: #888; font-size: 10px;")
+        seq_cache_info.setWordWrap(True)
+        sequence_layout.addWidget(seq_cache_info)
+
+        sequence_group.setLayout(sequence_layout)
+        layout.addWidget(sequence_group)
+
         # Display settings group
         display_group = QGroupBox("Display")
         display_layout = QVBoxLayout()
@@ -690,9 +724,10 @@ class PreviewSettingsTab(QWidget):
     
     def save_settings(self):
         """Save settings from UI to settings manager"""
-        res_map = {0: 512, 1: 1024, 2: 2048, 3: 4096}
+        res_map = {0: 512, 1: 1024, 2: 2048, 3: 4096, 4: 8192, 5: 0}
         self.settings.set("preview", "resolution", res_map[self.resolution_combo.currentIndex()])
         self.settings.set("preview", "hdr_cache_size", self.hdr_cache_spin.value())
+        self.settings.set("preview", "sequence_cache_size_mb", self.sequence_cache_spin.value())
         self.settings.set("preview", "default_exposure", float(self.exposure_spin.value()))
         self.settings.set("preview", "auto_fit", self.auto_fit_cb.isChecked())
 

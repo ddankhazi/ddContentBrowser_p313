@@ -3928,14 +3928,18 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Apply preview settings to PreviewPanel
         preview_resolution = self.settings_manager.get("preview", "resolution", 1024)
         hdr_cache_size = self.settings_manager.get("preview", "hdr_cache_size", 5)
+        sequence_cache_size_mb = self.settings_manager.get("preview", "sequence_cache_size_mb", 1024)
         if hasattr(self, 'preview_panel'):
             self.preview_panel.max_preview_size = preview_resolution
             self.preview_panel.hdr_cache_max_size = hdr_cache_size
             self.preview_panel.max_hdr_cache_size = hdr_cache_size  # Both attributes for compatibility
             # Clear and resize cache
             self.preview_panel.hdr_raw_cache.clear()
+            if hasattr(self.preview_panel, 'sequence_frame_cache'):
+                self.preview_panel.sequence_frame_cache.set_max_size_mb(sequence_cache_size_mb)
             if DEBUG_MODE:
-                print(f"[Browser] Preview resolution set to {preview_resolution}px, HDR cache size: {hdr_cache_size}")
+                print(f"[Browser] Preview resolution set to {preview_resolution}px, HDR cache size: {hdr_cache_size}, "
+                      f"sequence cache size: {sequence_cache_size_mb}MB")
         
         # Apply thumbnail generation size and quality from settings
         thumbnail_generation_size = self.settings_manager.get("thumbnails", "size", 128)

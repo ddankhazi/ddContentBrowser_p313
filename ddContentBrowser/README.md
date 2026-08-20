@@ -1,5 +1,5 @@
 
-# DD Content Browser v2.3.0
+# DD Content Browser v2.4.0
 
 Content Browser for Maya by Denes Dankhazi
 Modern Maya Asset Browser for Autodesk Maya 2025+ (PySide6, Python 3.11 & 3.13)
@@ -149,14 +149,24 @@ Cheers, D
 ### Preview System
 - **Preview panel** - Image (JPG, PNG, TIF, HDR, EXR, PSD), PDF (page navigation), text files
 - **HDR/EXR support** - Exposure slider (-5 to +5 stops), ACES tone mapping
-- **16/32-bit TIFF** - OpenCV integration with proper normalization
-- **Video thumbnails** - Middle frame extraction for 8 formats (.mp4, .mov, .avi, .mkv, .webm, .m4v, .flv, .wmv)
+- **`.tx` color management** - Auto-detects ACEScg / Linear sRGB / DCI-P3 from the Megascans/maketx filename suffix convention (defaults to ACEScg when unmarked), with the correct view transform per space
+- **16/32-bit TIFF** - Fast OpenImageIO-based decoding with proper normalization for uncommon pixel formats (e.g. LZW-compressed float32)
+- **Video thumbnails** - Middle frame extraction for 8 formats (.mp4, .mov, .avi, .mkv, .webm, .m4v, .flv, .wmv), decoded via a separate ffmpeg process so a problematic video can't destabilize Maya
 - **Zoom mode** - Double-click for 1:1 pixel zoom, mouse-centered scroll zoom
 - **Pan & scroll** - Drag to pan, scrollbars when zoomed
 - **Background modes** - Dark, light, checkerboard
 - **Password-protected PDFs** - User-friendly lock message
 - **Multi-file summary** - Resolution, size, date display
 - **Folder thumbnail preview** - Selecting a folder with its own preview image (a `*preview.<ext>` file inside it) shows that image full-size in the preview panel instead of the small grid thumbnail
+
+### Image Sequence Playback ✨ **NEW!**
+- **Auto-detected sequences** - Frame-numbered files (e.g. `render.0001.exr` … `render.0500.exr`) are grouped into a single playable sequence item
+- **Transport controls** - Play/Pause, Stop, First/Previous/Next/Last frame, FPS selector (24/25/30/60)
+- **Timeline scrubbing** - Click-to-jump or drag the timeline slider; cached frames are marked with green dots for at-a-glance feedback, RV-style
+- **Background frame cache** - EXR/HDR/`.tx`/TIFF frames are decoded and tone-mapped ahead of the playhead, so a cached frame displays in ~5-10ms instead of re-decoding on every frame - the difference between a slideshow and actual playback
+- **Process-isolated decoding** - The decode/tone-map work runs in dedicated `mayapy.exe` worker subprocesses rather than inside Maya itself, so a problematic frame can't destabilize Maya
+- **Exposure-aware caching** - Adjusting exposure during playback re-renders the current frame and the cached window at the new value
+- **Configurable cache budget** - `Settings > Preview > Sequence Playback` (128MB-16GB, default 1GB), applied live
 
 ### Batch Operations
 - **Batch Import** - Middle mouse drag to Maya viewport
@@ -186,7 +196,7 @@ Cheers, D
 - **JSON persistence** - Auto-save to `~/.ddContentBrowser/settings.json`
 - **General settings** - Startup dir, window size, UI font (5 fonts), confirm delete, auto-refresh
 - **Thumbnail settings** - Discrete sizes [32-512px], quality presets (Low/Med/High), cache limit
-- **Preview settings** - HDR resolution [512-4096px], cache size (1-20 files), default exposure
+- **Preview settings** - Preview resolution [512px-8192px, or Off for native resolution] (applies to both the preview panel and Quick View), raw HDR cache size (1-20 files), sequence playback frame cache (128MB-16GB), default exposure
 - **Filter settings** - Custom extensions, show hidden, case-sensitive search, recursive limits
 - **Cache management** - Visual cache size display, one-click clear
 - **Restore defaults** - Reset all settings button
@@ -308,6 +318,11 @@ Cheers, D
 - Image thumbnails: 50-200ms (with caching)
 - Video thumbnails: 100-300ms (middle frame extraction)
 - HDR/EXR: 100-200ms (1024px, first time), 35-45ms (exposure adjust from cache)
+- `.tx` (RenderMan texture): auto-selects the closest built-in mip level for the target thumbnail size instead of always decoding full resolution - up to ~15x faster on high-res textures
+
+**Sequence Playback:**
+- Cached frame display: ~5-10ms (vs. ~250-450ms decoding a full-res EXR frame from disk)
+- Background decode+tone-map: runs in separate worker processes, ahead of the playhead, while you scrub or watch
 
 **UI Performance:**
 - Frame time: ~16ms (60fps)
@@ -342,7 +357,7 @@ Commercial redistribution is not permitted without the author's permission.
 ## 🙏 Credits
 
 **Author:** Denes Dankhazi (ddankhazi)  
-**Version:** 2.3.0  
+**Version:** 2.4.0  
 **Maya Version:** 2025+ (PySide6)  
 **Python:** 3.11 (Maya 2025/2026) & 3.13 (Maya 2027+)  
 **Blog & Portfolio:** [ddankhazi.com](https://ddankhazi.com)
