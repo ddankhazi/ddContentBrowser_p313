@@ -1,5 +1,5 @@
 
-# DD Content Browser v2.4.0
+# DD Content Browser v2.5.0
 
 Content Browser for Maya by Denes Dankhazi
 Modern Maya Asset Browser for Autodesk Maya 2025+ (PySide6, Python 3.11 & 3.13)
@@ -9,6 +9,16 @@ Modern Maya Asset Browser for Autodesk Maya 2025+ (PySide6, Python 3.11 & 3.13)
 ## ✨ Overview
 
 DD Content Browser is a high-performance, feature-rich asset browser for Maya, designed for large production environments. It replaces the built-in browser with a fast, intuitive, and visually advanced interface with advanced features like video support, texture sets, collections, tags, Quick View, and more.
+
+---
+
+## 🆕 What's New in v2.5
+
+- **True batch geo import** - MMB drag and the Import action now import every selected geo back to back first, then build the texture set materials in one pass for the whole batch (folder scans cached, one TIF conversion progress for everything)
+- **Per-material / per-object texture sets** - In multi-object or per-face-assigned files each part gets its own texture set, matched by the imported material's name, then by the object's name - the file name (and the Megascans `VarN` layout) is only the fallback
+- **One material per texture set** - A set used by many geos, objects or face groups across the batch is built once and shared
+- **Replaced import materials cleaned up** - The placeholder materials the import itself brought in, and that the texture set materials replaced, are removed - nothing else in the scene is ever touched
+- **MMB drag over Collections fixed** - Crossing the Collections panel no longer kills the drag; over a collection the cursor shows a copy sign and the target row is highlighted
 
 ---
 
@@ -100,17 +110,28 @@ Cheers, D
 - **Advanced Filters integration** - Filter by "Texture Set" category (Set member / Loose file)
 - **Set badge & thumbnail** - File-count badge on the thumbnail, base-color image used as the set's preview
 - **Rich tooltip & metadata panel** - Lists every channel and the file(s) filling it, plus total set size
-- **Drag to build shader** - Drop a set into the Maya viewport to auto-generate a shader network (aiStandardSurface by default) wired to the set's channels
+- **Drag to build shader** - Drop a set into the Maya viewport to auto-generate a shader network (aiStandardSurface by default) wired to the set's channels. When only texture sets are dropped (a single one), the material is also assigned to the current Maya selection
 - **Collections support** - Dragging a set into a Collection (or "Add to Collection") adds every file in the set; Collection view re-groups sets when Texture Sets mode is on
 - **Per-folder isolation** - Same-named sets in different folders stay fully separate (thumbnails, cache)
 
-### Smart Import - Auto Material Build ✨ **NEW!**
-- **Automatic on geo import** - Importing a 3D file (own folder first, then subfolders) looks for a matching texture set and, if found, auto-builds and assigns a shader network to it - no manual drag-to-build needed
+### Smart Import - Auto Material Build ✨ **Updated in v2.5!**
+- **Automatic on geo import** - Importing 3D files (Import action / Enter / double-click, or MMB drag to the viewport) looks for matching texture sets next to each file (own folder first, then subfolders) and auto-builds and assigns shader networks - no manual drag-to-build needed
+- **Batch first, materials after** - All selected geo is imported back to back, then the materials are built in one pass for the whole batch, with folder scans cached across files
+- **Matched per material / per object** - Every shading assignment of an imported file (a whole object or a face group) gets its texture set by:
+  1. the imported material's name - configured suffixes (`_MAT`, `_mtl`, ...), `_High`/`_LODn` and `_2K`/`_4K` tags and Maya's clash numbering (`RockA_MAT1`) are ignored,
+  2. else the geo object's name,
+  3. else - only if nothing in the file matched by name - the file name / Megascans `VarN` layout, for the whole file.
+
+  Per-face assignments are moved 1:1; parts without a matching set keep their imported material.
+- **Shared materials** - Everything resolving to the same texture set (with the same channel files) shares one material across the batch - e.g. all `Var1`..`VarN` plants on one Atlas material
+- **Clean scene** - The materials the import brought in and the texture set materials replaced are deleted, together with their file/place2d nodes. Only nodes created by that very import are ever considered, and anything still in use stays - this is never a scene-wide "delete unused"
 - **Megascans "3D plant" support** - Recognizes the `VarN` folder layout (geo in `Var1`/`Var2`/... with textures in a sibling `Textures`/`Textures/Atlas` folder); handles assets that ship multiple resolution variants (e.g. both a 2K and 4K set) in the same Atlas folder
-- **LOD proxy auto-import** *(opt-in)* - When importing a "High" or untagged geo, also imports a lower-detail `LODN` file from the same folder (highest LOD number = lightest proxy) and assigns it the exact same material - handy for building asset libraries that need a lightweight stand-in geo
+- **LOD-aware channels** - `High` geo prefers the dedicated high-frequency normal map and skips displacement; `LODn` geo gets its own LOD's normal map. The object's own LOD tag wins over the file's, so a file holding several LODs works too
+- **LOD proxy auto-import** *(opt-in)* - When importing a "High" or untagged geo, also imports a lower-detail `LODN` file from the same folder (highest LOD number = lightest proxy) and assigns it the exact same material(s) (matched per imported material name) - handy for building asset libraries that need a lightweight stand-in geo. A proxy you selected yourself is imported only once
 - **Preferred resolution** - Picks the configured resolution (1K/2K/4K/8K) when a match has more than one available, falling back to whatever exists otherwise
 - **Shader type choice** - aiStandardSurface, openPBRSurface, or dGecko
-- **TIF conversion** - Optional auto-convert of JPG/PNG/TGA channel textures to TIF (LZW) before building
+- **TIF conversion** - Optional auto-convert of JPG/PNG/TGA channel textures to TIF (LZW) before building - one combined progress for the whole batch
+- **Undo** - One Ctrl+Z takes back the whole material step (build, assignment, cleanup); the geo stays in the scene, back on its imported materials. (Maya's file import itself can't be undone.)
 - **Texture Set Settings dialog** (`Settings > Texture Set Settings...`) - Dedicated panel for all of the above, plus VarN displacement toggle and `.tx`-as-Texture-Set grouping
 
 ### Quick View System ✨ **NEW!**
@@ -126,7 +147,7 @@ Cheers, D
 ### Collections System ✨ **NEW!**
 - **Manual Collections** - Drag & drop file management with SQLite backend
 - **Virtual folder view** - Display files from multiple folders
-- **Middle-button drag** - Maya-style file adding to collections
+- **Middle-button drag** - Release on a collection to add the selected files - the target row is highlighted and the cursor shows a copy sign; passing over the panel mid-drag doesn't interrupt a batch import released elsewhere
 - **Texture set aware** - Dragging a texture set adds all its files; Collection view can re-group them back into sets
 - **Collection mode** - Blue breadcrumb indicator, exit button
 - **Context menus** - "Add to Collection >", "Remove from Collection"
@@ -149,9 +170,8 @@ Cheers, D
 ### Preview System
 - **Preview panel** - Image (JPG, PNG, TIF, HDR, EXR, PSD), PDF (page navigation), text files
 - **HDR/EXR support** - Exposure slider (-5 to +5 stops), ACES tone mapping
-- **`.tx` color management** - Auto-detects ACEScg / Linear sRGB / DCI-P3 from the Megascans/maketx filename suffix convention (defaults to ACEScg when unmarked), with the correct view transform per space
-- **16/32-bit TIFF** - Fast OpenImageIO-based decoding with proper normalization for uncommon pixel formats (e.g. LZW-compressed float32)
-- **Video thumbnails** - Middle frame extraction for 8 formats (.mp4, .mov, .avi, .mkv, .webm, .m4v, .flv, .wmv), decoded via a separate ffmpeg process so a problematic video can't destabilize Maya
+- **16/32-bit TIFF** - OpenCV integration with proper normalization
+- **Video thumbnails** - Middle frame extraction for 8 formats (.mp4, .mov, .avi, .mkv, .webm, .m4v, .flv, .wmv)
 - **Zoom mode** - Double-click for 1:1 pixel zoom, mouse-centered scroll zoom
 - **Pan & scroll** - Drag to pan, scrollbars when zoomed
 - **Background modes** - Dark, light, checkerboard
@@ -159,17 +179,8 @@ Cheers, D
 - **Multi-file summary** - Resolution, size, date display
 - **Folder thumbnail preview** - Selecting a folder with its own preview image (a `*preview.<ext>` file inside it) shows that image full-size in the preview panel instead of the small grid thumbnail
 
-### Image Sequence Playback ✨ **NEW!**
-- **Auto-detected sequences** - Frame-numbered files (e.g. `render.0001.exr` … `render.0500.exr`) are grouped into a single playable sequence item
-- **Transport controls** - Play/Pause, Stop, First/Previous/Next/Last frame, FPS selector (24/25/30/60)
-- **Timeline scrubbing** - Click-to-jump or drag the timeline slider; cached frames are marked with green dots for at-a-glance feedback, RV-style
-- **Background frame cache** - EXR/HDR/`.tx`/TIFF frames are decoded and tone-mapped ahead of the playhead, so a cached frame displays in ~5-10ms instead of re-decoding on every frame - the difference between a slideshow and actual playback
-- **Process-isolated decoding** - The decode/tone-map work runs in dedicated `mayapy.exe` worker subprocesses rather than inside Maya itself, so a problematic frame can't destabilize Maya
-- **Exposure-aware caching** - Adjusting exposure during playback re-renders the current frame and the cached window at the new value
-- **Configurable cache budget** - `Settings > Preview > Sequence Playback` (128MB-16GB, default 1GB), applied live
-
 ### Batch Operations
-- **Batch Import** - Middle mouse drag to Maya viewport
+- **Batch Import** - Middle mouse drag to Maya viewport (texture set materials built once for the whole batch - see Smart Import)
 - **Batch Rename** - Multi-rule system with 7 rule types:
   - Find & Replace (case sensitive, whole name)
   - New Name (templates with {num}, {original})
@@ -196,7 +207,7 @@ Cheers, D
 - **JSON persistence** - Auto-save to `~/.ddContentBrowser/settings.json`
 - **General settings** - Startup dir, window size, UI font (5 fonts), confirm delete, auto-refresh
 - **Thumbnail settings** - Discrete sizes [32-512px], quality presets (Low/Med/High), cache limit
-- **Preview settings** - Preview resolution [512px-8192px, or Off for native resolution] (applies to both the preview panel and Quick View), raw HDR cache size (1-20 files), sequence playback frame cache (128MB-16GB), default exposure
+- **Preview settings** - HDR resolution [512-4096px], cache size (1-20 files), default exposure
 - **Filter settings** - Custom extensions, show hidden, case-sensitive search, recursive limits
 - **Cache management** - Visual cache size display, one-click clear
 - **Restore defaults** - Reset all settings button
@@ -276,7 +287,7 @@ Cheers, D
 | **LMB Drag**        | Box select (rubber band)                    |
 | **Double-Click**    | Import file / Enter zoom mode (preview)     |
 | **Alt+LMB Drag**    | File drag (Maya import)                     |
-| **MMB Drag**        | Batch import / Add to collection            |
+| **MMB Drag**        | Release outside the browser: batch import / on a collection: add to it (Esc cancels) |
 | **RMB**             | Context menu                                |
 | **Ctrl+Scroll**     | Zoom thumbnails                             |
 | **Scroll (Preview)**| Zoom (mouse-centered)                       |
@@ -318,11 +329,6 @@ Cheers, D
 - Image thumbnails: 50-200ms (with caching)
 - Video thumbnails: 100-300ms (middle frame extraction)
 - HDR/EXR: 100-200ms (1024px, first time), 35-45ms (exposure adjust from cache)
-- `.tx` (RenderMan texture): auto-selects the closest built-in mip level for the target thumbnail size instead of always decoding full resolution - up to ~15x faster on high-res textures
-
-**Sequence Playback:**
-- Cached frame display: ~5-10ms (vs. ~250-450ms decoding a full-res EXR frame from disk)
-- Background decode+tone-map: runs in separate worker processes, ahead of the playhead, while you scrub or watch
 
 **UI Performance:**
 - Frame time: ~16ms (60fps)
@@ -357,7 +363,7 @@ Commercial redistribution is not permitted without the author's permission.
 ## 🙏 Credits
 
 **Author:** Denes Dankhazi (ddankhazi)  
-**Version:** 2.4.0  
+**Version:** 2.5.0  
 **Maya Version:** 2025+ (PySide6)  
 **Python:** 3.11 (Maya 2025/2026) & 3.13 (Maya 2027+)  
 **Blog & Portfolio:** [ddankhazi.com](https://ddankhazi.com)
@@ -366,7 +372,7 @@ Commercial redistribution is not permitted without the author's permission.
 
 ## 🔮 Planned Features (Future)
 
-*Smart Material Generator (auto-shader from texture sets) shipped in v2.0 — see "Texture Sets" above. Automatic material build & LOD proxy import on geo import (incl. Megascans "3D plant" VarN/Atlas layouts) has since shipped too — see "Smart Import" above.*
+*Smart Material Generator (auto-shader from texture sets) shipped in v2.0 — see "Texture Sets" above. Automatic material build & LOD proxy import on geo import (incl. Megascans "3D plant" VarN/Atlas layouts) has since shipped too, and in v2.5 became a true batch import with per-material / per-object matching — see "Smart Import" above.*
 
 ### High Priority:
 1. **SkyDome Auto-Linker** - Drag HDR → update aiSkyDomeLight path

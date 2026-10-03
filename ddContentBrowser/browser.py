@@ -382,8 +382,72 @@ def show_content_browser(force_reload=False):
     _content_browser_instance.show()
     _content_browser_instance.raise_()
     _content_browser_instance.activateWindow()
+    _install_exit_callback()
     
     return _content_browser_instance
+
+
+# ========== Maya exit ==========
+# Left to itself, the browser outlives Python when Maya quits: PySide's own
+# clean-up at exit then destroys the Qt objects still around, a destructor calls
+# back into a Python slot or into the Qt message handler installed above, and
+# Maya crashes on the way out. On kMayaExiting - Python still fully alive - the
+# browser is closed (closeEvent saves the config and stops the thumbnail
+# thread), deleted on the spot (no event loop is left to run a deleteLater),
+# and Qt's own message handler is put back.
+_exit_callback_id = None
+
+
+def _install_exit_callback():
+    global _exit_callback_id
+    if _exit_callback_id is not None:
+        return
+    try:
+        import maya.api.OpenMaya as om
+    except ImportError:
+        return  # standalone: no Maya to quit
+    _exit_callback_id = om.MSceneMessage.addCallback(
+        om.MSceneMessage.kMayaExiting, _on_maya_exiting)
+
+
+def _remove_exit_callback():
+    """Also called by launch_browser before a reload purges this module."""
+    global _exit_callback_id
+    if _exit_callback_id is None:
+        return
+    try:
+        import maya.api.OpenMaya as om
+        om.MMessage.removeCallback(_exit_callback_id)
+    except Exception:
+        pass
+    _exit_callback_id = None
+
+
+def _on_maya_exiting(*_args):
+    global _content_browser_instance
+    try:
+        from shiboken6 import isValid, delete
+    except ImportError:
+        from shiboken2 import isValid, delete
+    browser = _content_browser_instance
+    if browser is not None:
+        try:
+            if isValid(browser):
+                quick_view = getattr(browser, 'quick_view_window', None)
+                browser.close()
+                # the Quick View is the Maya window's child, not the browser's
+                if quick_view is not None and isValid(quick_view):
+                    quick_view.close()
+                    delete(quick_view)
+                delete(browser)
+        except Exception as e:
+            print(f"[DD Content Browser] Cleanup at exit failed: {e}")
+        _content_browser_instance = None
+    try:
+        qInstallMessageHandler(None)
+    except Exception:
+        pass
+    _remove_exit_callback()
 
 
 class DDContentBrowser(QtWidgets.QMainWindow):
@@ -1478,7 +1542,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         immediately, since there's nothing expensive about reverting to "show everything".
         """
         if not hasattr(self, '_search_debounce_timer'):
-            self._search_debounce_timer = QTimer()
+            self._search_debounce_timer = QTimer(self)
             self._search_debounce_timer.setSingleShot(True)
             self._search_debounce_timer.timeout.connect(self._apply_pending_search_text)
         self._pending_search_text = text
@@ -2101,12 +2165,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         
         # Request thumbnails for newly visible items after size change
         # Use timer to debounce rapid size changes (e.g., Ctrl+scroll)
-        if hasattr(self, '_size_change_timer'):
-            self._size_change_timer.stop()
-        
-        self._size_change_timer = QTimer()
-        self._size_change_timer.setSingleShot(True)
-        self._size_change_timer.timeout.connect(self.request_thumbnails_for_visible_items)
+        if not hasattr(self, '_size_change_timer'):
+            self._size_change_timer = QTimer(self)  # parented: goes with the window
+            self._size_change_timer.setSingleShot(True)
+            self._size_change_timer.timeout.connect(self.request_thumbnails_for_visible_items)
         self._size_change_timer.start(200)  # Wait 200ms after size change stops
     
     def on_thumbnails_toggle(self, state):
@@ -2887,12 +2949,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         
         # Also set up a debounce timer for when scrolling continues
         # This prevents overwhelming the queue during rapid scrolling
-        if hasattr(self, '_scroll_timer'):
-            self._scroll_timer.stop()
-        
-        self._scroll_timer = QTimer()
-        self._scroll_timer.setSingleShot(True)
-        self._scroll_timer.timeout.connect(self.request_thumbnails_for_visible_items)
+        if not hasattr(self, '_scroll_timer'):
+            self._scroll_timer = QTimer(self)  # parented: goes with the window
+            self._scroll_timer.setSingleShot(True)
+            self._scroll_timer.timeout.connect(self.request_thumbnails_for_visible_items)
         self._scroll_timer.start(150)  # Reduced from 300ms for faster response
     
     def toggle_preview_panel(self):
@@ -3146,8 +3206,24 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         finally:
             progress.close()
 
-    def _build_texture_set_shaders(self, ts_assets):
-        """Build shader network(s) from texture-set asset(s) via the generator module."""
+    def _load_shader_generator(self):
+        """Load the shader network generator module, fresh from disk."""
+        import importlib.util
+        gen_path = Path(__file__).parent / 'smart_imports' / 'ddShaderNetworkGenerator.py'
+        spec = importlib.util.spec_from_file_location('ddShaderNetworkGenerator', str(gen_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _build_texture_set_shaders(self, ts_assets, assign_to_selection=True):
+        """
+        Build shader network(s) from texture-set asset(s) via the generator module.
+
+        assign_to_selection: assign to the current Maya selection (single set
+        only, see build_from_texture_sets()). Callers pass False when other
+        files were imported along with the sets - that selection has nothing
+        to do with what was dropped then.
+        """
         if not MAYA_AVAILABLE:
             self.safe_show_status("Maya not available")
             return
@@ -3161,132 +3237,459 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         ]
         shader_type = self.settings_manager.get('smart_import', 'shader_type', 'aiStandardSurface')
         try:
-            import importlib.util
-            gen_path = Path(__file__).parent / 'smart_imports' / 'ddShaderNetworkGenerator.py'
-            spec = importlib.util.spec_from_file_location('ddShaderNetworkGenerator', str(gen_path))
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            created = mod.build_from_texture_sets(sets, shader_type=shader_type)
+            mod = self._load_shader_generator()
+            created = mod.build_from_texture_sets(sets, shader_type=shader_type,
+                                                  assign_to_selection=assign_to_selection)
             self.safe_show_status(f"✓ Built {len(created)} material(s) from texture set(s)", 3000)
         except Exception as e:
             import traceback
             traceback.print_exc()
             self.safe_show_status(f"Shader build failed: {e}", 4000)
 
-    def _try_auto_assign_texture_set_material(self, file_path, new_nodes):
-        """
-        After importing a geo file, look for a texture set matching its name
-        (own folder first, then subfolders) and auto-build + assign a
-        material to the newly imported geometry.
+    # ------------------------------------------------------------------
+    # Geo import + texture set auto-materials
+    # ------------------------------------------------------------------
 
-        Opportunistic/best-effort: silently does nothing if no matching
-        texture set is found, so it never interferes with a plain geo import.
-        Callable from any import path (Import action, MMB batch import, ...)
-        - takes a plain file path rather than an AssetItem so it doesn't
-        depend on where the import was triggered from.
+    def _import_geo_file(self, file_path):
+        """Import one geo file into the root namespace. Returns its new nodes."""
+        from .utils import get_maya_import_type, to_maya_path
+        kwargs = dict(i=True, ignoreVersion=True, mergeNamespacesOnClash=False,
+                      namespace=':', preserveReferences=True, returnNewNodes=True)
+        file_type = get_maya_import_type(Path(file_path).suffix.lower())
+        if file_type:
+            kwargs.update(type=file_type, options='v=0')
+        return cmds.file(to_maya_path(file_path), **kwargs) or []
+
+    def _new_import_record(self, path, new_nodes):
         """
-        if not MAYA_AVAILABLE or not new_nodes:
-            return
-        geo_path = Path(file_path)
+        Bookkeeping for one imported geo file. born_uuids is what later
+        limits the cleanup to nodes this very import created. Never pass an
+        empty list to cmds.ls() here - that lists the WHOLE scene.
+        """
+        return {
+            'path': Path(path),
+            'nodes': new_nodes,
+            'born_uuids': set(cmds.ls(new_nodes, uuid=True) or []) if new_nodes else set(),
+            'file_nodes': (cmds.ls(new_nodes, type='file') or []) if new_nodes else [],
+            'slots': [],
+            'replaced_sgs': set(),
+            'matched': False,
+        }
+
+    def _smart_import_geo_files(self, file_paths):
+        """
+        Batch-import geo files, then give them materials built from their
+        texture sets. Runs in one undo chunk with viewport refresh suspended:
+        every file is imported first, back to back, and the material work
+        then runs once for the whole batch:
+
+          1. each file's shading slots get a texture set by imported material
+             name, else by geo object name; only if nothing in a file matched
+             by name, its file-level match (file name / Megascans VarN) goes
+             to all its slots (see _plan_import_slots());
+          2. one material per distinct set + resolved channels for the whole
+             batch, assigned 1:1 to the slots' members (per-face included);
+          3. LOD proxies (opt-in) share their primary's materials;
+          4. the shading networks the imports brought in and the new
+             materials replaced are deleted - nothing else
+             (see _delete_replaced_import_shading()).
+
+        Returns (imported_count, failed_count, materials_built).
+        """
+        if not MAYA_AVAILABLE or not file_paths:
+            return 0, 0, 0
+        import traceback
+        from .utils import find_lod_proxy_for_geo, get_importable_extensions, strip_geo_suffix
+
+        def _key(p):
+            return os.path.normcase(os.path.normpath(str(p)))
+
+        # Same file selected twice (or reached via two routes) imports once
+        paths = list({_key(p): Path(p) for p in file_paths}.values())
+
+        # LOD proxies are found up front, so one that's also in the selection
+        # isn't imported twice (once on its own, once as a proxy)
+        proxy_of = {}
+        if self.settings_manager.get('smart_import', 'import_lod_proxy', False):
+            exts = get_importable_extensions()
+            for p in paths:
+                proxy = find_lod_proxy_for_geo(p, strip_geo_suffix(p.stem)[1], exts)
+                if proxy:
+                    proxy_of[_key(p)] = proxy
+        selected_proxies = {_key(px) for px in proxy_of.values()} & {_key(p) for p in paths}
+
+        records = {}
+        imported = failed = built = 0
+        cmds.undoInfo(openChunk=True, chunkName='ddContentBrowser_geo_import')
+        cmds.refresh(suspend=True)
+        # Node creation in the shader generator moves the selection around
+        selection = cmds.ls(selection=True, long=True) or []
         try:
-            from .utils import find_texture_set_for_geo, resolve_texture_set_channels
-
-            preferred_resolution = self.settings_manager.get('smart_import', 'preferred_resolution', '4K')
-            ts_data, geo_suffix, is_var_match = find_texture_set_for_geo(geo_path, preferred_resolution)
-            if not ts_data:
-                return
-
-            # VarN-matched assets (Megascans plants, etc.) skip displacement by
-            # default - most don't need it. Opt-in via Texture Set Settings.
-            exclude_displacement = is_var_match and not self.settings_manager.get(
-                'smart_import', 'var_import_displacement', False
-            )
-
-            variant_map = ts_data['variant_map']
-            if self.settings_manager.get('smart_import', 'convert_to_tif', False):
-                from .utils import convert_variant_map_to_tif
-                progress, on_progress = self._tif_conversion_progress_callback()
+            for p in paths:
                 try:
-                    variant_map = convert_variant_map_to_tif(variant_map, progress_callback=on_progress)
-                finally:
-                    progress.close()
+                    records[_key(p)] = self._new_import_record(p, self._import_geo_file(p))
+                    imported += 1
+                except Exception as e:
+                    failed += 1
+                    print(f"[GeoImport] Failed to import {p.name}: {e}")
 
-            channels = resolve_texture_set_channels(variant_map, geo_suffix, exclude_displacement)
+            try:
+                gen = self._load_shader_generator()
+                cache = {}
+                # The imports' own file nodes are never reused by the new
+                # materials - they belong to networks that may get deleted
+                no_reuse = {n for rec in records.values() for n in rec['file_nodes']}
+
+                primaries = [rec for key, rec in records.items() if key not in selected_proxies]
+                built += self._apply_texture_set_materials(primaries, gen, cache, no_reuse)
+
+                shared = set()
+                for rec in primaries:
+                    proxy = proxy_of.get(_key(rec['path']))
+                    if not proxy or not rec['matched']:
+                        continue
+                    pkey = _key(proxy)
+                    prec = records.get(pkey)
+                    if prec is None:
+                        try:
+                            prec = records[pkey] = self._new_import_record(proxy, self._import_geo_file(proxy))
+                        except Exception as e:
+                            print(f"[LODProxy] Failed to import {proxy.name}: {e}")
+                            continue
+                        no_reuse.update(prec['file_nodes'])
+                    self._share_primary_material(prec, rec)
+                    shared.add(pkey)
+
+                # Selected proxies whose primary got no material: on their own
+                late = [records[key] for key in selected_proxies if key in records and key not in shared]
+                if late:
+                    built += self._apply_texture_set_materials(late, gen, cache, no_reuse)
+
+                self._delete_replaced_import_shading(list(records.values()))
+            except Exception as e:
+                traceback.print_exc()
+                print(f"[AutoMaterial] Failed: {e}")
+        finally:
+            try:
+                # (never cmds.ls([]) - that lists the whole scene)
+                kept = (cmds.ls(selection, long=True) or []) if selection else []
+                if kept:
+                    cmds.select(kept, replace=True)
+                else:
+                    cmds.select(clear=True)
+            except Exception:
+                pass
+            cmds.refresh(suspend=False)
+            cmds.undoInfo(closeChunk=True)
+
+        return imported, failed, built
+
+    def _collect_import_slots(self, rec):
+        """
+        The shading slots of one imported geo file: one per (shading group,
+        shape) pair, holding the exact members that shape has in that SG -
+        the whole shape, or a face list for per-face assignments - so each
+        part can be moved to its own texture set material 1:1. A shape with
+        no SG at all gets a whole-shape slot of its own.
+        """
+        if not rec['nodes']:
+            return []
+        shapes = cmds.ls(rec['nodes'], dag=True, type=('mesh', 'nurbsSurface'),
+                         noIntermediate=True, long=True) or []
+        if not shapes:
+            return []
+        shape_set = set(shapes)
+        # Cheap name pre-filter for SG members - a shared SG like
+        # initialShadingGroup can hold every other geo in the scene too
+        names = set()
+        for s in shapes:
+            parts = s.split('|')
+            names.update(parts[-2:])
+
+        slots = {}
+        sgs = dict.fromkeys(sg for s in shapes for sg in (cmds.listConnections(s, type='shadingEngine') or []))
+        for sg in sgs:
+            surface = cmds.listConnections(sg + '.surfaceShader', source=True, destination=False) or []
+            born = (cmds.ls(sg, uuid=True) or [None])[0] in rec['born_uuids']
+            for member in cmds.sets(sg, q=True) or []:
+                if member.split('.')[0].split('|')[-1] not in names:
+                    continue
+                owner = (cmds.ls(member, objectsOnly=True, long=True) or [None])[0]
+                if owner and owner not in shape_set:
+                    kids = cmds.listRelatives(owner, shapes=True, noIntermediate=True, fullPath=True) or []
+                    owner = next((k for k in kids if k in shape_set), None)
+                if owner not in shape_set:
+                    continue  # another (pre-existing) geo sharing this SG
+                slot = slots.setdefault((sg, owner), {
+                    'sg': sg, 'born_sg': born, 'material': surface[0] if surface else None,
+                    'shape': owner, 'members': [], 'target': None,
+                })
+                slot['members'].append(member)
+
+        covered = {s['shape'] for s in slots.values()}
+        for shape in shapes:
+            if shape not in covered:
+                slots[(None, shape)] = {'sg': None, 'born_sg': False, 'material': None,
+                                        'shape': shape, 'members': [shape], 'target': None}
+        return list(slots.values())
+
+    def _plan_import_slots(self, rec, preferred_resolution, strip_patterns, cache):
+        """
+        Pick a texture set for each slot of one imported file, searched next
+        to the file (see find_texture_set_by_name()):
+          1. by the slot's imported material name (only for a material this
+             import created - not e.g. lambert1 of initialShadingGroup);
+          2. else by the slot's geo object name;
+          3. only if NOTHING in the file matched by name: the file-level
+             match (file name, Megascans VarN fallback) for every slot.
+        Slots left without a set keep their imported material untouched.
+        Returns [(slot, texture_set_data, from_var_folder), ...].
+        """
+        from .utils import find_texture_set_by_name, find_texture_set_for_geo, strip_geo_suffix
+        path = rec['path']
+        file_suffix = strip_geo_suffix(path.stem)[1]
+
+        plan = []
+        for slot in rec['slots']:
+            obj = (cmds.listRelatives(slot['shape'], parent=True) or [''])[0]
+            # LOD tag for the channel pick: the object's own first (one file
+            # holding several LODs), else the file's
+            slot['geo_suffix'] = strip_geo_suffix(obj.split(':')[-1])[1] or file_suffix
+            ts, from_var = None, False
+            if slot['born_sg'] and slot['material']:
+                ts, from_var = find_texture_set_by_name(slot['material'], path, preferred_resolution,
+                                                        strip_patterns, cache)
+            if not ts and obj:
+                ts, from_var = find_texture_set_by_name(obj, path, preferred_resolution, strip_patterns, cache)
+            if ts:
+                plan.append((slot, ts, from_var))
+
+        if not plan:
+            ts, _, is_var = find_texture_set_for_geo(path, preferred_resolution, cache)
+            if ts:
+                plan = [(slot, ts, is_var) for slot in rec['slots']]
+        return plan
+
+    def _apply_texture_set_materials(self, records, gen, cache, no_reuse_file_nodes):
+        """
+        Plan, build and assign texture set materials for import records (see
+        _smart_import_geo_files()). Each distinct material - same set, same
+        resolved channels - is built once for the whole batch, however many
+        files/objects/face groups use it. Returns the number built.
+        """
+        import traceback
+        from .utils import resolve_texture_set_channels
+
+        sm = self.settings_manager
+        preferred_resolution = sm.get('smart_import', 'preferred_resolution', '4K')
+        var_displacement = sm.get('smart_import', 'var_import_displacement', False)
+        shader_type = sm.get('smart_import', 'shader_type', 'aiStandardSurface')
+        strip_patterns = gen.CONFIG.get('material_suffixes_to_strip', [])
+
+        plans = []
+        for rec in records:
+            rec['slots'] = self._collect_import_slots(rec)
+            plans.extend(self._plan_import_slots(rec, preferred_resolution, strip_patterns, cache))
+        if not plans:
+            return 0
+
+        # One TIF conversion pass (one progress dialog) for every set in the batch
+        sets = list({id(ts): ts for _, ts, _ in plans}.values())
+        variant_maps = [ts['variant_map'] for ts in sets]
+        if sm.get('smart_import', 'convert_to_tif', False):
+            from .utils import convert_variant_maps_to_tif
+            progress, on_progress = self._tif_conversion_progress_callback()
+            try:
+                variant_maps = convert_variant_maps_to_tif(variant_maps, progress_callback=on_progress)
+            finally:
+                progress.close()
+        variant_map_of = {id(ts): vm for ts, vm in zip(sets, variant_maps)}
+
+        # VarN-matched assets (Megascans plants, etc.) skip displacement by
+        # default - most don't need it. Opt-in via Texture Set Settings.
+        groups = {}
+        for slot, ts, from_var in plans:
+            channels = resolve_texture_set_channels(variant_map_of[id(ts)], slot['geo_suffix'],
+                                                    exclude_displacement=from_var and not var_displacement)
             if not channels:
-                return
+                continue
+            key = (ts['display'], tuple(sorted(channels.items())))
+            group = groups.setdefault(key, {'name': ts['display'], 'channels': channels, 'slots': []})
+            group['slots'].append(slot)
 
-            shapes = cmds.ls(new_nodes, dag=True, type=('mesh', 'nurbsSurface'), noIntermediate=True) or []
-            if not shapes:
-                return
-            transforms = list({cmds.listRelatives(s, parent=True, fullPath=True)[0] for s in shapes})
-            if not transforms:
-                return
+        built = 0
+        for group in groups.values():
+            shapes = list(dict.fromkeys(s['shape'] for s in group['slots']))
+            try:
+                _, sg = gen.build_texture_set_material(group['name'], group['channels'],
+                                                       shader_type=shader_type, disp_shapes=shapes,
+                                                       no_reuse_file_nodes=no_reuse_file_nodes)
+            except Exception as e:
+                traceback.print_exc()
+                print(f"[AutoMaterial] Failed to build material for '{group['name']}': {e}")
+                continue
+            built += 1
+            for slot in group['slots']:
+                slot['target'] = sg
 
-            shader_type = self.settings_manager.get('smart_import', 'shader_type', 'aiStandardSurface')
+        for rec in records:
+            self._assign_slot_targets(rec)
+        return built
 
-            import importlib.util
-            gen_path = Path(__file__).parent / 'smart_imports' / 'ddShaderNetworkGenerator.py'
-            spec = importlib.util.spec_from_file_location('ddShaderNetworkGenerator', str(gen_path))
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-
-            cmds.select(transforms, replace=True)
-            mod.build_from_texture_sets(
-                [{'name': ts_data['display'], 'channels': channels}],
-                shader_type=shader_type, assign_to_selection=True
-            )
-            self.safe_show_status(
-                f"✓ Auto-built material from texture set '{ts_data['display']}'", 3000
-            )
-
-            if self.settings_manager.get('smart_import', 'import_lod_proxy', False):
-                shading_group = None
-                for s in shapes:
-                    sgs = cmds.listConnections(s, type='shadingEngine') or []
-                    if sgs:
-                        shading_group = sgs[0]
-                        break
-                self._try_import_lod_proxy(geo_path, geo_suffix, shading_group)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[AutoMaterial] Failed for {geo_path.name}: {e}")
-
-    def _try_import_lod_proxy(self, geo_path, geo_suffix, shading_group):
+    def _assign_slot_targets(self, rec):
         """
-        Companion to _try_auto_assign_texture_set_material(): after a
-        "high"/untagged geo import gets its material built, also import a
-        lower-detail "LODN" proxy from the same folder (if one exists) and
-        assign it the SAME shading group - not a freshly built material, so
-        the proxy and the full-res geo genuinely share one material. Opt-in
-        via the 'smart_import.import_lod_proxy' setting; see
-        find_lod_proxy_for_geo() for the matching rules.
+        Move each slot's members to its new SG. A shape whose every slot goes
+        to the same SG is assigned as a whole object (a per-face split that
+        collapsed to one material doesn't linger as per-face assignments);
+        otherwise each face group moves on its own. Only SGs actually emptied
+        this way are recorded for the cleanup.
         """
-        if not shading_group:
+        by_shape = {}
+        for slot in rec['slots']:
+            by_shape.setdefault(slot['shape'], []).append(slot)
+
+        for shape, slots in by_shape.items():
+            targets = {s['target'] for s in slots}
+            moved = []
+            if len(targets) == 1 and None not in targets:
+                try:
+                    cmds.sets(shape, edit=True, forceElement=targets.pop())
+                    moved = slots
+                except Exception as e:
+                    print(f"[AutoMaterial] Assign failed on {shape}: {e}")
+            else:
+                for s in slots:
+                    # Never call cmds.sets() with an empty list - it'd act on the selection
+                    if not s['target'] or not s['members']:
+                        continue
+                    try:
+                        cmds.sets(s['members'], edit=True, forceElement=s['target'])
+                        moved.append(s)
+                    except Exception as e:
+                        print(f"[AutoMaterial] Assign failed on {s['members']}: {e}")
+            if moved:
+                rec['matched'] = True
+                rec['replaced_sgs'].update(s['sg'] for s in moved if s['sg'] and s['born_sg'])
+
+    def _share_primary_material(self, proxy_rec, primary_rec):
+        """
+        LOD proxy: each proxy slot gets the SAME shading group its primary
+        geo's slot with the same imported material got, falling back to the
+        primary's most used one - never a freshly built material, so the
+        proxy and the full-res geo genuinely share one material.
+        """
+        from collections import Counter
+        from .utils import strip_maya_uniquifier
+
+        by_material, targets = {}, []
+        for slot in primary_rec['slots']:
+            if not slot['target']:
+                continue
+            targets.append(slot['target'])
+            if slot['material']:
+                by_material.setdefault(slot['material'], slot['target'])
+                by_material.setdefault(strip_maya_uniquifier(slot['material']), slot['target'])
+        if not targets:
             return
+        fallback = Counter(targets).most_common(1)[0][0]
+
+        proxy_rec['slots'] = self._collect_import_slots(proxy_rec)
+        for slot in proxy_rec['slots']:
+            mat = slot['material']
+            slot['target'] = (mat and (by_material.get(mat) or by_material.get(strip_maya_uniquifier(mat)))) or fallback
+        self._assign_slot_targets(proxy_rec)
+        if proxy_rec['matched']:
+            self.safe_show_status(f"✓ Imported LOD proxy '{proxy_rec['path'].name}' and assigned material", 3000)
+
+    # Consumers that don't count as "still in use" - scene-wide bookkeeping
+    # every shading node is hooked into
+    # (node types - renderPartition's type is 'partition')
+    _CLEANUP_IGNORED_CONSUMERS = frozenset((
+        'defaultShaderList', 'defaultTextureList', 'defaultRenderUtilityList',
+        'partition', 'lightLinker', 'nodeGraphEditorInfo', 'hyperLayout',
+    ))
+
+    def _delete_replaced_import_shading(self, records):
+        """
+        Delete the shading networks the batch's own imports brought in that
+        the texture set materials replaced - and nothing else. Every one of
+        these must hold for a node to be deleted:
+          - this batch's imports created it: its UUID is in their
+            returnNewNodes (never a name check - a pre-existing node that
+            merely shares a name can't qualify);
+          - a shading group: its members were moved to a texture set
+            material by us, and it's now completely empty (a partially
+            replaced SG is still in use and stays);
+          - anything upstream of such an SG (material, file, place2d, ...):
+            it has no connection left into any node that stays in the scene.
+        Returns the number of nodes deleted.
+        """
+        born = set()
+        for rec in records:
+            born |= rec['born_uuids']
+        if not born:
+            return 0
+
+        def _born(node):
+            uuid = cmds.ls(node, uuid=True)
+            return bool(uuid) and uuid[0] in born
+
+        doomed = set()
+        for rec in records:
+            for sg in rec['replaced_sgs']:
+                if not cmds.objExists(sg) or not _born(sg) or cmds.sets(sg, q=True):
+                    continue
+                doomed.add(sg)
+                upstream = cmds.listHistory(sg, pruneDagObjects=True) or []
+                info = cmds.listConnections(sg, source=False, destination=True, type='materialInfo') or []
+                # per-face groupIds (kept below while still wired to a shape)
+                groups = cmds.listConnections(sg + '.groupNodes', source=True, destination=False) or []
+                for node in upstream + info + groups:
+                    if node != sg and not cmds.ls(node, type='dagNode') and _born(node):
+                        doomed.add(node)
+
+        def _info_owner_doomed(info):
+            owner = cmds.listConnections(info + '.shadingGroup', source=True, destination=False) or []
+            return bool(owner) and owner[0] in doomed
+
+        def _ignored(consumer):
+            if cmds.nodeType(consumer) in self._CLEANUP_IGNORED_CONSUMERS:
+                return True
+            # A doomed SG's own materialInfo (texture links) isn't a real use
+            return cmds.nodeType(consumer) == 'materialInfo' and _info_owner_doomed(consumer)
+
+        # Anything still feeding a node that stays in the scene stays too -
+        # and a materialInfo only goes together with its own SG
+        changed = True
+        while changed:
+            changed = False
+            for node in list(doomed):
+                if cmds.nodeType(node) == 'materialInfo' and not _info_owner_doomed(node):
+                    doomed.discard(node)
+                    changed = True
+                    continue
+                for consumer in set(cmds.listConnections(node, source=False, destination=True) or []):
+                    if consumer in doomed or _ignored(consumer):
+                        continue
+                    doomed.discard(node)
+                    changed = True
+                    break
+
+        # Never call cmds.delete() with an empty list - it'd delete the selection
+        doomed = [n for n in doomed if cmds.objExists(n) and not cmds.lockNode(n, q=True, lock=True)[0]]
+        if not doomed:
+            return 0
         try:
-            from .utils import find_lod_proxy_for_geo, get_importable_extensions, get_maya_import_type
-
-            proxy_path = find_lod_proxy_for_geo(geo_path, geo_suffix, get_importable_extensions())
-            if not proxy_path:
-                return
-
-            file_type = get_maya_import_type(proxy_path.suffix)
-            kwargs = dict(i=True, ignoreVersion=True, mergeNamespacesOnClash=False,
-                          namespace=':', options='v=0', preserveReferences=True, returnNewNodes=True)
-            if file_type:
-                kwargs['type'] = file_type
-            new_nodes = cmds.file(str(proxy_path), **kwargs) or []
-
-            shapes = cmds.ls(new_nodes, dag=True, type=('mesh', 'nurbsSurface'), noIntermediate=True) or []
-            if not shapes:
-                return
-            cmds.sets(shapes, edit=True, forceElement=shading_group)
-            self.safe_show_status(f"✓ Imported LOD proxy '{proxy_path.name}' and assigned material", 3000)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[LODProxy] Failed for {geo_path.name}: {e}")
+            cmds.delete(doomed)
+        except Exception:
+            for node in doomed:
+                if cmds.objExists(node):
+                    try:
+                        cmds.delete(node)
+                    except Exception as e:
+                        print(f"[AutoMaterial] Could not delete replaced node {node}: {e}")
+        print(f"[AutoMaterial] Removed {len(doomed)} replaced import shading node(s)")
+        return len(doomed)
 
     def import_selected_file(self):
         """Import selected file or navigate into folder"""
@@ -3307,19 +3710,21 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Texture sets: build shader network(s) directly (not file-node import)
         ts_assets = [a for a in assets if getattr(a, 'is_texture_set', False) and a.texture_set]
         if ts_assets:
-            self._build_texture_set_shaders(ts_assets)
             assets = [a for a in assets if not (getattr(a, 'is_texture_set', False) and a.texture_set)]
+            # Assign to the current Maya selection only when nothing but texture sets is imported
+            self._build_texture_set_shaders(ts_assets, assign_to_selection=not any(not a.is_folder for a in assets))
             if not assets:
                 return
-        
+
         imported_count = 0
         error_count = 0
         skipped_count = 0
-        
+        geo_paths = []
+
         # Get importable extensions from registry
-        from .utils import get_importable_extensions
+        from .utils import get_importable_extensions, to_maya_path
         maya_importable = get_importable_extensions()
-        
+
         for asset in assets:
             # Skip folders
             if asset.is_folder:
@@ -3349,7 +3754,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                         # Create substance texture node (treating like texture, Maya handles the rest)
                         # Node type might need adjustment based on actual plugin
                         substance_node = cmds.shadingNode('substance', asTexture=True)
-                        cmds.setAttr(f"{substance_node}.filePath", str(asset.file_path), type="string")
+                        cmds.setAttr(f"{substance_node}.filePath", to_maya_path(asset.file_path), type="string")
                         
                         imported_count += 1
                         self.safe_show_status(f"Substance texture created: {substance_node}", 2000)
@@ -3360,7 +3765,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 
                 elif asset.is_maya_file:
                     # Maya files - regular import
-                    cmds.file(str(asset.file_path), i=True, type="mayaAscii" if asset.extension == ".ma" else "mayaBinary")
+                    cmds.file(to_maya_path(asset.file_path), i=True, type="mayaAscii" if asset.extension == ".ma" else "mayaBinary")
                     imported_count += 1
                 
                 elif asset.is_script_file:
@@ -3368,7 +3773,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                     if asset.extension == ".mel":
                         # MEL script - use mel.eval to source it
                         # Convert backslashes to forward slashes for MEL
-                        mel_path = str(asset.file_path).replace('\\', '/')
+                        mel_path = to_maya_path(asset.file_path).replace('\\', '/')
                         mel.eval(f'source "{mel_path}"')
                         imported_count += 1
                     elif asset.extension == ".py":
@@ -3381,7 +3786,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 elif asset.is_image_file:
                     # Image files - create file texture node
                     file_node = cmds.shadingNode('file', asTexture=True, isColorManaged=True)
-                    cmds.setAttr(f"{file_node}.fileTextureName", str(asset.file_path), type="string")
+                    cmds.setAttr(f"{file_node}.fileTextureName", to_maya_path(asset.file_path), type="string")
                     
                     # Also create place2dTexture node and connect
                     place2d = cmds.shadingNode('place2dTexture', asUtility=True)
@@ -3407,42 +3812,27 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                     imported_count += 1
                     
                 else:
-                    # Other 3D file types (OBJ, FBX, ABC, USD, DAE, STL, etc.)
-                    from .utils import get_maya_import_type
-
-                    file_path = str(asset.file_path)
-
-                    # Get Maya import type from config
-                    file_type = get_maya_import_type(asset.extension)
-
-                    new_nodes = []
-                    if file_type:
-                        # Import with type specification
-                        new_nodes = cmds.file(file_path, i=True, type=file_type, ignoreVersion=True,
-                                 mergeNamespacesOnClash=False, namespace=':',
-                                 options='v=0', preserveReferences=True, returnNewNodes=True) or []
-                        imported_count += 1
-                    else:
-                        # Unknown 3D format, try without type specification
-                        try:
-                            new_nodes = cmds.file(file_path, i=True, returnNewNodes=True) or []
-                            imported_count += 1
-                        except:
-                            # Skip if import fails
-                            pass
-
-                    # Auto-build & assign a material from a matching texture
-                    # set (same folder or subfolders), if one is found
-                    self._try_auto_assign_texture_set_material(asset.file_path, new_nodes)
+                    # Other 3D file types (OBJ, FBX, ABC, USD, DAE, STL, etc.):
+                    # collected and batch-imported together below
+                    geo_paths.append(asset.file_path)
 
             except Exception as e:
                 error_count += 1
                 self.safe_show_status(f"Import error ({asset.name}): {e}", 3000)
                 print(f"Import error {asset.name}: {e}")
-        
+
+        # All geo in one batch, then auto-built texture set materials
+        materials_built = 0
+        if geo_paths:
+            geo_imported, geo_failed, materials_built = self._smart_import_geo_files(geo_paths)
+            imported_count += geo_imported
+            error_count += geo_failed
+
         # Summary message
         if imported_count > 0:
             msg = f"✓ Imported {imported_count} file(s)"
+            if materials_built > 0:
+                msg += f", {materials_built} texture set material(s)"
             if error_count > 0:
                 msg += f", {error_count} error(s)"
             if skipped_count > 0:
@@ -3464,11 +3854,13 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             print("Maya not available")
             return
         
+        from .utils import to_maya_path
+
         for asset in assets:
             try:
                 if asset.is_maya_file:
                     namespace = asset.file_path.stem  # filename without extension
-                    cmds.file(str(asset.file_path), r=True, namespace=namespace)
+                    cmds.file(to_maya_path(asset.file_path), r=True, namespace=namespace)
                     self.safe_show_status(f"Referenced: {asset.name} ({namespace})")
                 else:
                     self.safe_show_status(f"Reference only supported for Maya files")
@@ -3711,12 +4103,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # The position will be saved in closeEvent()
         
         # Use timer to detect end of drag (no more moves for 100ms = drag ended)
-        if hasattr(self, '_splitter_end_timer'):
-            self._splitter_end_timer.stop()
-        
-        self._splitter_end_timer = QTimer()
-        self._splitter_end_timer.setSingleShot(True)
-        self._splitter_end_timer.timeout.connect(self._on_splitter_drag_ended)
+        if not hasattr(self, '_splitter_end_timer'):
+            self._splitter_end_timer = QTimer(self)  # parented: goes with the window
+            self._splitter_end_timer.setSingleShot(True)
+            self._splitter_end_timer.timeout.connect(self._on_splitter_drag_ended)
         self._splitter_end_timer.start(100)  # 100ms delay to detect end
     
     def _on_splitter_drag_ended(self):
@@ -3766,12 +4156,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     def on_column_width_changed(self, pos, index):
         """Refresh list view when column widths change"""
         # Use timer to debounce rapid column resizing
-        if hasattr(self, '_column_resize_timer'):
-            self._column_resize_timer.stop()
-        
-        self._column_resize_timer = QTimer()
-        self._column_resize_timer.setSingleShot(True)
-        self._column_resize_timer.timeout.connect(self._finish_column_resize)
+        if not hasattr(self, '_column_resize_timer'):
+            self._column_resize_timer = QTimer(self)  # parented: goes with the window
+            self._column_resize_timer.setSingleShot(True)
+            self._column_resize_timer.timeout.connect(self._finish_column_resize)
         self._column_resize_timer.start(50)  # Very short delay for responsive feel
     
     def _finish_column_resize(self):
@@ -3781,12 +4169,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             self.file_list.scheduleDelayedItemsLayout()
         
         # Request thumbnails for newly visible items
-        if hasattr(self, '_column_thumb_timer'):
-            self._column_thumb_timer.stop()
-        
-        self._column_thumb_timer = QTimer()
-        self._column_thumb_timer.setSingleShot(True)
-        self._column_thumb_timer.timeout.connect(self.request_thumbnails_for_visible_items)
+        if not hasattr(self, '_column_thumb_timer'):
+            self._column_thumb_timer = QTimer(self)  # parented: goes with the window
+            self._column_thumb_timer.setSingleShot(True)
+            self._column_thumb_timer.timeout.connect(self.request_thumbnails_for_visible_items)
         self._column_thumb_timer.start(200)  # Wait 200ms after column resize stops
     
     def on_nav_splitter_moved(self, pos, index):
@@ -3880,12 +4266,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         super().resizeEvent(event)
         
         # Use timer to debounce resize events (avoid generating on every pixel)
-        if hasattr(self, '_resize_timer'):
-            self._resize_timer.stop()
-        
-        self._resize_timer = QTimer()
-        self._resize_timer.setSingleShot(True)
-        self._resize_timer.timeout.connect(self.request_thumbnails_for_visible_items)
+        if not hasattr(self, '_resize_timer'):
+            self._resize_timer = QTimer(self)  # parented: goes with the window
+            self._resize_timer.setSingleShot(True)
+            self._resize_timer.timeout.connect(self.request_thumbnails_for_visible_items)
         self._resize_timer.start(300)  # Wait 300ms after resize stops
     
     def show_settings_dialog(self):
@@ -3928,18 +4312,14 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Apply preview settings to PreviewPanel
         preview_resolution = self.settings_manager.get("preview", "resolution", 1024)
         hdr_cache_size = self.settings_manager.get("preview", "hdr_cache_size", 5)
-        sequence_cache_size_mb = self.settings_manager.get("preview", "sequence_cache_size_mb", 1024)
         if hasattr(self, 'preview_panel'):
             self.preview_panel.max_preview_size = preview_resolution
             self.preview_panel.hdr_cache_max_size = hdr_cache_size
             self.preview_panel.max_hdr_cache_size = hdr_cache_size  # Both attributes for compatibility
             # Clear and resize cache
             self.preview_panel.hdr_raw_cache.clear()
-            if hasattr(self.preview_panel, 'sequence_frame_cache'):
-                self.preview_panel.sequence_frame_cache.set_max_size_mb(sequence_cache_size_mb)
             if DEBUG_MODE:
-                print(f"[Browser] Preview resolution set to {preview_resolution}px, HDR cache size: {hdr_cache_size}, "
-                      f"sequence cache size: {sequence_cache_size_mb}MB")
+                print(f"[Browser] Preview resolution set to {preview_resolution}px, HDR cache size: {hdr_cache_size}")
         
         # Apply thumbnail generation size and quality from settings
         thumbnail_generation_size = self.settings_manager.get("thumbnails", "size", 128)
@@ -4098,12 +4478,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         if hasattr(self, 'file_list') and obj == self.file_list.viewport():
             if event.type() == QtCore.QEvent.Resize:
                 # Use timer to debounce rapid resize events (during splitter drag)
-                if hasattr(self, '_viewport_resize_timer'):
-                    self._viewport_resize_timer.stop()
-                
-                self._viewport_resize_timer = QTimer()
-                self._viewport_resize_timer.setSingleShot(True)
-                self._viewport_resize_timer.timeout.connect(self.request_thumbnails_for_visible_items)
+                if not hasattr(self, '_viewport_resize_timer'):
+                    self._viewport_resize_timer = QTimer(self)  # parented: goes with the window
+                    self._viewport_resize_timer.setSingleShot(True)
+                    self._viewport_resize_timer.timeout.connect(self.request_thumbnails_for_visible_items)
                 self._viewport_resize_timer.start(100)  # Wait 100ms after resize stops
                 return False
         

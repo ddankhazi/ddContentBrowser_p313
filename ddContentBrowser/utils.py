@@ -6,6 +6,7 @@ Helper functions for Maya integration and common operations
 import os
 import sys
 import threading
+import time
 
 
 def get_external_libs_dir():
@@ -24,30 +25,6 @@ def get_external_libs_dir():
     if os.path.isdir(versioned):
         return versioned
     return os.path.join(base, 'external_libs')
-
-
-def get_mayapy_executable():
-    """
-    Locate mayapy.exe (Maya's standalone/headless Python interpreter) next
-    to the currently running Maya executable.
-
-    Used to spawn sequence-playback decode worker subprocesses (see
-    sequence_decode_worker.py) as genuinely separate OS processes rather
-    than threads within Maya's own process - confirmed necessary because
-    calling OpenImageIO/OpenCV concurrently from ThreadPoolExecutor worker
-    threads inside Maya's process crashed Maya outright (a native crash,
-    no Python traceback, immediately after the first background decode
-    requests were submitted).
-
-    Falls back to sys.executable if mayapy.exe isn't found next to it -
-    e.g. when testing standalone, where sys.executable already IS a plain
-    python.exe capable of running the worker script directly.
-    """
-    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-    mayapy = os.path.join(exe_dir, 'mayapy.exe')
-    if os.path.isfile(mayapy):
-        return mayapy
-    return sys.executable
 
 
 _openexr_import_cache = {}
@@ -116,104 +93,6 @@ def import_openexr():
 
         _openexr_import_cache['result'] = (OpenEXR, Imath)
         return OpenEXR, Imath
-
-
-def group_oiio_exr_channels(channelnames):
-    """
-    Group a flat OpenImageIO channel-name list the same way OpenEXR's
-    Python OpenEXR.File().channels() API groups them: channels sharing a
-    dotted prefix (or no prefix) whose suffixes include R, G, B (and
-    optionally A) collapse into one entry keyed by the prefix (or
-    "RGB"/"RGBA" when there's no prefix, e.g. plain "R"/"G"/"B" channels
-    group into "RGB", "diffuse.R"/"diffuse.G"/"diffuse.B" group into
-    "diffuse"); every other channel (Z, N.X, N.Y, N.Z, ...) keeps its own
-    full name as the key. Verified to match OpenEXR.File()'s real grouping
-    exactly against both single-layer and multi-AOV EXRs.
-
-    This lets code written against OpenEXR's grouped-dict API (see
-    read_exr_via_oiio() below) be ported to OpenImageIO without changing
-    the channel-name lookup/fallback logic itself - see
-    cache.py's _generate_exr_thumbnail_optimized() and preview_panel.py's
-    load_exr_channel() for both call sites.
-
-    Returns an OrderedDict: group key -> list of member channel names (in
-    R, G, B[, A] order for grouped entries; a single-item list otherwise),
-    in first-seen order.
-    """
-    from collections import OrderedDict
-
-    by_prefix = OrderedDict()
-    for name in channelnames:
-        if '.' in name:
-            prefix, suffix = name.rsplit('.', 1)
-        else:
-            prefix, suffix = '', name
-        by_prefix.setdefault(prefix, OrderedDict())[suffix] = name
-
-    groups = OrderedDict()
-    used = set()
-    for prefix, suffix_map in by_prefix.items():
-        if 'R' in suffix_map and 'G' in suffix_map and 'B' in suffix_map:
-            has_alpha = 'A' in suffix_map
-            key = prefix if prefix else ('RGBA' if has_alpha else 'RGB')
-            members = [suffix_map['R'], suffix_map['G'], suffix_map['B']]
-            if has_alpha:
-                members.append(suffix_map['A'])
-            groups[key] = members
-            used.update(members)
-    for name in channelnames:
-        if name not in used:
-            groups[name] = [name]
-    return groups
-
-
-def read_exr_via_oiio(file_path):
-    """
-    Read an EXR file's full pixel data via OpenImageIO - measured ~2-3x
-    faster than the OpenEXR Python binding (OpenEXR.File()) for typical
-    single-layer texture/HDRI EXRs, and still meaningfully faster on
-    multi-AOV render EXRs, in testing during a thumbnail-generation
-    performance investigation.
-
-    Returns (width, height, channels) where channels is a dict of
-    group-key -> numpy float32 array (2D for a single channel, 3D
-    (H,W,3)/(H,W,4) for a grouped RGB/RGBA/layer entry) - grouped via
-    group_oiio_exr_channels() so it has the same shape as iterating
-    OpenEXR.File().channels().items() and reading each entry's .pixels
-    (just without the .pixels attribute - index the dict value directly).
-
-    Raises OSError/ValueError on failure (missing file, unreadable
-    format, no pixel data, etc.) - callers should catch as part of their
-    existing error handling, same as they would OpenEXR.File() raising.
-    """
-    import sys
-    import numpy as np
-
-    external_libs = get_external_libs_dir()
-    if external_libs not in sys.path:
-        sys.path.append(external_libs)
-    from OpenImageIO import ImageInput
-
-    inp = ImageInput.open(str(file_path))
-    if not inp:
-        raise OSError(f"OpenImageIO could not open {file_path}")
-    spec = inp.spec()
-    width, height = spec.width, spec.height
-    pixels = inp.read_image()
-    inp.close()
-    if pixels is None:
-        raise ValueError(f"OpenImageIO returned no pixel data for {file_path}")
-
-    img = np.array(pixels, dtype=np.float32)
-    name_to_idx = {name: i for i, name in enumerate(spec.channelnames)}
-    grouped = group_oiio_exr_channels(spec.channelnames)
-
-    channels = {}
-    for key, members in grouped.items():
-        idxs = [name_to_idx[m] for m in members]
-        channels[key] = img[:, :, idxs] if len(idxs) > 1 else img[:, :, idxs[0]]
-
-    return width, height, channels
 
 
 # Maya imports
@@ -550,6 +429,168 @@ def get_browser_data_dir():
     data_dir = Path.home() / ".ddContentBrowser"
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
+
+
+# ============================================================================
+# UNC -> MAPPED DRIVE PATH NORMALIZATION
+# ============================================================================
+#
+# Browsing a network location through its UNC name (a UNC favourite, a UNC
+# library root, the Windows network tree, ...) makes every asset path come
+# out as \\server\share\... Handing that straight to Maya bakes the UNC form
+# into file nodes / references, which breaks for anyone whose pipeline is
+# built around the mapped drive letter (and is unreadable in the Attribute
+# Editor). Everything that hands a path to Maya goes through to_maya_path()
+# below, which swaps a UNC prefix back for its mapped drive letter.
+
+_unc_drive_map_cache = None
+_unc_drive_map_built_at = 0.0
+_unc_drive_map_lock = threading.Lock()
+# Minimum seconds between re-queries after a UNC path fails to match.
+_UNC_DRIVE_MAP_TTL = 30.0
+
+
+def _build_unc_drive_map():
+    """
+    Query Windows for every mapped network drive and return
+    {unc_root_lowercase: "X:"}, e.g. {"\\\\svsmb.digicpictures.local\\w": "W:"}.
+
+    Empty dict on non-Windows, or if the lookup fails for any reason - in
+    that case to_maya_path() simply passes paths through unchanged.
+    """
+    mapping = {}
+    if os.name != 'nt':
+        return mapping
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        mpr = ctypes.WinDLL('mpr', use_last_error=True)
+        WNetGetConnectionW = mpr.WNetGetConnectionW
+        WNetGetConnectionW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR,
+                                       ctypes.POINTER(wintypes.DWORD)]
+        WNetGetConnectionW.restype = wintypes.DWORD
+        drive_bits = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception as e:
+        print(f"[PathMap] Could not query mapped drives: {e}")
+        return mapping
+
+    for i in range(26):
+        if not (drive_bits >> i) & 1:
+            continue
+        local = f"{chr(ord('A') + i)}:"
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(size.value)
+        try:
+            if WNetGetConnectionW(local, buf, ctypes.byref(size)) != 0:
+                continue  # not a network drive
+        except Exception:
+            continue
+        remote = (buf.value or '').rstrip('\\/')
+        if remote.startswith('\\\\'):
+            # Several letters can map to the same share - first (lowest)
+            # letter wins, so the result is stable across sessions.
+            mapping.setdefault(remote.lower(), local)
+    return mapping
+
+
+def get_unc_drive_map(refresh=False):
+    """Cached _build_unc_drive_map(). Pass refresh=True to re-query (drives
+    can be mapped/unmapped while the browser is open)."""
+    global _unc_drive_map_cache, _unc_drive_map_built_at
+    with _unc_drive_map_lock:
+        if _unc_drive_map_cache is None or refresh:
+            _unc_drive_map_cache = _build_unc_drive_map()
+            _unc_drive_map_built_at = time.time()
+        return _unc_drive_map_cache
+
+
+def _refresh_unc_drive_map_if_stale():
+    """
+    Re-query the drive map, but at most once per _UNC_DRIVE_MAP_TTL seconds.
+    Called by unc_to_drive() only after a UNC path failed to match, so a
+    drive mapped mid-session starts working without re-querying Windows for
+    every one of the hundreds of paths a texture-set import touches.
+
+    Returns the fresh map, or None if the last query is still recent
+    (in which case the caller has already tried it and should give up).
+    """
+    with _unc_drive_map_lock:
+        if time.time() - _unc_drive_map_built_at < _UNC_DRIVE_MAP_TTL:
+            return None
+    return get_unc_drive_map(refresh=True)
+
+
+def unc_to_drive(path):
+    """
+    Rewrite a UNC path to its mapped drive letter, if one exists:
+
+        \\\\svsmb.digicpictures.local\\W\\library\\foo.tif  ->  W:\\library\\foo.tif
+
+    Anything that isn't a UNC path, or whose share isn't mapped on this
+    machine, is returned unchanged. The input's separator style is
+    preserved (a //server/share/... path comes back as X:/...).
+    """
+    if not path:
+        return path
+    original = str(path)
+    if not (original.startswith('\\\\') or original.startswith('//')):
+        return original
+
+    forward_slashed = '\\' not in original
+    norm = original.replace('/', '\\')
+
+    def _finish(result):
+        if len(result) == 2:  # share root -> keep it a directory path ("W:\")
+            result += '\\'
+        return result.replace('\\', '/') if forward_slashed else result
+
+    lowered = norm.lower()
+
+    def _match(drive_map):
+        """Drive path for `norm` against this map, or None if no share matches."""
+        # Exact prefix match, longest first (a share can be mounted at
+        # several depths, e.g. \\srv\lib and \\srv\lib\megascans).
+        best = None
+        for unc_root, drive in drive_map.items():
+            if lowered == unc_root or lowered.startswith(unc_root + '\\'):
+                if best is None or len(unc_root) > len(best[0]):
+                    best = (unc_root, drive)
+        if best:
+            return _finish(best[1] + norm[len(best[0]):])
+
+        # Hostname-alias fallback: the path may spell the server out as an
+        # FQDN while the drive was mapped with the short name (or vice
+        # versa), e.g. \\svsmb.digicpictures.local\W vs. a W: on \\svsmb\W.
+        parts = norm[2:].split('\\', 2)
+        if len(parts) >= 2:
+            host_short = parts[0].split('.')[0].lower()
+            share = parts[1].lower()
+            rest = '\\' + parts[2] if len(parts) > 2 else ''
+            for unc_root, drive in drive_map.items():
+                mapped = unc_root[2:].split('\\')
+                if len(mapped) >= 2 and mapped[1] == share and mapped[0].split('.')[0] == host_short:
+                    return _finish(drive + rest)
+        return None
+
+    result = _match(get_unc_drive_map())
+    if result is None:
+        # A miss may just mean the drive was mapped after the cache was
+        # built, so re-query once (rate-limited) before giving up.
+        fresh = _refresh_unc_drive_map_if_stale()
+        if fresh is not None:
+            result = _match(fresh)
+    return result if result is not None else original
+
+
+def to_maya_path(path):
+    """
+    Normalize a path on its way into Maya (file nodes, imports, references,
+    drag & drop MEL, ...). Currently that means UNC -> mapped drive letter;
+    see unc_to_drive(). Always returns a str, so Path objects can be passed
+    straight in.
+    """
+    return unc_to_drive(str(path)) if path is not None else path
 
 
 # ============================================================================
@@ -1165,7 +1206,13 @@ def format_sequence_pattern(base_name: str, padding: int, separator: str, extens
 # building agree on which suffix maps to which material channel.
 TEXTURE_CHANNEL_ALIASES = {
     "baseColor":    ["basecolor", "base_color", "albedo", "diffuse", "diffuse_color", "diff", "color", "col", "clr"],
-    "roughness":    ["roughness", "rough", "glossiness", "gloss", "rgh"],
+    "roughness":    ["roughness", "rough", "rgh"],
+    # Gloss is the INVERSE of roughness (gloss = 1 - roughness), so it gets
+    # its own channel rather than being aliased onto "roughness" - wiring a
+    # gloss map straight into a roughness input renders everything backwards
+    # (shiny where it should be matte). The shader builder inverts it on the
+    # way into the roughness input; a set shipping both prefers roughness.
+    "gloss":        ["glossiness", "gloss", "gls"],
     "metalness":    ["metalness", "metallic", "metal", "met"],
     "normal":       ["normal", "normalmap", "normal_gl", "normal_dx", "normalgl", "normaldx",
                       "nor_gl", "nor_dx", "norgl", "nordx", "nrm", "nor", "norm", "n"],
@@ -1625,6 +1672,21 @@ def convert_variant_map_to_tif(variant_map: dict, progress_callback=None) -> dic
     return {key: results.get(p, p) for key, p in variant_map.items()}
 
 
+def convert_variant_maps_to_tif(variant_maps, progress_callback=None):
+    """
+    convert_variant_map_to_tif() for several variant_maps in one combined
+    pass - one running progress count for a whole batch import, and a file
+    shared by several maps is only converted once.
+
+    Returns a list of converted maps, same order as variant_maps.
+    """
+    results = _convert_paths_to_tif(dict.fromkeys(p for vm in variant_maps for p in vm.values()),
+                                    progress_callback)
+    if not results:
+        return list(variant_maps)
+    return [{key: results.get(p, p) for key, p in vm.items()} for vm in variant_maps]
+
+
 def convert_texture_sets_to_tif(channels_list, progress_callback=None):
     """
     Convert non-EXR raster textures across MULTIPLE texture sets in one
@@ -1659,7 +1721,7 @@ def channel_paths_from_channels(channels: dict) -> dict:
 
 # Channel priority for choosing a texture set's representative (thumbnail) file.
 _TEXTURE_SET_THUMBNAIL_PRIORITY = [
-    "baseColor", "emission", "roughness", "metalness", "normal",
+    "baseColor", "emission", "roughness", "gloss", "metalness", "normal",
     "height", "displacement", "opacity", "transmission", "ao",
 ]
 
@@ -1786,6 +1848,8 @@ _GEO_SUFFIX_REGEX = re.compile(r'_(High|LOD\d+)$', re.IGNORECASE)
 _RESOLUTION_TAG_REGEX = re.compile(r'_(\d+K)$', re.IGNORECASE)
 _TX_SET_SUFFIX_REGEX = re.compile(r' \(TX(?: Annotated)?(?: \d+)?\)$')
 _VAR_FOLDER_REGEX = re.compile(r'^Var\d+$', re.IGNORECASE)
+_MAYA_UNIQUIFIER_REGEX = re.compile(r'(?<=[^\d_])\d+$')
+_FBX_ASCII_ESCAPE_REGEX = re.compile(r'FBXASC(\d{3})')
 
 
 def strip_geo_suffix(name: str):
@@ -1814,7 +1878,94 @@ def _strip_resolution_tag(name: str):
     return name[:m.start()], m.group(1).upper()
 
 
-def find_texture_set_for_geo(geo_path, preferred_resolution="4K"):
+def _images_in_dir(directory, recursive=False):
+    """Image files directly in `directory` (or anywhere below it, if recursive)."""
+    try:
+        it = directory.rglob('*') if recursive else directory.iterdir()
+        return [p for p in it if p.is_file() and get_extension_category(p.suffix.lower()) == 'images']
+    except OSError:
+        return []
+
+
+def _texture_sets_in_dir(directory, recursive=False, cache=None):
+    """
+    The texture sets (group_texture_sets() values) built from the images in
+    `directory`. `cache` is an optional plain dict owned by the caller that
+    memoizes this per directory - a batch import asks about the same few
+    folders over and over (every geo, every imported material/object), and
+    each scan + grouping would otherwise hit the disk/network again.
+    """
+    key = ('sets', os.path.normcase(str(directory)), recursive)
+    if cache is not None and key in cache:
+        return cache[key]
+    images = _images_in_dir(directory, recursive)
+    sets = list(group_texture_sets(images)[0].values()) if images else []
+    if cache is not None:
+        cache[key] = sets
+    return sets
+
+
+def _named_search_dirs(geo_path, cache=None):
+    """The folders a geo's texture set is looked up in by name, in priority
+    order: the geo's own folder, then its immediate subfolders (sorted)."""
+    parent = geo_path.parent
+    key = ('dirs', os.path.normcase(str(parent)))
+    if cache is not None and key in cache:
+        return cache[key]
+    try:
+        subdirs = sorted((d for d in parent.iterdir() if d.is_dir()), key=lambda d: d.name.lower())
+    except OSError:
+        subdirs = []
+    dirs = [parent] + subdirs
+    if cache is not None:
+        cache[key] = dirs
+    return dirs
+
+
+def _var_textures_dir(geo_path, cache=None):
+    """
+    For a geo sitting in a Megascans-style "VarN" folder: the folder its
+    shared texture set lives in - Textures/Atlas if present, else the whole
+    Textures folder (searched recursively). None for any other geo.
+
+    Some 3D-plant assets ship BOTH an "Atlas" set (full 3D mesh, the VarN
+    geo) and a "Billboard" set (a separate impostor-plane geo, not a VarN
+    mesh) side by side under Textures/. Scanning the whole tree would mix
+    both together, so the Atlas subfolder alone is preferred when present -
+    that's always the one a VarN mesh needs.
+    """
+    if not _VAR_FOLDER_REGEX.match(geo_path.parent.name):
+        return None
+    asset_root = geo_path.parent.parent
+    key = ('var', os.path.normcase(str(asset_root)))
+    if cache is not None and key in cache:
+        return cache[key]
+
+    def _child_dir(directory, name):
+        try:
+            for d in directory.iterdir():
+                if d.is_dir() and d.name.lower() == name:
+                    return d
+        except OSError:
+            pass
+        return None
+
+    textures_dir = _child_dir(asset_root, 'textures')
+    search_dir = (_child_dir(textures_dir, 'atlas') or textures_dir) if textures_dir else None
+    if cache is not None:
+        cache[key] = search_dir
+    return search_dir
+
+
+def _best_texture_set(matches, preferred_resolution):
+    """Pick one set from [(set_data, res_tag, rank), ...]: lowest rank first
+    (how closely the name matched), then non-.tx over .tx, then the
+    preferred resolution over others."""
+    matches.sort(key=lambda m: (m[2], ' (TX' in m[0]['display'], m[1] != preferred_resolution))
+    return matches[0][0]
+
+
+def find_texture_set_for_geo(geo_path, preferred_resolution="4K", cache=None):
     """
     Find the texture set matching an imported geo file, for auto material
     building.
@@ -1839,15 +1990,12 @@ def find_texture_set_for_geo(geo_path, preferred_resolution="4K"):
     "qheqG_4K" pair both resolve to "qheqG"), with the same non-.tx /
     preferred_resolution tie-break the named search above uses. Genuinely
     distinct base names (unrelated sets mixed together) still refuse to
-    guess. Some assets ship
-    both an "Atlas" set (for the VarN mesh) and a separate "Billboard" set
-    (for a different, non-VarN impostor geo) side by side under Textures/ -
-    when an "Atlas" subfolder exists, only it is searched (a VarN mesh
-    always needs the Atlas set), otherwise the whole Textures tree is
-    searched recursively.
+    guess. When an "Atlas" subfolder exists under Textures, only it is
+    searched (see _var_textures_dir()).
 
     Args:
         geo_path: Path (or str) to the imported geo file.
+        cache: optional dict reused across calls (see _texture_sets_in_dir()).
 
     Returns:
         (texture_set_data, geo_suffix, is_var_match) - texture_set_data is
@@ -1863,99 +2011,131 @@ def find_texture_set_for_geo(geo_path, preferred_resolution="4K"):
     geo_base, geo_suffix = strip_geo_suffix(geo_path.stem)
     target = geo_base.lower()
 
-    def _images_in(directory, recursive=False):
-        try:
-            it = directory.rglob('*') if recursive else directory.iterdir()
-            return [p for p in it if p.is_file() and get_extension_category(p.suffix.lower()) == 'images']
-        except OSError:
-            return []
-
-    def _search(directory):
-        candidates = _images_in(directory)
-        if not candidates:
-            return None
-
-        sets, _ = group_texture_sets(candidates)
-
+    for directory in _named_search_dirs(geo_path, cache):
         matches = []
-        for data in sets.values():
+        for data in _texture_sets_in_dir(directory, cache=cache):
             clean = _TX_SET_SUFFIX_REGEX.sub('', data['display'])
             clean_base, res_tag = _strip_resolution_tag(clean)
             if clean_base.lower() == target:
-                matches.append((data, res_tag))
-        if not matches:
-            return None
+                matches.append((data, res_tag, 0))
+        if matches:
+            return _best_texture_set(matches, preferred_resolution), geo_suffix, False
 
-        # Prefer non-.tx over .tx, then the preferred resolution over others.
-        matches.sort(key=lambda m: (' (TX' in m[0]['display'], m[1] != preferred_resolution))
-        return matches[0][0]
-
-    match = _search(geo_path.parent)
-    if match:
-        return match, geo_suffix, False
-
-    try:
-        subdirs = sorted((d for d in geo_path.parent.iterdir() if d.is_dir()), key=lambda d: d.name.lower())
-    except OSError:
-        subdirs = []
-    for sub in subdirs:
-        match = _search(sub)
-        if match:
-            return match, geo_suffix, False
-
-    # "VarN" fallback: look for a sibling "Textures" folder one level up.
-    if _VAR_FOLDER_REGEX.match(geo_path.parent.name):
-        asset_root = geo_path.parent.parent
-        textures_dir = None
-        try:
-            for d in asset_root.iterdir():
-                if d.is_dir() and d.name.lower() == 'textures':
-                    textures_dir = d
-                    break
-        except OSError:
-            pass
-
-        if textures_dir:
-            # Some 3D-plant assets ship BOTH an "Atlas" set (full 3D mesh,
-            # the VarN geo this fallback is for) and a "Billboard" set (a
-            # separate impostor-plane geo, not a VarN mesh) side by side
-            # under Textures/. Scanning the whole tree recursively would mix
-            # both sets together and produce >1 result, so the old "exactly
-            # one set found" check would fail and silently skip the match.
-            # Prefer the Atlas subfolder alone when present - that's always
-            # the one a VarN mesh needs; only fall back to scanning the
-            # whole tree if there's no dedicated Atlas subfolder.
-            atlas_dir = None
-            try:
-                for d in textures_dir.iterdir():
-                    if d.is_dir() and d.name.lower() == 'atlas':
-                        atlas_dir = d
-                        break
-            except OSError:
-                pass
-
-            search_dir = atlas_dir or textures_dir
-            candidates = _images_in(search_dir, recursive=True)
-            if candidates:
-                sets, _ = group_texture_sets(candidates)
-                # Multiple sets can land here purely from resolution/.tx
-                # variants of the same material (e.g. "qheqG_2K" and
-                # "qheqG_4K" grouped as separate sets) - collapse those with
-                # the same non-.tx / preferred-resolution tie-break used by
-                # the named search above, rather than requiring there be
-                # only a single set. Genuinely distinct materials (e.g. an
-                # Atlas set mixed with a Billboard set when there's no
-                # dedicated Atlas subfolder) still refuse to guess.
-                tagged = []
-                for data in sets.values():
-                    clean = _TX_SET_SUFFIX_REGEX.sub('', data['display'])
-                    clean_base, res_tag = _strip_resolution_tag(clean)
-                    tagged.append((data, clean_base.lower(), res_tag))
-                if tagged and len({t[1] for t in tagged}) == 1:
-                    tagged.sort(key=lambda t: (' (TX' in t[0]['display'], t[2] != preferred_resolution))
-                    return tagged[0][0], geo_suffix, True
+    # "VarN" fallback: Multiple sets can land here purely from resolution/.tx
+    # variants of the same material (e.g. "qheqG_2K" and "qheqG_4K" grouped
+    # as separate sets) - collapse those with the same tie-break used above,
+    # rather than requiring there be only a single set. Genuinely distinct
+    # materials (e.g. an Atlas set mixed with a Billboard set when there's
+    # no dedicated Atlas subfolder) still refuse to guess.
+    var_dir = _var_textures_dir(geo_path, cache)
+    if var_dir:
+        tagged = []
+        for data in _texture_sets_in_dir(var_dir, recursive=True, cache=cache):
+            clean = _TX_SET_SUFFIX_REGEX.sub('', data['display'])
+            clean_base, res_tag = _strip_resolution_tag(clean)
+            tagged.append((data, clean_base.lower(), res_tag))
+        if tagged and len({t[1] for t in tagged}) == 1:
+            return _best_texture_set([(t[0], t[2], 0) for t in tagged], preferred_resolution), geo_suffix, True
 
     return None, geo_suffix, False
+
+
+def strip_maya_uniquifier(name: str) -> str:
+    """Drop a trailing number glued straight onto a node name - what Maya
+    appends on a name clash (RockA_MAT -> RockA_MAT1). Numbers after an
+    underscore (Rock_01) are left alone, those are usually meaningful."""
+    return _MAYA_UNIQUIFIER_REGEX.sub('', name)
+
+
+def _normalize_match_name(name: str) -> str:
+    """Lowercase, with every run of non-alphanumerics folded to a single
+    '_' - Maya node names can't hold the spaces/dashes texture file names
+    can, so both sides are compared in this form."""
+    return re.sub(r'[^0-9a-z]+', '_', name.lower()).strip('_')
+
+
+def _name_match_keys(name, strip_patterns=()):
+    """
+    Candidate texture set base names for a Maya node name (an imported
+    material or geo object), as up to two tiers, most exact first:
+      1. the name itself, plus the name with the configured material
+         suffixes (_MAT, _mtl, ...), the geo _High/_LODn tag and a _<N>K
+         resolution tag stripped;
+      2. the same after strip_maya_uniquifier() - only tried when tier 1
+         found nothing anywhere, since a trailing number can be meaningful.
+    FBX-escaped characters (FBXASC032 = space, ...) are decoded first.
+    """
+    name = name.split('|')[-1].split(':')[-1]
+    name = _FBX_ASCII_ESCAPE_REGEX.sub(lambda m: chr(int(m.group(1))), name)
+
+    def _variants(base):
+        out = [base]
+        for pat in strip_patterns:
+            for b in list(out):
+                stripped = re.sub(pat, '', b, flags=re.IGNORECASE)
+                if stripped and stripped not in out:
+                    out.append(stripped)
+        for strip in (lambda s: strip_geo_suffix(s)[0], lambda s: _strip_resolution_tag(s)[0]):
+            for b in list(out):
+                stripped = strip(b)
+                if stripped and stripped not in out:
+                    out.append(stripped)
+        return [k for k in dict.fromkeys(_normalize_match_name(v) for v in out) if k]
+
+    tiers = [_variants(name)]
+    unique_less = strip_maya_uniquifier(name)
+    if unique_less and unique_less != name:
+        tier2 = [k for k in _variants(unique_less) if k not in tiers[0]]
+        if tier2:
+            tiers.append(tier2)
+    return [t for t in tiers if t]
+
+
+def find_texture_set_by_name(name, geo_path, preferred_resolution="4K", strip_patterns=(), cache=None):
+    """
+    Find the texture set named after a node that came in with an imported
+    geo file - one of its materials, or one of its geo objects - so a
+    multi-object or per-face-assigned file can give each part its own
+    texture set, instead of one set for the whole file.
+
+    Looked up in the same places as find_texture_set_for_geo(), in the same
+    priority: the geo file's own folder, then its immediate subfolders,
+    then (for a geo in a "VarN" folder) the shared Textures/Atlas folder.
+    Within a folder, the closest name variant wins (see _name_match_keys()),
+    then the usual non-.tx / preferred_resolution tie-break.
+
+    Args:
+        name: the Maya node name to match (namespace/DAG path is ignored).
+        geo_path: Path (or str) to the geo file the node was imported from.
+        strip_patterns: regexes of material suffixes to also try without
+            (the shader generator's 'material_suffixes_to_strip' config).
+        cache: optional dict reused across calls (see _texture_sets_in_dir()).
+
+    Returns:
+        (texture_set_data, from_var_folder) - from_var_folder is True when
+        the set was found in a "VarN" asset's shared Textures folder (the
+        'smart_import.var_import_displacement' rule applies). (None, False)
+        if nothing matched.
+    """
+    geo_path = Path(geo_path)
+    search = [(d, False) for d in _named_search_dirs(geo_path, cache)]
+    var_dir = _var_textures_dir(geo_path, cache)
+    if var_dir:
+        search.append((var_dir, True))
+
+    for keys in _name_match_keys(name, strip_patterns):
+        rank = {k: i for i, k in enumerate(keys)}
+        for directory, is_var in search:
+            matches = []
+            for data in _texture_sets_in_dir(directory, recursive=is_var, cache=cache):
+                clean = _TX_SET_SUFFIX_REGEX.sub('', data['display'])
+                clean_base, res_tag = _strip_resolution_tag(clean)
+                key = _normalize_match_name(clean_base)
+                if key in rank:
+                    matches.append((data, res_tag, rank[key]))
+            if matches:
+                return _best_texture_set(matches, preferred_resolution), is_var
+    return None, False
 
 
 def find_lod_proxy_for_geo(geo_path, geo_suffix, importable_extensions):

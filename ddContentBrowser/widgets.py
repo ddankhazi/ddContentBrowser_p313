@@ -1,4 +1,4 @@
-﻿"""
+"""
 DD Content Browser - UI Widgets
 Breadcrumb navigation, filter panel, and custom list view
 
@@ -1256,7 +1256,7 @@ def load_hdr_exr_raw(file_path, max_size=2048):
             resolution_str = f"{width} x {height}"
             
             # Scale if needed
-            if max_size and (width > max_size or height > max_size):
+            if width > max_size or height > max_size:
                 scale = min(max_size / width, max_size / height)
                 new_width = int(width * scale)
                 new_height = int(height * scale)
@@ -1309,7 +1309,7 @@ def load_hdr_exr_raw(file_path, max_size=2048):
                     return None, None, None, None
                 
                 # Scale if needed
-                if max_size and (width > max_size or height > max_size):
+                if width > max_size or height > max_size:
                     scale = min(max_size / width, max_size / height)
                     new_width = int(width * scale)
                     new_height = int(height * scale)
@@ -1372,70 +1372,35 @@ def load_hdr_exr_image(file_path, max_size=3840, exposure=0.0, return_raw=False,
                     return None, "Deep EXR - No Preview"
         except:
             pass
-
-    # SLOW CHECK: Not tagged yet (first time seeing this file) - ask OIIO
-    # directly via spec.deep. Needed because read_exr_via_oiio() raising a
-    # generic "no pixel data" error for deep files (OIIO's read_image()
-    # just returns None for them, no dtype-based signal like the old
-    # OpenEXR-binding path had) wouldn't be recognized as "deep" by the
-    # string-matching in the except clause below, so this must be checked
-    # upfront rather than inferred from the failure afterwards.
-    if file_ext.endswith('.exr'):
-        try:
-            from .preview_panel import is_deep_exr
-            if is_deep_exr(file_path_str):
-                if metadata_manager:
-                    try:
-                        tag_id = metadata_manager.add_tag("deepdata", category=None, color=None)
-                        metadata_manager.add_tag_to_file(file_path_str, tag_id)
-                    except Exception:
-                        pass
-                if return_raw:
-                    return None, "Deep EXR - No Preview", None
-                else:
-                    return None, "Deep EXR - No Preview"
-        except ImportError:
-            pass
-
-    # Use OpenImageIO for .hdr (Radiance RGBE) files if available - measured
-    # ~30% faster than OpenCV's Radiance decoder (see
-    # _generate_hdr_thumbnail_data() in cache.py for the benchmark)
+    
+    # Use OpenCV for .hdr (Radiance RGBE) files if available
     if file_ext.endswith('.hdr') and OPENCV_AVAILABLE and NUMPY_AVAILABLE:
         try:
-            import sys
-            from .utils import get_external_libs_dir
-            external_libs = get_external_libs_dir()
-            if external_libs not in sys.path:
-                sys.path.append(external_libs)
-            from OpenImageIO import ImageInput
-
-            inp = ImageInput.open(file_path_str)
-            if not inp:
-                raise Exception("OpenImageIO could not open file")
-            spec = inp.spec()
-            width, height = spec.width, spec.height
-            pixels = inp.read_image()
-            inp.close()
-
-            if pixels is None:
-                raise Exception("OpenImageIO returned no pixel data")
-
-            rgb = np.array(pixels, dtype=np.float32)
+            # Read HDR with OpenCV
+            rgb = cv2.imread(file_path_str, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
+            
+            if rgb is None:
+                raise Exception("OpenCV returned None")
+            
+            # OpenCV loads as BGR, convert to RGB
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+            
             if rgb.ndim == 2:
                 # Grayscale - convert to RGB
                 rgb = np.stack([rgb, rgb, rgb], axis=2)
-            elif rgb.ndim == 3 and rgb.shape[2] >= 4:
+            elif rgb.shape[2] == 4:
                 # RGBA - drop alpha
                 rgb = rgb[:, :, :3]
-
+            
+            height, width = rgb.shape[:2]
             resolution_str = f"{width} x {height}"
-
+            
             # Scale if needed
-            if max_size and (width > max_size or height > max_size):
+            if width > max_size or height > max_size:
                 scale = min(max_size / width, max_size / height)
                 new_width = int(width * scale)
                 new_height = int(height * scale)
-
+                
                 # Use OpenCV resize
                 rgb = cv2.resize(rgb, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
                 width, height = new_width, new_height
@@ -1491,160 +1456,200 @@ def load_hdr_exr_image(file_path, max_size=3840, exposure=0.0, return_raw=False,
             return pixmap, resolution_str
             
         except Exception as e:
-            print(f"HDR loading failed: {e}")
+            print(f"OpenCV HDR loading failed: {e}")
             import traceback
             traceback.print_exc()
             # Fall through to Maya MImage fallback
     
-    # Use OpenImageIO for .exr files if available - measured ~2-3x faster
-    # than the OpenEXR Python binding (see read_exr_via_oiio() in utils.py
-    # for the benchmark and channel-grouping details)
+    # Use OpenEXR for .exr files if available
     if file_ext.endswith('.exr') and OPENEXR_AVAILABLE and NUMPY_AVAILABLE:
         try:
-            from .utils import read_exr_via_oiio
-
-            # channels is grouped the same way OpenEXR.File().channels()
-            # groups them (e.g. "Beauty.R/G/B" -> one "Beauty"-keyed
-            # 3-channel entry), so the fallback ladder below checks those
-            # group keys directly instead of re-deriving them from
-            # individual dotted channel names.
-            width, height, channels = read_exr_via_oiio(file_path_str)
-            resolution_str = f"{width} x {height}"
-
-            # Get RGB data - try multiple naming conventions for RGB channels
-            rgb = None
-
-            # 1. Try standard interleaved RGB or RGBA
-            if "RGB" in channels:
-                data = channels["RGB"]
-                rgb = data[:, :, :3] if data.ndim == 3 and data.shape[2] >= 3 else data
-            elif "RGBA" in channels:
-                rgb = channels["RGBA"][:, :, :3]  # Drop alpha, keep RGB only
-
-            # 2. Try Beauty pass (common in render layers)
-            elif "Beauty" in channels and channels["Beauty"].ndim == 3 and channels["Beauty"].shape[2] >= 3:
-                rgb = channels["Beauty"][:, :, :3]
-
-            # 3. Try the first other grouped (3+ channel) layer, in file order
-            if rgb is None:
-                for key, data in channels.items():
-                    if key in ("RGB", "RGBA", "Beauty"):
-                        continue
-                    if data.ndim == 3 and data.shape[2] >= 3:
-                        rgb = data[:, :, :3]
-                        break
-
-            # 4. If still no RGB, try single channel (grayscale)
-            if rgb is None:
-                single_channels = ["Y", "Z", "depth", "A", "alpha", "luminance"]
-                for ch_name in single_channels:
-                    if ch_name in channels:
-                        gray = channels[ch_name]
-                        # Convert to RGB by repeating channel
-                        rgb = np.stack([gray, gray, gray], axis=2) if gray.ndim == 2 else gray
-                        break
-
-            # 5. Last resort: use ANY available channel as grayscale
-            if rgb is None and len(channels) > 0:
-                first_channel_name = next(iter(channels))
-                gray = channels[first_channel_name]
-
-                if gray.ndim == 2:
-                    rgb = np.stack([gray, gray, gray], axis=2)
-                elif gray.ndim == 3 and gray.shape[2] == 1:
-                    rgb = np.concatenate([gray, gray, gray], axis=2)
+            # Open EXR file
+            with OpenEXR.File(file_path_str) as exr_file:
+                # Get header info
+                header = exr_file.header()
+                dw = header['dataWindow']
+                width = dw[1][0] - dw[0][0] + 1
+                height = dw[1][1] - dw[0][1] + 1
+                resolution_str = f"{width} x {height}"
+                
+                # Read RGB channels as interleaved array
+                channels = exr_file.channels()
+                
+                # Get RGB data (returns numpy array directly!)
+                # Try multiple naming conventions for RGB channels
+                rgb = None
+                
+                # 1. Try standard interleaved RGB or RGBA
+                if "RGB" in channels:
+                    rgb_data = channels["RGB"].pixels  # Shape: (height, width, 3)
+                    if rgb_data is not None:
+                        rgb = rgb_data
+                elif "RGBA" in channels:
+                    rgba_data = channels["RGBA"].pixels  # Shape: (height, width, 4)
+                    if rgba_data is not None:
+                        rgb = rgba_data[:, :, :3]  # Drop alpha, keep RGB only
+                
+                # 2. Try separate R, G, B channels
+                elif all(c in channels for c in ["R", "G", "B"]):
+                    r = channels["R"].pixels
+                    g = channels["G"].pixels
+                    b = channels["B"].pixels
+                    if r is not None and g is not None and b is not None:
+                        rgb = np.stack([r, g, b], axis=2)  # Shape: (height, width, 3)
+                
+                # 3. Try Beauty pass (common in render layers)
+                elif all(c in channels for c in ["Beauty.R", "Beauty.G", "Beauty.B"]):
+                    r = channels["Beauty.R"].pixels
+                    g = channels["Beauty.G"].pixels
+                    b = channels["Beauty.B"].pixels
+                    if r is not None and g is not None and b is not None:
+                        rgb = np.stack([r, g, b], axis=2)
+                
+                # 4. Try first layer with .R .G .B (generic multi-layer)
                 else:
-                    rgb = gray
-
-            # If still nothing, list available channels and give up
-            if rgb is None:
-                available = ", ".join(sorted(channels.keys())[:10])  # Show first 10
-                raise Exception(f"No usable channels found. Available: {available}")
-
-            # Final safety check: verify rgb is valid numpy array with data
-            if rgb is None or not isinstance(rgb, np.ndarray) or rgb.size == 0:
-                raise Exception(f"RGB data is invalid or empty after channel processing")
-
-            # Check if dtype is numeric (not object or other non-numeric types)
-            # Deep EXR channels can return object arrays which we can't process
-            if rgb.dtype == np.object_ or not np.issubdtype(rgb.dtype, np.number):
-                raise Exception(f"RGB data has non-numeric dtype: {rgb.dtype} (deep/volumetric EXR not supported)")
-
-            # Scale if needed
-            if max_size and (width > max_size or height > max_size):
-                scale = min(max_size / width, max_size / height)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-
-                # Simple nearest-neighbor resize (fast)
-                indices_h = np.linspace(0, height-1, new_height, dtype=int)
-                indices_w = np.linspace(0, width-1, new_width, dtype=int)
-                rgb = rgb[np.ix_(indices_h, indices_w)]
-
-                width, height = new_width, new_height
-
-            # Check for ACES color management via tags
-            use_aces = False
-            if metadata_manager:
-                try:
-                    from pathlib import Path
-                    file_metadata = metadata_manager.get_file_metadata(str(file_path))
-                    file_tags = file_metadata.get('tags', [])
-                    tag_names_lower = [tag['name'].lower() for tag in file_tags]
-
-                    if "acescg" in tag_names_lower or "srgb(aces)" in tag_names_lower:
-                        use_aces = True
-                except:
-                    pass
-
-            # Apply exposure compensation with -1 stop offset (match Nuke/Maya)
-            compensated_exposure = exposure - 1.0
-
-            if use_aces:
-                # Use ACES view transform
-                from .aces_color import apply_aces_view_transform
-                with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
-                    rgb_display = apply_aces_view_transform(rgb, exposure=compensated_exposure)
-            else:
-                # Standard tone mapping
-                exposure_multiplier = pow(2.0, compensated_exposure)
-                rgb = rgb * exposure_multiplier
-
-                # ACES Filmic tone mapping
-                a = 2.51
-                b = 0.03
-                c = 2.43
-                d = 0.59
-                e = 0.14
-
-                # Suppress numpy warnings for HDR tonemapping
-                with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
-                    rgb_tonemapped = np.clip((rgb * (a * rgb + b)) / (rgb * (c * rgb + d) + e), 0, 1)
-
-                # Gamma correction (2.2 for sRGB)
-                gamma = 1.0 / 2.2
-                rgb_display = np.power(rgb_tonemapped, gamma)
-
-            # Convert to 8-bit
-            with np.errstate(invalid='ignore'):
-                rgb_8bit = (rgb_display * 255).astype(np.uint8)
-
-            # Create QImage
-            bytes_per_line = width * 3
-            q_image = QImage(rgb_8bit.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
-            q_image = q_image.copy()
-
-            # Convert to QPixmap
-            pixmap = QPixmap.fromImage(q_image)
-            return pixmap, resolution_str
-
+                    # Find first layer that has RGB channels
+                    channel_names = list(channels.keys())
+                    layer_prefixes = set()
+                    for name in channel_names:
+                        if '.' in name:
+                            prefix = name.rsplit('.', 1)[0]
+                            layer_prefixes.add(prefix)
+                    
+                    # Try each layer prefix
+                    for prefix in sorted(layer_prefixes):
+                        r_name = f"{prefix}.R"
+                        g_name = f"{prefix}.G"
+                        b_name = f"{prefix}.B"
+                        if all(c in channels for c in [r_name, g_name, b_name]):
+                            r = channels[r_name].pixels
+                            g = channels[g_name].pixels
+                            b = channels[b_name].pixels
+                            if r is not None and g is not None and b is not None:
+                                rgb = np.stack([r, g, b], axis=2)
+                                break
+                
+                # 5. If still no RGB, try single channel (grayscale)
+                if rgb is None:
+                    # Try common single-channel names first
+                    single_channels = ["Y", "Z", "depth", "A", "alpha", "luminance"]
+                    for ch_name in single_channels:
+                        if ch_name in channels:
+                            gray = channels[ch_name].pixels
+                            if gray is not None:
+                                # Convert to RGB by repeating channel
+                                if gray.ndim == 2:
+                                    rgb = np.stack([gray, gray, gray], axis=2)
+                                else:
+                                    # Already 3D, just use it
+                                    rgb = gray
+                                break
+                
+                # 6. Last resort: use ANY available channel as grayscale
+                if rgb is None and len(channels) > 0:
+                    # Take the first available channel
+                    first_channel_name = list(channels.keys())[0]
+                    gray = channels[first_channel_name].pixels
+                    
+                    if gray is not None:
+                        # Convert to RGB by repeating channel
+                        if gray.ndim == 2:
+                            rgb = np.stack([gray, gray, gray], axis=2)
+                        elif gray.ndim == 3 and gray.shape[2] == 1:
+                            # Single channel as 3D array
+                            rgb = np.concatenate([gray, gray, gray], axis=2)
+                        else:
+                            rgb = gray
+                
+                # If still nothing, list available channels and give up
+                if rgb is None:
+                    available = ", ".join(sorted(channels.keys())[:10])  # Show first 10
+                    raise Exception(f"No usable channels found. Available: {available}")
+                
+                # Final safety check: verify rgb is valid numpy array with data
+                if rgb is None or not isinstance(rgb, np.ndarray) or rgb.size == 0:
+                    raise Exception(f"RGB data is invalid or empty after channel processing")
+                
+                # Check if dtype is numeric (not object or other non-numeric types)
+                # Deep EXR channels can return object arrays which we can't process
+                if rgb.dtype == np.object_ or not np.issubdtype(rgb.dtype, np.number):
+                    raise Exception(f"RGB data has non-numeric dtype: {rgb.dtype} (deep/volumetric EXR not supported)")
+                
+                # Scale if needed
+                if width > max_size or height > max_size:
+                    scale = min(max_size / width, max_size / height)
+                    new_width = int(width * scale)
+                    new_height = int(height * scale)
+                    
+                    # Simple nearest-neighbor resize (fast)
+                    indices_h = np.linspace(0, height-1, new_height, dtype=int)
+                    indices_w = np.linspace(0, width-1, new_width, dtype=int)
+                    rgb = rgb[np.ix_(indices_h, indices_w)]
+                    
+                    width, height = new_width, new_height
+                
+                # Check for ACES color management via tags
+                use_aces = False
+                if metadata_manager:
+                    try:
+                        from pathlib import Path
+                        file_metadata = metadata_manager.get_file_metadata(str(file_path))
+                        file_tags = file_metadata.get('tags', [])
+                        tag_names_lower = [tag['name'].lower() for tag in file_tags]
+                        
+                        if "acescg" in tag_names_lower or "srgb(aces)" in tag_names_lower:
+                            use_aces = True
+                    except:
+                        pass
+                
+                # Apply exposure compensation with -1 stop offset (match Nuke/Maya)
+                compensated_exposure = exposure - 1.0
+                
+                if use_aces:
+                    # Use ACES view transform
+                    from .aces_color import apply_aces_view_transform
+                    with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+                        rgb_display = apply_aces_view_transform(rgb, exposure=compensated_exposure)
+                else:
+                    # Standard tone mapping
+                    exposure_multiplier = pow(2.0, compensated_exposure)
+                    rgb = rgb * exposure_multiplier
+                    
+                    # ACES Filmic tone mapping
+                    a = 2.51
+                    b = 0.03
+                    c = 2.43
+                    d = 0.59
+                    e = 0.14
+                    
+                    # Suppress numpy warnings for HDR tonemapping
+                    with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+                        rgb_tonemapped = np.clip((rgb * (a * rgb + b)) / (rgb * (c * rgb + d) + e), 0, 1)
+                    
+                    # Gamma correction (2.2 for sRGB)
+                    gamma = 1.0 / 2.2
+                    rgb_display = np.power(rgb_tonemapped, gamma)
+                
+                # Convert to 8-bit
+                with np.errstate(invalid='ignore'):
+                    rgb_8bit = (rgb_display * 255).astype(np.uint8)
+                
+                # Create QImage
+                bytes_per_line = width * 3
+                q_image = QImage(rgb_8bit.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
+                q_image = q_image.copy()
+                
+                # Convert to QPixmap
+                pixmap = QPixmap.fromImage(q_image)
+                return pixmap, resolution_str
+                
         except Exception as e:
             error_msg = str(e)
             # Deep/volumetric EXR files are not supported
             if "non-numeric dtype" in error_msg or "deep/volumetric" in error_msg.lower():
                 print(f"ℹ️  Deep/volumetric EXR not supported for preview: {Path(file_path_str).name}")
             else:
-                print(f"EXR loading failed: {e}")
+                print(f"OpenEXR loading failed: {e}")
             # Fall through to Maya MImage fallback
     
     # Fallback: Use Maya MImage for HDR or if OpenEXR not available
@@ -1665,7 +1670,7 @@ def load_hdr_exr_image(file_path, max_size=3840, exposure=0.0, return_raw=False,
         resolution_str = f"{width} x {height}"
         
         # Calculate scaled size if needed
-        if max_size and (width > max_size or height > max_size):
+        if width > max_size or height > max_size:
             if width > height:
                 scaled_width = max_size
                 scaled_height = int(max_size * height / width)
@@ -2044,10 +2049,9 @@ class MayaStyleListView(QListView):
     - Maya automatically imports files when dropped on viewport
     - Hold Alt while dragging to enable file drag
     
-    MIDDLE BUTTON:
-    - Batch import dialog (custom handling)
-    - Drag to Collections panel to add files
-    - Drag outside browser to show import options dialog
+    MIDDLE BUTTON (plain mouse tracking, not a Qt drag):
+    - Release over a collection to add files to it
+    - Release outside the browser (e.g. Maya viewport) to batch import
     """
     
     def __init__(self, parent=None):
@@ -2056,6 +2060,8 @@ class MayaStyleListView(QListView):
         self.drag_start_position = None
         self.drag_started = False
         self.drag_to_collection = False  # Flag to distinguish drag-to-collection from batch import
+        self._hover_collections = None  # Collections list highlighted by the current MMB drag
+        self._drag_cursor = None  # Active MMB drag override cursor shape
         # Scroll speed reduction factor (lower = slower scrolling)
         self.scroll_speed_factor = 3.0  # 30% of normal speed
     
@@ -2079,6 +2085,9 @@ class MayaStyleListView(QListView):
     
     def mousePressEvent(self, event):
         """Handle mouse press - Middle button for batch import, Left button for selection/drag"""
+        # A previous MMB drag whose release never reached us must not leave
+        # its app-wide cursor behind
+        self._clear_drag_cursor()
         if event.button() == Qt.MiddleButton:
             # Middle button: Batch import or add to collection
             # Get item at click position
@@ -2115,95 +2124,89 @@ class MayaStyleListView(QListView):
         else:
             super().mousePressEvent(event)
     
+    def _collection_target_at(self, global_pos):
+        """
+        (collections list widget, collection item) under global_pos. The item
+        is None unless it's a real (named) collection - and the widget is None
+        too when the cursor isn't over the Collections list at all.
+        """
+        widget = QApplication.widgetAt(global_pos)
+        while widget and not isinstance(widget, DragDropCollectionListWidget):
+            widget = widget.parent()
+        if widget is None:
+            return None, None
+        item = widget.itemAt(widget.viewport().mapFromGlobal(global_pos))
+        return widget, (item if item and item.data(Qt.UserRole) else None)
+
+    def _set_collection_hover(self, widget, item):
+        """Highlight the collection item an MMB drag is over (None, None clears)."""
+        previous = self._hover_collections
+        if previous is not None and previous is not widget:
+            try:
+                previous.set_drop_highlight(None)
+            except RuntimeError:
+                pass  # widget already deleted
+        self._hover_collections = widget
+        if widget is not None:
+            widget.set_drop_highlight(item)
+
+    def _set_drag_cursor(self, shape):
+        """
+        Show `shape` for the MMB drag as an app-wide override cursor - the
+        mouse is mostly over other widgets / Maya panels during the drag, not
+        this view, so a cursor set on the view alone wouldn't show there.
+        """
+        if self._drag_cursor == shape:
+            return
+        if self._drag_cursor is None:
+            QApplication.setOverrideCursor(QCursor(shape))
+        else:
+            QApplication.changeOverrideCursor(QCursor(shape))
+        self._drag_cursor = shape
+
+    def _clear_drag_cursor(self):
+        """Drop the MMB drag's override cursor, if one is active."""
+        if self._drag_cursor is not None:
+            QApplication.restoreOverrideCursor()
+            self._drag_cursor = None
+
+    def _end_mmb_drag(self):
+        """Reset all MMB drag state: flags, collection highlight, cursor."""
+        self._set_collection_hover(None, None)
+        self._clear_drag_cursor()
+        self.middle_button_pressed = False
+        self.drag_start_position = None
+        self.drag_started = False
+        self.drag_to_collection = False
+        self.unsetCursor()
+
     def mouseMoveEvent(self, event):
-        """Handle mouse move - Start drag manually when over collections"""
+        """Handle mouse move - MMB drag: follow the cursor, highlight a collection under it"""
         if self.middle_button_pressed and self.drag_start_position:
+            if not event.buttons() & Qt.MiddleButton:
+                # The release never reached us (e.g. it landed in a popup)
+                self._end_mmb_drag()
+                super().mouseMoveEvent(event)
+                return
+
             if not self.drag_started:
                 # Check if we've moved enough to start drag
                 distance = (event.pos() - self.drag_start_position).manhattanLength()
                 if distance >= 5:
                     self.drag_started = True
-                    self.setCursor(Qt.ClosedHandCursor)
-            
+
             if self.drag_started:
-                # Continuously check position to see if we're over collections
-                global_pos = self.mapToGlobal(event.pos())
-                widget_at_cursor = QApplication.widgetAt(global_pos)
-                
-                # Check if cursor is over DragDropCollectionListWidget
-                is_over_collections = False
-                collections_widget = None
-                check_widget = widget_at_cursor
-                while check_widget:
-                    if isinstance(check_widget, DragDropCollectionListWidget):
-                        is_over_collections = True
-                        collections_widget = check_widget
-                        break
-                    check_widget = check_widget.parent()
-                
-                # If over collections, check if cursor is over a valid collection item
-                is_over_valid_collection = False
-                if is_over_collections and collections_widget:
-                    # Map global position to collections widget local coordinates
-                    local_pos = collections_widget.mapFromGlobal(global_pos)
-                    item = collections_widget.itemAt(local_pos)
-                    if item and item.data(Qt.UserRole):  # Has collection name
-                        is_over_valid_collection = True
-                
-                # Update cursor and start drag if over valid collection
-                if is_over_valid_collection:
-                    if not self.drag_to_collection:
-                        self.drag_to_collection = True
-                        # Start Qt drag operation (BLOCKING call)
-                        self.startDrag(Qt.CopyAction)
-                        
-                        # After drag completes, check if we should do batch import
-                        if not self.drag_to_collection:
-                            # Check if mouse was released outside the browser window
-                            global_pos = QCursor.pos()
-                            widget_at_cursor = QApplication.widgetAt(global_pos)
-                            
-                            is_over_browser = False
-                            check_widget = widget_at_cursor
-                            while check_widget:
-                                if hasattr(check_widget, 'windowTitle') and 'DD Content Browser' in str(check_widget.windowTitle()):
-                                    is_over_browser = True
-                                    break
-                                if check_widget.__class__.__name__ == 'DDContentBrowser':
-                                    is_over_browser = True
-                                    break
-                                check_widget = check_widget.parent() if check_widget else None
-                            
-                            # If not over browser, do batch import
-                            if not is_over_browser:
-                                indexes = self.selectedIndexes()
-                                if indexes:
-                                    print(f"[mouseMoveEvent] Batch importing {len(indexes)} files after drag...")
-                                    count = len(indexes)
-                                    browser = self.parent()
-                                    while browser and not hasattr(browser, 'status_bar'):
-                                        browser = browser.parent()
-                                    if browser and hasattr(browser, 'status_bar'):
-                                        try:
-                                            browser.status_bar.showMessage(f"Batch importing {count} file{'s' if count != 1 else ''}...", 2000)
-                                        except RuntimeError:
-                                            pass
-                                    self.batch_import_files(indexes)
-                        
-                        # Reset flags after drag completes
-                        self.middle_button_pressed = False
-                        self.drag_start_position = None
-                        self.drag_started = False
-                        self.drag_to_collection = False
-                        self.setCursor(Qt.ArrowCursor)
-                        self.unsetCursor()
-                        return
-                else:
-                    if self.drag_to_collection:
-                        # Left valid collection area
-                        self.drag_to_collection = False
-                        self.setCursor(Qt.ClosedHandCursor)
-        
+                # The MMB drag stays plain mouse tracking all the way (this view
+                # keeps the mouse grab while the button is held) and the drop is
+                # decided on release. Never a QDrag here: that takes the mouse
+                # over until release, so after crossing the Collections panel
+                # the drag could no longer end in a batch import anywhere else.
+                widget, item = self._collection_target_at(self.mapToGlobal(event.pos()))
+                self._set_collection_hover(widget, item)
+                self.drag_to_collection = item is not None
+                # "Can drop here" feedback: copy cursor over a collection
+                self._set_drag_cursor(Qt.DragCopyCursor if item is not None else Qt.ClosedHandCursor)
+
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
@@ -2217,6 +2220,10 @@ class MayaStyleListView(QListView):
         if event.button() == Qt.MiddleButton:
             # Check if we're still over the ddContentBrowser window
             global_pos = self.mapToGlobal(event.pos())
+            collections_widget, collection_item = self._collection_target_at(global_pos)
+            # Drag visuals off before the (possibly long) import starts
+            self._set_collection_hover(None, None)
+            self._clear_drag_cursor()
             widget_at_cursor = QApplication.widgetAt(global_pos)
             
             # Find the top-level browser window
@@ -2231,11 +2238,15 @@ class MayaStyleListView(QListView):
                     break
                 check_widget = check_widget.parent()
             
+            # Released on a collection: add the selection to it
+            if self.drag_started and collection_item is not None:
+                collections_widget.add_selection_to_collection(self, collection_item)
+
             # Only do batch import if:
             # 1. Drag was started
-            # 2. NOT dragging to collections
+            # 2. NOT dropped on a collection
             # 3. Mouse is NOT over browser window (must be outside, e.g., Maya viewport)
-            if self.drag_started and not self.drag_to_collection and not is_over_browser:
+            elif self.drag_started and not is_over_browser:
                 indexes = self.selectedIndexes()
                 if indexes:
                     print(f"[mouseReleaseEvent] Batch importing {len(indexes)} files...")
@@ -2249,14 +2260,8 @@ class MayaStyleListView(QListView):
                         except RuntimeError:
                             pass
                     self.batch_import_files(indexes)
-            
-            # Reset all flags
-            self.middle_button_pressed = False
-            self.drag_start_position = None
-            self.drag_started = False
-            self.drag_to_collection = False
-            self.setCursor(Qt.ArrowCursor)
-            self.unsetCursor()
+
+            self._end_mmb_drag()
             event.accept()
             return
         
@@ -2273,14 +2278,8 @@ class MayaStyleListView(QListView):
         """Handle ESC to cancel drag"""
         if event.key() == Qt.Key_Escape:
             if self.drag_started or self.middle_button_pressed:
-                # Reset all drag state
-                self.setCursor(Qt.ArrowCursor)
-                self.unsetCursor()
-                self.middle_button_pressed = False
-                self.drag_start_position = None
-                self.drag_started = False
-                self.drag_to_collection = False
-                
+                self._end_mmb_drag()
+
                 browser = self.parent()
                 while browser and not hasattr(browser, 'status_bar'):
                     browser = browser.parent()
@@ -2295,27 +2294,29 @@ class MayaStyleListView(QListView):
         super().keyPressEvent(event)
     
     def startDrag(self, supportedActions):
-        """Start drag operation - handle both ALT+left (file URLs) and middle button (collections only)"""
+        """
+        Start an ALT+left drag (file URLs for Windows/Maya, or a texture set's
+        shader-build command). MMB drags never get here - they're plain mouse
+        tracking, see mouseMoveEvent/mouseReleaseEvent.
+        """
         try:
             from PySide6.QtCore import QMimeData, QUrl
             from PySide6.QtGui import QDrag
         except ImportError:
             from PySide2.QtCore import QMimeData, QUrl
             from PySide2.QtGui import QDrag
-        
-        # Remember if this is a middle button drag
-        is_middle_button = self.middle_button_pressed
-        
+
+        from ddContentBrowser.utils import to_maya_path
+
         # Create drag object
         drag = QDrag(self)
         mime_data = QMimeData()
-        
+
         # Get selected files
         indexes = self.selectedIndexes()
-        file_paths = []
         urls = []
         texture_set_assets = []
-        
+
         for index in indexes:
             if index.isValid():
                 asset = self.model().data(index, Qt.UserRole)
@@ -2324,20 +2325,14 @@ class MayaStyleListView(QListView):
                 # Texture set: build shader graph on drop (do NOT drag the raw file URL)
                 if getattr(asset, 'is_texture_set', False) and getattr(asset, 'texture_set', None):
                     texture_set_assets.append(asset)
-                    # For MMB (collections/batch import) keep a representative URL so the
-                    # internal drop handler still has something to work with.
-                    if is_middle_button:
-                        rep = str(asset.file_path)
-                        file_paths.append(rep)
-                        urls.append(QUrl.fromLocalFile(rep))
                     continue
-                file_path = str(asset.file_path)
-                file_paths.append(file_path)
-                urls.append(QUrl.fromLocalFile(file_path))
-        
+                # Mapped-drive form: an ALT-drag drops these URLs straight
+                # into Maya, which bakes whatever spelling it gets into the
+                # file node / import.
+                urls.append(QUrl.fromLocalFile(to_maya_path(asset.file_path)))
+
         # Texture set drag -> stash payload and set the shader-build MEL command as text.
-        # Only for ALT/external (Windows-native) drags; MMB drops build via batch_import_files.
-        if texture_set_assets and not is_middle_button:
+        if texture_set_assets:
             try:
                 from . import models as _models
                 # Stash the list-based channels (not channel_paths) so
@@ -2356,35 +2351,15 @@ class MayaStyleListView(QListView):
                 'python("import ddContentBrowser.models as _m; _m.apply_pending_texture_set_drop()");'
             )
             drag.setMimeData(mime_data)
-            if is_middle_button:
-                self.middle_button_pressed = False
-                self.drag_start_position = None
-                self.drag_started = False
-                self.setCursor(Qt.ArrowCursor)
-                self.unsetCursor()
             drag.exec_(supportedActions)
             return
-        
+
         if not urls:
-            # No files to drag - reset state if middle button
-            if is_middle_button:
-                self.middle_button_pressed = False
-                self.drag_start_position = None
-                self.drag_started = False
-                self.setCursor(Qt.ArrowCursor)
-                self.unsetCursor()
             return
-        
-        # Set mime data based on drag type
-        if is_middle_button:
-            # Middle button: Only text marker for collections drop handler
-            # NO file URLs - prevents accidental drops to other apps
-            mime_data.setText("drag_from_file_list")
-        else:
-            # ALT+Left button: Standard file URLs for Windows/Maya drag
-            mime_data.setUrls(urls)
-            mime_data.setText("alt_left_drag")
-        
+
+        # Standard file URLs for Windows/Maya drag
+        mime_data.setUrls(urls)
+        mime_data.setText("alt_left_drag")
         drag.setMimeData(mime_data)
         
         # Execute drag (blocking call)
@@ -2394,7 +2369,9 @@ class MayaStyleListView(QListView):
         """Batch import files"""
         if not MAYA_AVAILABLE:
             return
-        
+
+        from ddContentBrowser.utils import to_maya_path
+
         paths = []
         texture_set_assets = []
         for index in indexes:
@@ -2406,15 +2383,17 @@ class MayaStyleListView(QListView):
                 if getattr(asset, 'is_texture_set', False) and getattr(asset, 'texture_set', None):
                     texture_set_assets.append(asset)
                     continue
-                paths.append(str(asset.file_path))
-        
-        # Build shader network(s) for any texture sets via the browser
+                paths.append(to_maya_path(asset.file_path))
+
+        # Build shader network(s) for any texture sets via the browser. Only
+        # assign them to the current Maya selection when nothing but texture
+        # sets was dropped - in a mixed drop that selection is unrelated.
         if texture_set_assets:
             browser = self.parent()
             while browser and not hasattr(browser, '_build_texture_set_shaders'):
                 browser = browser.parent()
             if browser and hasattr(browser, '_build_texture_set_shaders'):
-                browser._build_texture_set_shaders(texture_set_assets)
+                browser._build_texture_set_shaders(texture_set_assets, assign_to_selection=not paths)
         
         if not paths:
             return
@@ -2429,12 +2408,7 @@ class MayaStyleListView(QListView):
             # Get image extensions from config
             image_exts = get_extensions_by_category('images')
 
-            # Find the browser instance once, for the auto-material hook below
-            # (same lookup pattern as _build_texture_set_shaders above)
-            browser = self.parent()
-            while browser and not hasattr(browser, '_try_auto_assign_texture_set_material'):
-                browser = browser.parent()
-
+            geo_paths = []
             for file_path in paths:
                 try:
                     file_ext = Path(file_path).suffix.lower()
@@ -2468,42 +2442,27 @@ class MayaStyleListView(QListView):
                         
                         imported_count += 1
                     else:
-                        # Import 3D file
-                        from ddContentBrowser.utils import get_maya_import_type
-                        
-                        # Get extension
-                        file_ext = Path(file_path).suffix.lower()
-                        
-                        # Get Maya import type from config
-                        file_type = get_maya_import_type(file_ext)
-                        
-                        new_nodes = []
-                        if file_type:
-                            # Import with type specification
-                            new_nodes = cmds.file(file_path, i=True, type=file_type, ignoreVersion=True,
-                                     mergeNamespacesOnClash=False, namespace=':',
-                                     options='v=0', preserveReferences=True, returnNewNodes=True) or []
-                            imported_count += 1
-                        else:
-                            # Unknown format or no import type - try auto-detect
-                            try:
-                                new_nodes = cmds.file(file_path, i=True, ignoreVersion=True,
-                                         mergeNamespacesOnClash=False, namespace=':',
-                                         preserveReferences=True, returnNewNodes=True) or []
-                                imported_count += 1
-                            except:
-                                # Skip unsupported file types
-                                failed_count += 1
-                                continue
-
-                        # Auto-build & assign a material from a matching texture
-                        # set (same folder or subfolders), if one is found
-                        if browser:
-                            browser._try_auto_assign_texture_set_material(file_path, new_nodes)
+                        # 3D files: collected and batch-imported together below
+                        geo_paths.append(file_path)
 
                 except Exception as e:
                     failed_count += 1
-            
+
+            # All geo in one batch, then auto-built texture set materials
+            # (see the browser's _smart_import_geo_files)
+            materials_built = 0
+            if geo_paths:
+                browser = self.parent()
+                while browser and not hasattr(browser, '_smart_import_geo_files'):
+                    browser = browser.parent()
+                if browser:
+                    geo_imported, geo_failed, materials_built = browser._smart_import_geo_files(geo_paths)
+                    imported_count += geo_imported
+                    failed_count += geo_failed
+                else:
+                    print("[batch_import_files] Browser not found - geo files not imported")
+                    failed_count += len(geo_paths)
+
             # Update status bar
             browser = self.parent()
             while browser and not hasattr(browser, 'status_bar'):
@@ -2512,6 +2471,8 @@ class MayaStyleListView(QListView):
                 try:
                     if imported_count > 0:
                         msg = f"Imported {imported_count} file{'s' if imported_count != 1 else ''}"
+                        if materials_built > 0:
+                            msg += f", {materials_built} texture set material{'s' if materials_built != 1 else ''}"
                         if failed_count > 0:
                             msg += f" ({failed_count} failed)"
                         browser.status_bar.showMessage(msg, 3000)
@@ -2556,75 +2517,43 @@ class DragDropCollectionListWidget(QListWidget):
         
         event.ignore()
     
-    def dragMoveEvent(self, event):
-        """Handle drag move - highlight collection under cursor"""
-        if event.source() and isinstance(event.source(), MayaStyleListView):
-            # Get item under cursor
-            item = self.itemAt(event.pos())
-            
-            # Clear previous highlight
-            if self.drop_indicator_item:
+    # Drop-target row tint (the stylesheet's :hover color, stronger). The
+    # regular :hover style can't show during the file list's MMB drag - that
+    # view holds the mouse grab, so this list gets no hover events.
+    _DROP_HIGHLIGHT_COLOR = (75, 125, 170, 150)
+
+    def set_drop_highlight(self, item):
+        """Highlight (row tint + bold) the collection item a drag is over -
+        None clears it. Used by Qt drags here and by the file list's MMB
+        drag, which tracks the mouse itself instead of running a Qt drag."""
+        if item is self.drop_indicator_item:
+            return
+        if self.drop_indicator_item is not None:
+            try:
                 font = self.drop_indicator_item.font()
                 font.setBold(False)
                 self.drop_indicator_item.setFont(font)
-            
-            # Highlight current item
-            if item and item.data(Qt.UserRole):  # Has collection name
-                font = item.font()
-                font.setBold(True)
-                item.setFont(font)
-                self.drop_indicator_item = item
-                event.acceptProposedAction()
-            else:
-                self.drop_indicator_item = None
-                event.ignore()
-            
-            return
-        
-        event.ignore()
-    
-    def dragLeaveEvent(self, event):
-        """Handle drag leave - clear highlight and emit signal"""
-        if self.drop_indicator_item:
-            font = self.drop_indicator_item.font()
-            font.setBold(False)
-            self.drop_indicator_item.setFont(font)
-            self.drop_indicator_item = None
-        
-        # Emit signal to notify that drag left the collection area
-        self.drag_left_collection.emit()
-    
-    def dropEvent(self, event):
-        """Handle drop - add files to collection"""
-        # Clear highlight
-        if self.drop_indicator_item:
-            font = self.drop_indicator_item.font()
-            font.setBold(False)
-            self.drop_indicator_item.setFont(font)
-            self.drop_indicator_item = None
-        
-        # Check if dropped on valid collection item
-        item = self.itemAt(event.pos())
-        if not item:
-            event.ignore()
-            return
-        
-        collection_name = item.data(Qt.UserRole)
+                self.drop_indicator_item.setData(Qt.BackgroundRole, None)
+            except RuntimeError:
+                pass  # item gone (list refreshed mid-drag)
+        self.drop_indicator_item = item
+        if item is not None:
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            item.setBackground(QtGui.QBrush(QColor(*self._DROP_HIGHLIGHT_COLOR)))
+
+    def add_selection_to_collection(self, source, item):
+        """
+        Add the selected assets of the file list `source` to the collection
+        `item` stands for. Returns True if anything was sent.
+        """
+        collection_name = item.data(Qt.UserRole) if item else None
         if not collection_name:
-            event.ignore()
-            return
-        
-        # Get file paths from source
-        source = event.source()
-        if not isinstance(source, MayaStyleListView):
-            event.ignore()
-            return
-        
-        # Get selected assets from file list
-        indexes = source.selectedIndexes()
+            return False
+
         file_paths = []
-        
-        for index in indexes:
+        for index in source.selectedIndexes():
             if index.isValid():
                 asset = source.model().data(index, Qt.UserRole)
                 if not asset or asset.is_folder:
@@ -2634,63 +2563,150 @@ class DragDropCollectionListWidget(QListWidget):
                     file_paths.extend(str(f) for f in asset.texture_set.files)
                 else:
                     file_paths.append(str(asset.file_path))
-        
-        if file_paths:
-            # Emit signal with collection name and file paths
-            self.files_dropped_on_collection.emit(collection_name, file_paths)
+
+        if not file_paths:
+            return False
+        self.files_dropped_on_collection.emit(collection_name, file_paths)
+        return True
+
+    def dragMoveEvent(self, event):
+        """Handle drag move - highlight collection under cursor"""
+        if event.source() and isinstance(event.source(), MayaStyleListView):
+            item = self.itemAt(event.pos())
+            item = item if item and item.data(Qt.UserRole) else None  # Has collection name
+            self.set_drop_highlight(item)
+            if item:
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return
+
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        """Handle drag leave - clear highlight and emit signal"""
+        self.set_drop_highlight(None)
+
+        # Emit signal to notify that drag left the collection area
+        self.drag_left_collection.emit()
+
+    def dropEvent(self, event):
+        """Handle drop - add files to collection"""
+        self.set_drop_highlight(None)
+        source = event.source()
+        if (isinstance(source, MayaStyleListView)
+                and self.add_selection_to_collection(source, self.itemAt(event.pos()))):
             event.acceptProposedAction()
         else:
             event.ignore()
 
 
-# Qt-free decode/tonemap logic lives in sequence_decode.py - imported
-# here (and used verbatim below) so cache.py/quick_view.py/preview_panel.py
-# can keep importing these names from widgets, while
-# sequence_decode_worker.py can import the same functions without pulling
-# in any Qt/Maya dependency (see sequence_decode.py's module docstring).
-from .sequence_decode import (
-    _resize_float_rgb, _compute_auto_mip_level, load_oiio_image_array,
-    decode_tiff_array, tonemap_hdr_linear_array, tonemap_tx_array,
-    decode_sequence_frame_raw,
-)
+def _resize_float_rgb(img, new_width, new_height):
+    """Resize a float32 (H,W,C) image without cv2 (avoids numpy/cv2 ABI mismatch)."""
+    import numpy as np
+    from PIL import Image
+    channels = []
+    for c in range(img.shape[2]):
+        ch = np.ascontiguousarray(img[:, :, c], dtype=np.float32)
+        pil = Image.fromarray(ch, mode='F').resize((new_width, new_height), Image.BILINEAR)
+        channels.append(np.asarray(pil, dtype=np.float32))
+    return np.stack(channels, axis=2)
 
 
-def load_tiff_fast(file_path, max_size=1024):
+def load_oiio_image_array(file_path, max_size=2048, mip_level=0):
     """
-    Load a TIFF preview via OpenImageIO with its native pixel format (no
-    float upcast for uint8-native TIFFs). Single-decoder fast path shared by
-    the Preview panel and Quick View (single-file and grid mode).
-
-    Measured on real 4K Megascans TIFFs: ~2.3x faster than PIL for
-    uncompressed uint8, ~1.6x faster for LZW-compressed, and it's the only
-    decoder among PIL/tifffile/Qt's QImageReader that reliably handles
-    uncompressed float32 TIFFs (PIL can't open them at all; QImageReader
-    opens them but took ~900ms vs this path's ~150-200ms).
-
+    Load image using OpenImageIO and return as numpy array (worker thread safe).
+    Simpler version of load_oiio_image that returns raw array instead of QPixmap.
+    
     Args:
-        file_path: Path to the TIFF file
-        max_size: Maximum width/height for the returned pixmap
-
+        file_path: Path to image file
+        max_size: Maximum width/height for thumbnail
+        mip_level: Mipmap level to load (0 = full res, 1 = half res, etc.)
+        
     Returns:
-        tuple: (QPixmap, resolution_string) or (None, None) on failure
+        numpy array (RGB, uint8) or None on failure
     """
-    array, resolution_str = decode_tiff_array(file_path, max_size=max_size)
-    if array is None:
-        return None, None
     try:
-        try:
-            from PySide6.QtGui import QImage, QPixmap
-        except ImportError:
-            from PySide2.QtGui import QImage, QPixmap
-
-        hh, ww = array.shape[:2]
-        q_image = QImage(array.tobytes(), ww, hh, ww * 3, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(q_image.copy())
-        if pixmap and not pixmap.isNull():
-            return pixmap, resolution_str
-        return None, None
-    except Exception:
-        return None, None
+        import sys
+        import os
+        from .utils import get_external_libs_dir
+        external_libs = get_external_libs_dir()
+        if external_libs not in sys.path:
+            sys.path.append(external_libs)
+        
+        from OpenImageIO import ImageInput
+        import numpy as np
+        
+        file_path_str = str(file_path)
+        
+        # Open image
+        inp = ImageInput.open(file_path_str)
+        if not inp:
+            return None
+        
+        # Get image spec
+        spec = inp.spec()
+        width = spec.width
+        height = spec.height
+        
+        # If mipmap requested and available
+        if mip_level > 0 and spec.get_int_attribute('miplevels', 1) > mip_level:
+            inp.seek_subimage(0, mip_level)
+            spec = inp.spec()
+            width = spec.width
+            height = spec.height
+        
+        # Check valid dimensions
+        if width <= 0 or height <= 0:
+            return None
+        
+        # Read pixels
+        pixels = inp.read_image()
+        inp.close()
+        
+        if pixels is None:
+            return None
+        
+        # Convert to numpy array
+        img = np.array(pixels, dtype=np.float32)
+        
+        if img.size == 0:
+            return None
+        
+        # Handle different channel counts
+        if img.ndim == 2:
+            # Grayscale -> RGB
+            img = np.stack([img, img, img], axis=2)
+        elif img.ndim == 3:
+            actual_channels = img.shape[2]
+            if actual_channels == 1:
+                img = np.concatenate([img, img, img], axis=2)
+            elif actual_channels == 2:
+                img = np.concatenate([img[:,:,0:1], img[:,:,0:1], img[:,:,0:1]], axis=2)
+            elif actual_channels == 4:
+                # RGBA -> RGB
+                img = img[:, :, :3]
+            elif actual_channels > 4:
+                # Take first 3 channels
+                img = img[:, :, :3]
+        
+        # Resize if needed
+        if width > max_size or height > max_size:
+            scale = min(max_size / width, max_size / height)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            
+            if new_width < 1 or new_height < 1:
+                return None
+            
+            img = _resize_float_rgb(img, new_width, new_height)
+        
+        # Return as float32 [0-inf] - caller will handle tone mapping
+        # This allows HDR/ACEScg color management in the worker thread
+        return img
+        
+    except Exception as e:
+        return None
 
 
 def load_oiio_image(file_path, max_size=2048, mip_level=0, exposure=0.0, metadata_manager=None):
@@ -2701,8 +2717,7 @@ def load_oiio_image(file_path, max_size=2048, mip_level=0, exposure=0.0, metadat
     Args:
         file_path: Path to image file
         max_size: Maximum width/height for preview
-        mip_level: Mipmap level to load (0 = full res, 1 = half res, etc.),
-                   or 'auto' to pick the smallest mip level that still covers max_size
+        mip_level: Mipmap level to load (0 = full res, 1 = half res, etc.)
         exposure: Exposure compensation in stops (0.0 = neutral)
         metadata_manager: Optional metadata manager for tag-based color management
         
@@ -2754,19 +2769,13 @@ def load_oiio_image(file_path, max_size=2048, mip_level=0, exposure=0.0, metadat
         #     print(f"[OIIO]   Format: {metadata['format']}, Compression: {metadata['compression']}")
         #     print(f"[OIIO]   Color Space: {metadata['color_space']}")
         
-        # Seek to the requested mip level, probing downward if it doesn't
-        # exist (seek_subimage() is the source of truth - the 'miplevels'
-        # spec attribute is not reliably populated, see _compute_auto_mip_level)
-        if mip_level == 'auto':
-            mip_level = _compute_auto_mip_level(width, height, max_size)
-
-        while mip_level > 0 and not inp.seek_subimage(0, mip_level):
-            mip_level -= 1
-        if mip_level > 0:
+        # If mipmap requested and available
+        if mip_level > 0 and spec.get_int_attribute('miplevels', 1) > mip_level:
+            inp.seek_subimage(0, mip_level)
             spec = inp.spec()
             width = spec.width
             height = spec.height
-
+        
         resolution_str = f"{width} x {height}"
         
         # Debug: Check for invalid dimensions
@@ -2823,74 +2832,55 @@ def load_oiio_image(file_path, max_size=2048, mip_level=0, exposure=0.0, metadat
             img = _resize_float_rgb(img, new_width, new_height)
             width, height = new_width, new_height
         
-        # Detect color space: "ACEScg", "DCI-P3", or "Linear sRGB"
-        detected_colorspace = "Linear sRGB"
-
+        # Detect ACES color space
+        use_aces = False
+        
+        # Method 1: Check filename for ACEScg marker (RenderMan .tx convention)
+        # Example: "texture_ACEScg.tx" or "env_scene-linear Rec.709-sRGB_ACEScg.hdr.tx"
         from pathlib import Path
-        file_path_obj = Path(file_path_str)
-        filename = file_path_obj.stem.lower()  # Get filename without extension
-
-        if file_path_obj.suffix.lower() == '.tx':
-            # .tx files: filename render-colorspace suffix is authoritative
-            # (same rule as aces_color.auto_tag_file_colorspace's .tx branch -
-            # kept in sync here so Preview/Quick View never disagrees with the
-            # tag a file was auto-tagged with). Does NOT apply to any other
-            # extension reaching this loader (e.g. the EXR fallback path below).
-            colorspace_suffix_map = [
-                ('acescg', "ACEScg"),
-                ('scene-linear rec.2020', "ACEScg"),          # close enough to ACEScg's AP1 gamut
-                ('scene-linear rec.709-srgb', "Linear sRGB"),
-                ('scene-linear dci-p3', "DCI-P3"),
-            ]
-            matched = None
-            for suffix, colorspace in colorspace_suffix_map:
-                if suffix in filename:
-                    matched = colorspace
-                    break
-            # No explicit indicator - .tx files in this pipeline default to ACEScg
-            detected_colorspace = matched if matched else "ACEScg"
-        else:
-            # Method 1: Check filename for ACEScg marker (legacy, non-.tx formats)
-            use_aces = False
-            if '_acescg' in filename or '-acescg' in filename or 'acescg' in filename:
-                use_aces = True
-
-            # Method 2: Check OIIO metadata color_space attribute
-            if not use_aces and metadata.get('color_space', '').lower() in ['acescg', 'aces', 'aces_cg']:
-                use_aces = True
-
-            # Method 3: Check tags (if metadata_manager provided)
-            if not use_aces and metadata_manager:
-                try:
-                    file_metadata = metadata_manager.get_file_metadata(str(file_path))
-                    file_tags = file_metadata.get('tags', [])
-                    tag_names_lower = [tag['name'].lower() for tag in file_tags]
-
-                    if "acescg" in tag_names_lower or "srgb(aces)" in tag_names_lower:
-                        use_aces = True
-                except:
-                    pass
-
-            detected_colorspace = "ACEScg" if use_aces else "Linear sRGB"
-
+        filename = Path(file_path_str).stem.lower()  # Get filename without extension
+        
+        # Debug: Show what we're checking (disabled for production)
+        # if file_path_str.lower().endswith('.tx'):
+        #     print(f"[OIIO] Checking filename stem: '{filename}'")
+        
+        if '_acescg' in filename or '-acescg' in filename or 'acescg' in filename:
+            use_aces = True
+            # print(f"[OIIO] ✓ Detected ACEScg from filename: {Path(file_path_str).name}")
+        
+        # Method 2: Check OIIO metadata color_space attribute
+        if not use_aces and metadata.get('color_space', '').lower() in ['acescg', 'aces', 'aces_cg']:
+            use_aces = True
+            # print(f"[OIIO] Detected ACEScg from metadata: {metadata['color_space']}")
+        
+        # Method 3: Check tags (if metadata_manager provided)
+        if not use_aces and metadata_manager:
+            try:
+                file_metadata = metadata_manager.get_file_metadata(str(file_path))
+                file_tags = file_metadata.get('tags', [])
+                tag_names_lower = [tag['name'].lower() for tag in file_tags]
+                
+                if "acescg" in tag_names_lower or "srgb(aces)" in tag_names_lower:
+                    use_aces = True
+                    # print(f"[OIIO] Detected ACEScg from tags: {[tag['name'] for tag in file_tags]}")
+            except:
+                pass
+        
+        # Debug: Print final color management decision (disabled for production)
+        # if file_path_str.lower().endswith('.tx'):
+        #     if use_aces:
+        #         print(f"[OIIO] → Using ACES view transform")
+        #     else:
+        #         print(f"[OIIO] → Using standard filmic tone mapping")
+        
         # Apply exposure compensation with -1 stop offset (match Nuke/Maya)
         compensated_exposure = exposure - 1.0
-
+        
         # Apply color management and tone mapping
-        # NOTE: ACES/DCI-P3 view transforms apply whenever detected, regardless
-        # of value range - most .tx textures (Albedo, Roughness, etc.) are
-        # LDR (max <= 1.0) but still need the gamut/display transform, not
-        # just a range check. Matches cache.py's thumbnail generator, which
-        # applies it unconditionally too - previously this was gated on
-        # img.max() > 1.0, so LDR-tagged .tx files silently fell through to
-        # plain gamma with no color management applied at all.
-        if detected_colorspace == "ACEScg":
+        if use_aces and img.max() > 1.0:
+            # ACES view transform for HDR .tx files
             from .aces_color import apply_aces_view_transform
             img = apply_aces_view_transform(img, exposure=compensated_exposure)
-        elif detected_colorspace == "DCI-P3":
-            from .aces_color import apply_dci_p3_view_transform
-            # No baked-in exposure offset - matches Linear sRGB (LDR texture data)
-            img = apply_dci_p3_view_transform(img, exposure=0.0)
         else:
             # Standard tone mapping
             if exposure != 0.0:

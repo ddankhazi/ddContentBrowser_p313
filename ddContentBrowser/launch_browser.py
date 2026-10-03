@@ -28,6 +28,10 @@ def launch(force_reload=True):
             # importing browser, so code edits actually take effect.
             browser_mod = sys.modules.get('ddContentBrowser.browser')
             if browser_mod is not None:
+                # the fresh module installs its own Maya-exit callback
+                remove_exit = getattr(browser_mod, '_remove_exit_callback', None)
+                if remove_exit is not None:
+                    remove_exit()
                 inst = getattr(browser_mod, '_content_browser_instance', None)
                 if inst is not None:
                     try:

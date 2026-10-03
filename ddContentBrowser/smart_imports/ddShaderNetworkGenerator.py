@@ -9,6 +9,17 @@ import hashlib
 
 import maya.cmds as cmds
 
+# Paths that reach a file node go through to_maya_path() first, so a texture
+# browsed over its UNC name (\\server\share\...) is baked into the scene as
+# the mapped drive letter (W:\...) instead. Falls back to a pass-through when
+# this module is run detached from the browser package, since it's also
+# usable as a standalone script.
+try:
+    from ddContentBrowser.utils import to_maya_path
+except Exception:
+    def to_maya_path(path):
+        return str(path) if path is not None else path
+
 # -------------------------------
 # Config loading (JSON sidecar)
 # -------------------------------
@@ -16,7 +27,9 @@ import maya.cmds as cmds
 _DEFAULT_CONFIG = {
     "channel_aliases": {
         "baseColor": ["basecolor", "base_color", "base", "albedo", "diffuse", "diff", "color", "col"],
-        "roughness": ["roughness", "rough", "glossiness", "gloss"],
+        "roughness": ["roughness", "rough"],
+        # Inverse of roughness - inverted on the way in, never wired raw.
+        "gloss": ["glossiness", "gloss"],
         "metalness": ["metalness", "metallic", "metal", "met"],
         "normal": ["normal", "normalmap", "nrm", "nor", "norm"],
         "bump": ["bump", "bumpmap"],
@@ -138,6 +151,13 @@ def _channel_dst_attr(material, channel):
                 return a
         return None
 
+    # A gloss map drives the same input as roughness, just inverted on the
+    # way in (see _ensure_gloss_invert_chain) - so it resolves to the
+    # roughness plug here, which also makes the "already connected" checks
+    # treat roughness and gloss as competing for one input.
+    if channel == "gloss":
+        channel = "roughness"
+
     if t == "openPBRSurface":
         mapping = {
             "baseColor":    ["baseColor"],
@@ -224,14 +244,24 @@ def _dst_has_input(dst_attr):
     """Return True if dst_attr already has an incoming connection."""
     return bool(cmds.listConnections(dst_attr, s=True, d=False, plugs=True))
 
+# File nodes that must never be picked up for reuse - set for the duration
+# of a build_texture_set_material() call (see its no_reuse_file_nodes).
+_NO_REUSE_FILE_NODES = frozenset()
+
 def _find_file_node_by_path(path_or_pattern):
-    """Return the first file node whose fileTextureName equals the given path_or_pattern (exact match)."""
+    """Return the first file node whose fileTextureName equals the given
+    path_or_pattern. Both sides are run through to_maya_path() so a node
+    still holding the UNC spelling of a path (built before this
+    normalization, or by another tool) is recognized as the same texture."""
+    wanted = to_maya_path(path_or_pattern)
     for n in cmds.ls(type="file") or []:
+        if n in _NO_REUSE_FILE_NODES:
+            continue
         try:
             v = cmds.getAttr(n + ".fileTextureName")
         except Exception:
             continue
-        if v == path_or_pattern:
+        if to_maya_path(v) == wanted:
             return n
     return None
 
@@ -486,8 +516,14 @@ def _create_file_node(label, texture_path_or_pattern, is_udim, colorspace, place
     name = label + "_file"
     created_new = False
 
+    # Single choke point for every file node this module builds (texture
+    # sets, folder scans, displacement) - normalize UNC -> mapped drive here
+    # so the node reuse lookup below compares the same form it writes out.
+    texture_path_or_pattern = to_maya_path(texture_path_or_pattern)
+
     # Prefer a named node if it exists
-    node = name if cmds.objExists(name) and cmds.nodeType(name) == "file" else None
+    node = name if (cmds.objExists(name) and cmds.nodeType(name) == "file"
+                    and name not in _NO_REUSE_FILE_NODES) else None
 
     # Else, try to reuse any file node already pointing to this path/pattern
     if not node:
@@ -604,6 +640,27 @@ def _ensure_emission_rayswitch(label, file_node, material, dst_attr="emissionCol
         pass
 
     return rs
+
+
+def _ensure_gloss_invert_chain(label, file_node, material, dst_attr):
+    """
+    Wire a glossiness map into a roughness input through an inversion.
+
+    Gloss and roughness are complements (roughness = 1 - gloss), so feeding
+    a gloss map straight into specularRoughness renders the surface exactly
+    backwards - polished where it should be matte. A plain Maya `reverse`
+    node does the 1-x, so this needs no plugin (unlike floatMath's
+    lookdevKit) and works for every shader type.
+    """
+    r_name = label + "_glossInvert"
+    if cmds.objExists(r_name) and cmds.nodeType(r_name) == "reverse":
+        r_node = r_name
+    else:
+        r_node = cmds.shadingNode("reverse", asUtility=True, n=r_name)
+
+    _connect_if_free(file_node + ".outColorR", r_node + ".inputX")
+    _connect_if_free(r_node + ".outputX", material + "." + dst_attr)
+    return r_node
 
 
 def _ensure_normal_chain(label, file_node, material):
@@ -772,6 +829,9 @@ def _connect_channel(material, channel, file_node, invert_normal_g=False):
     elif channel == "roughness":
         _connect_if_free(file_node + ".outColorR", dst)
 
+    elif channel == "gloss":
+        _ensure_gloss_invert_chain(material + "_gloss", file_node, material, dst_attr)
+
     elif channel == "metalness":
         _connect_if_free(file_node + ".outColorR", dst)
 
@@ -818,7 +878,8 @@ def _build_for_material(material, base_dir, shapes_for_material):
 
     found = {}
     # Determine candidate textures for the key channels
-    for ch in ["baseColor", "roughness", "metalness", "normal", "emission", "opacity", "transmission", "height", "displacement"]:
+    for ch in ["baseColor", "roughness", "gloss", "metalness", "normal", "emission",
+               "opacity", "transmission", "height", "displacement"]:
         tex, is_udim = _scan_textures_for_channel(base_dir, roots, ch)
         found[ch] = (tex, is_udim)
 
@@ -830,6 +891,7 @@ def _build_for_material(material, base_dir, shapes_for_material):
         "baseColor": "sRGB",
         "emission":  "sRGB",
         "roughness": "Raw",
+        "gloss":     "Raw",
         "metalness": "Raw",
         "normal":    "Raw",
         "opacity":   "Raw",
@@ -843,7 +905,10 @@ def _build_for_material(material, base_dir, shapes_for_material):
         a = _channel_dst_attr(material, ch)
         return material + "." + a if a else None
 
-    for ch in ["baseColor", "roughness", "metalness", "normal", "emission", "opacity", "transmission"]:
+    # "gloss" sits right after "roughness": both resolve to the same dst
+    # plug, so once a real roughness map is wired the gloss one is skipped
+    # by the _dst_has_input() check below - roughness wins, as it should.
+    for ch in ["baseColor", "roughness", "gloss", "metalness", "normal", "emission", "opacity", "transmission"]:
         dst = _dst(material, ch)
         if not dst:
             continue
@@ -1005,7 +1070,10 @@ def _channels_signature(channels):
     Same signature = same graph, safe to reuse; different signature = the
     graph would actually differ, so a separate material is built.
     """
-    key = "|".join("{0}={1}".format(ch, channels[ch]) for ch in sorted(channels.keys()))
+    # Normalized like the file nodes themselves, so the same texture set
+    # reached once over UNC and once over its mapped drive still hashes the
+    # same and reuses one material instead of building a duplicate.
+    key = "|".join("{0}={1}".format(ch, to_maya_path(channels[ch])) for ch in sorted(channels.keys()))
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:10]
 
 
@@ -1133,6 +1201,78 @@ def _build_displacement_chain(material, disp_tex, shared_place2d, shapes_to_set)
         _set_shape_disp_settings(shapes_to_set, shader_type=shader_type)
 
 
+def _drop_redundant_gloss(set_name, channels):
+    """
+    Roughness wins over gloss when a set ships both - they drive the same
+    shader input, and the real roughness map needs no inversion. Returns
+    `channels` unchanged unless there's something to drop (so the channel
+    signature this feeds also reflects what actually gets built).
+    """
+    if not (channels.get("roughness") and channels.get("gloss")):
+        return channels
+    print("[ShaderGen] Set '{0}' has both roughness and gloss - using roughness, "
+          "ignoring '{1}'.".format(set_name, os.path.basename(str(channels["gloss"]))))
+    trimmed = dict(channels)
+    trimmed.pop("gloss")
+    return trimmed
+
+
+_TEXTURE_SET_CHANNEL_CS = {
+    "baseColor": "sRGB", "emission": "sRGB", "translucency": "sRGB",
+    "roughness": "Raw", "gloss": "Raw", "metalness": "Raw", "normal": "Raw",
+    "opacity": "Raw", "transmission": "Raw", "height": "Raw", "displacement": "Raw",
+}
+_TEXTURE_SET_SUPPORTED_CHANNELS = ["baseColor", "roughness", "gloss", "metalness", "normal", "emission",
+                                   "opacity", "transmission", "translucency"]
+
+
+def _build_texture_set(set_name, channels, shader_type, disp_shapes):
+    """
+    Build (or reuse, see _get_or_create_material) the material for one
+    texture set. disp_shapes get the displacement-friendly shape settings
+    if the set has a displacement/height channel. Returns (material, sg).
+    """
+    channels = _drop_redundant_gloss(set_name, channels)
+
+    material, sg = _get_or_create_material(_sanitize_name(set_name) + "_MAT", shader_type, channels)
+    shared_place2d = _get_or_create_shared_place2d(material)
+
+    for ch in _TEXTURE_SET_SUPPORTED_CHANNELS:
+        path = channels.get(ch)
+        if not path:
+            continue
+        fnode = _create_file_node(
+            "{0}_{1}".format(material, ch), path, _looks_like_udim(path),
+            colorspace=_TEXTURE_SET_CHANNEL_CS.get(ch, "Raw"), place2d=shared_place2d
+        )
+        if ch == "normal":
+            _connect_channel(material, ch, fnode, invert_normal_g=_path_contains_megascans(path))
+        else:
+            _connect_channel(material, ch, fnode)
+
+    # Bump: normal always takes priority. Only wire bump (via bump2d)
+    # when there's no normal map in this set. dGecko has no .normalCamera
+    # input for bump2d to feed - not wired for that shader type.
+    bump_path = channels.get("bump")
+    if bump_path and not channels.get("normal") and shader_type != "dGecko":
+        bfile = _create_file_node(
+            "{0}_bump".format(material), bump_path, _looks_like_udim(bump_path),
+            colorspace="Raw", place2d=shared_place2d
+        )
+        _ensure_bump2d_chain(material + "_bump", bfile, material)
+
+    # Displacement: prefer displacement, else height as displacement
+    disp_path = channels.get("displacement") or channels.get("height")
+    if disp_path:
+        print("[ShaderGen] Building displacement chain from '{0}'.".format(disp_path))
+        _build_displacement_chain(material, disp_path, shared_place2d, disp_shapes)
+    else:
+        print("[ShaderGen] No displacement/height channel in set '{0}' - skipping displacement chain.".format(set_name))
+
+    print("[ShaderGen] Built material '{0}' from set '{1}'".format(material, set_name))
+    return material, sg
+
+
 def build_from_texture_sets(texture_sets, shader_type="aiStandardSurface", assign_to_selection=True):
     """
     Build shader network(s) from explicit texture set(s).
@@ -1156,61 +1296,46 @@ def build_from_texture_sets(texture_sets, shader_type="aiStandardSurface", assig
     # Only auto-assign when a single set is dropped onto a selection (unambiguous)
     do_assign = bool(selected_shapes) and len(texture_sets) == 1
 
-    channel_cs = {
-        "baseColor": "sRGB", "emission": "sRGB", "translucency": "sRGB",
-        "roughness": "Raw", "metalness": "Raw", "normal": "Raw",
-        "opacity": "Raw", "transmission": "Raw", "height": "Raw", "displacement": "Raw",
-    }
-    supported = ["baseColor", "roughness", "metalness", "normal", "emission", "opacity", "transmission", "translucency"]
-
     created = []
     for ts in texture_sets:
         set_name = ts.get("name") or "texture_set"
-        channels = ts.get("channels") or {}
-
-        material, sg = _get_or_create_material(_sanitize_name(set_name) + "_MAT", shader_type, channels)
+        material, sg = _build_texture_set(set_name, ts.get("channels") or {}, shader_type,
+                                          selected_shapes if do_assign else [])
         created.append(material)
-        shared_place2d = _get_or_create_shared_place2d(material)
-
-        for ch in supported:
-            path = channels.get(ch)
-            if not path:
-                continue
-            fnode = _create_file_node(
-                "{0}_{1}".format(material, ch), path, _looks_like_udim(path),
-                colorspace=channel_cs.get(ch, "Raw"), place2d=shared_place2d
-            )
-            if ch == "normal":
-                _connect_channel(material, ch, fnode, invert_normal_g=_path_contains_megascans(path))
-            else:
-                _connect_channel(material, ch, fnode)
-
-        # Bump: normal always takes priority. Only wire bump (via bump2d)
-        # when there's no normal map in this set. dGecko has no .normalCamera
-        # input for bump2d to feed - not wired for that shader type.
-        bump_path = channels.get("bump")
-        if bump_path and not channels.get("normal") and shader_type != "dGecko":
-            bfile = _create_file_node(
-                "{0}_bump".format(material), bump_path, _looks_like_udim(bump_path),
-                colorspace="Raw", place2d=shared_place2d
-            )
-            _ensure_bump2d_chain(material + "_bump", bfile, material)
-
-        # Displacement: prefer displacement, else height as displacement
-        disp_path = channels.get("displacement") or channels.get("height")
-        if disp_path:
-            print("[ShaderGen] Building displacement chain from '{0}'.".format(disp_path))
-            _build_displacement_chain(material, disp_path, shared_place2d,
-                                      selected_shapes if do_assign else [])
-        else:
-            print("[ShaderGen] No displacement/height channel in set '{0}' - skipping displacement chain.".format(set_name))
-
         if do_assign:
             _assign_material_to_shapes(sg, selected_shapes)
 
-        print("[ShaderGen] Built material '{0}' from set '{1}'".format(material, set_name))
-
     print("[ShaderGen] Done. Created {0} material(s).".format(len(created)))
     return created
+
+
+def build_texture_set_material(set_name, channels, shader_type="aiStandardSurface",
+                               disp_shapes=None, no_reuse_file_nodes=None):
+    """
+    Build the material for a single texture set without assigning it - for
+    callers that do their own (e.g. per-face) assignment, like the DD
+    Content Browser's batch geo import.
+
+    Args:
+        set_name: texture set display name (the material is named after it).
+        channels: {channel_key: path}
+        shader_type: "aiStandardSurface", "openPBRSurface", or "dGecko"
+        disp_shapes: shapes that will use this material - they get the
+            displacement-friendly shape settings if the set has displacement.
+        no_reuse_file_nodes: file nodes that must not be picked up for reuse
+            just because they point at the same texture (e.g. the ones a geo
+            import just brought in with its own, about-to-be-deleted material).
+
+    Returns:
+        (material, shading_group)
+    """
+    global _NO_REUSE_FILE_NODES
+    if shader_type != "dGecko":
+        _ensure_mtoa()
+    _NO_REUSE_FILE_NODES = frozenset(no_reuse_file_nodes or ())
+    try:
+        return _build_texture_set(set_name or "texture_set", channels or {}, shader_type, disp_shapes or [])
+    finally:
+        _NO_REUSE_FILE_NODES = frozenset()
 
 

@@ -1,7 +1,8 @@
 {
   "channel_aliases": {
     "baseColor": ["basecolor", "base_color", "albedo", "diffuse", "diff", "color", "col"],
-    "roughness": ["roughness", "rough", "glossiness", "gloss"],
+    "roughness": ["roughness", "rough"],
+    "gloss": ["glossiness", "gloss"],
     "metalness": ["metalness", "metallic", "metal", "met"],
     "normal": ["normal", "normalmap", "nrm", "nor", "norm"],
     "height": ["height", "heightmap", "bumpheight"],

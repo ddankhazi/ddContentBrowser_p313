@@ -1770,6 +1770,8 @@ class FileSystemModel(QAbstractListModel):
     
     def mimeData(self, indexes):
         """Create MIME data for drag operation with MEL batch import command"""
+        from .utils import to_maya_path
+
         mime_data = QMimeData()
         urls = []
         paths = []
@@ -1784,12 +1786,14 @@ class FileSystemModel(QAbstractListModel):
                 # Texture set: build a shader graph on drop instead of importing files
                 if getattr(asset, 'is_texture_set', False) and asset.texture_set:
                     texture_set_assets.append(asset)
-                    urls.append(QUrl.fromLocalFile(str(asset.file_path)))
+                    urls.append(QUrl.fromLocalFile(to_maya_path(asset.file_path)))
                     continue
                 if not asset.is_folder:
-                    url = QUrl.fromLocalFile(str(asset.file_path))
-                    urls.append(url)
-                    paths.append(str(asset.file_path))
+                    # Mapped-drive form throughout: these URLs and the MEL
+                    # command below both end up inside Maya on a drop.
+                    file_path = to_maya_path(asset.file_path)
+                    urls.append(QUrl.fromLocalFile(file_path))
+                    paths.append(file_path)
                     assets.append(asset)
         
         # Texture set drag -> generate shader network(s) from the dropped set(s)

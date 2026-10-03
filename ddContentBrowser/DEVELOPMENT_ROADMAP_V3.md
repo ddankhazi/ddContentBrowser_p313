@@ -1,6 +1,13 @@
 # DD Content Browser - Development Roadmap v3.0
 
-**Last Updated:** October 15, 2025
+**Last Updated:** October 15, 2025 *(status note added October 3, 2026)*
+
+> **Status as of v2.5.0 (October 2026):** Most of Phase 1 and the core of Phase 4 have shipped, in a different shape than planned below (automatic on import instead of a right-click "Auto-Generate Material" / "Import as Megascans Asset" menu):
+> - Texture set detection & grouping, drag-to-build shader networks, auto-assign to the Maya selection (v2.0+)
+> - Auto material build on geo import - true batch import, texture sets matched per imported material / per object / per file, per-face assignments kept, one shared material per set, replaced import materials cleaned up (v2.5)
+> - Megascans: `VarN`/Atlas plant layouts, multi-resolution sets, LOD-specific normals, opt-in LOD proxy import sharing the material
+>
+> Still open from Phase 1: SkyDome Auto-Linker. See `README.md` ("Smart Import") for the current behavior.
 
 ---
 
