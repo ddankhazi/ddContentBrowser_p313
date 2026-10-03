@@ -16,6 +16,7 @@ DD Content Browser is a high-performance, feature-rich asset browser for Maya, d
 
 - **True batch geo import** - MMB drag and the Import action now import every selected geo back to back first, then build the texture set materials in one pass for the whole batch (folder scans cached, one TIF conversion progress for everything)
 - **Per-material / per-object texture sets** - In multi-object or per-face-assigned files each part gets its own texture set, matched by the imported material's name, then by the object's name - the file name (and the Megascans `VarN` layout) is only the fallback
+- **Import Asset Folders** - Right-click selected asset folders (e.g. Megascans downloads) → *Import Asset Folder(s)* → *High* or *LOD0*: the right geo file is picked from each folder (and its `VarN` plant folders) and goes through the same batch import
 - **One material per texture set** - A set used by many geos, objects or face groups across the batch is built once and shared
 - **Replaced import materials cleaned up** - The placeholder materials the import itself brought in, and that the texture set materials replaced, are removed - nothing else in the scene is ever touched
 - **MMB drag over Collections fixed** - Crossing the Collections panel no longer kills the drag; over a collection the cursor shows a copy sign and the target row is highlighted
@@ -117,6 +118,11 @@ Cheers, D
 ### Smart Import - Auto Material Build ✨ **Updated in v2.5!**
 - **Automatic on geo import** - Importing 3D files (Import action / Enter / double-click, or MMB drag to the viewport) looks for matching texture sets next to each file (own folder first, then subfolders) and auto-builds and assigns shader networks - no manual drag-to-build needed
 - **Batch first, materials after** - All selected geo is imported back to back, then the materials are built in one pass for the whole batch, with folder scans cached across files
+- **Import Asset Folders** - Select asset folders, right-click → *Import Asset Folder(s)* → *High* or *LOD0*. Each folder (and its `VarN` subfolders - never deeper, so a category folder selected by mistake imports nothing) gets one geo per asset:
+  - *High* uses LOD0 where there's no High (3D plants never ship one); *LOD0* never falls back to the heavier High
+  - Several formats of the same file: FBX > ABC > OBJ
+  - Untagged geo is only used when the folder has no High/LOD0 at all (so `_proxy`/ZTool extras are skipped); with `VarN` folders present, duplicate copies at the asset's top level are ignored
+  - The status bar reports how many files came in, how many used the LOD0 fallback and which folders had nothing to import
 - **Matched per material / per object** - Every shading assignment of an imported file (a whole object or a face group) gets its texture set by:
   1. the imported material's name - configured suffixes (`_MAT`, `_mtl`, ...), `_High`/`_LODn` and `_2K`/`_4K` tags and Maya's clash numbering (`RockA_MAT1`) are ignored,
   2. else the geo object's name,

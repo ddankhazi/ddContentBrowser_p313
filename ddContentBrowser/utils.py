@@ -2138,6 +2138,89 @@ def find_texture_set_by_name(name, geo_path, preferred_resolution="4K", strip_pa
     return None, False
 
 
+_ASSET_GEO_FORMAT_PRIORITY = ('.fbx', '.abc', '.obj')
+
+
+def find_asset_folder_geo(folder, level, importable_extensions):
+    """
+    The geo files to import for an asset folder at the requested detail
+    level - for "Import Asset Folders" on Megascans-style libraries (any
+    folder using the _High/_LODn naming works).
+
+    Looks in the folder's "VarN" subfolders (Megascans 3D plants) and only
+    if those hold no geo, in the folder itself (some older plants carry
+    duplicate copies of the Var geo at the top level too) - never deeper,
+    so selecting a whole category folder by mistake doesn't import hundreds
+    of assets. Within a folder, files are grouped by base name
+    (strip_geo_suffix()), one pick per base.
+
+    Per base: 'high' takes High, else LOD0 (3D plants never ship a High);
+    'LOD0' takes LOD0 - never High instead (much heavier). Untagged files
+    are only picked in a folder with no High/LOD0 geo at all (next to
+    tagged geo they're extras like _proxy or ZTool exports). When the
+    chosen level exists in several formats: FBX > ABC > OBJ > anything
+    else importable.
+
+    Args:
+        folder: the asset folder (Path or str).
+        level: 'high' or 'LOD0'.
+        importable_extensions: iterable of importable extensions (with or
+            without a leading '.').
+
+    Returns:
+        (paths, fell_back) - fell_back is how many picks used LOD0 because
+        'high' was requested but the base has no High.
+    """
+    folder = Path(folder)
+    exts = {('.' + e.lstrip('.')).lower() for e in importable_extensions}
+
+    def _format_rank(path):
+        ext = path.suffix.lower()
+        return (_ASSET_GEO_FORMAT_PRIORITY.index(ext) if ext in _ASSET_GEO_FORMAT_PRIORITY
+                else len(_ASSET_GEO_FORMAT_PRIORITY), ext)
+
+    try:
+        var_dirs = [d for d in folder.iterdir() if d.is_dir() and _VAR_FOLDER_REGEX.match(d.name)]
+    except OSError:
+        var_dirs = []
+    var_dirs.sort(key=lambda d: int(d.name[3:]))  # Var2 before Var10
+
+    order = ('high', 'LOD0', None) if level == 'high' else ('LOD0', None)
+
+    def _picks(directory):
+        try:
+            files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in exts]
+        except OSError:
+            return []
+        by_base = {}
+        for p in files:
+            base, suffix = strip_geo_suffix(p.stem)
+            if suffix and suffix.startswith('LOD') and suffix != 'LOD0':
+                continue  # only High, LOD0 or untagged can be picked
+            by_base.setdefault(base.lower(), {}).setdefault(suffix, []).append(p)
+        # A VarN folder holding its own VarN_* geo: ignore strays from other
+        # Vars (seen in real downloads: a Var4_LOD0 sitting in Var3)
+        own = directory.name.lower()
+        if own in by_base and _VAR_FOLDER_REGEX.match(directory.name):
+            by_base = {own: by_base[own]}
+        # Untagged files only count when the folder has no High/LOD0 at all -
+        # next to tagged geo they're extras (_proxy, ZTool exports, ...)
+        if any(set(v) - {None} for v in by_base.values()):
+            by_base = {b: v for b, v in by_base.items() if set(v) - {None}}
+        picks = []
+        for base in sorted(by_base):
+            variants = by_base[base]
+            for suffix in order:
+                if suffix in variants:
+                    picks.append((min(variants[suffix], key=_format_rank), suffix))
+                    break
+        return picks
+
+    picks = [pick for d in var_dirs for pick in _picks(d)] or _picks(folder)
+    fell_back = sum(1 for _, suffix in picks if level == 'high' and suffix == 'LOD0')
+    return [p for p, _ in picks], fell_back
+
+
 def find_lod_proxy_for_geo(geo_path, geo_suffix, importable_extensions):
     """
     Look for a lower-detail "LODN" proxy geo next to a just-imported geo

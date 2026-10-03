@@ -3691,6 +3691,48 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         print(f"[AutoMaterial] Removed {len(doomed)} replaced import shading node(s)")
         return len(doomed)
 
+    def import_asset_folders(self, level):
+        """
+        Import the selected asset folders' geo at `level` ('high' or 'LOD0' -
+        which files, see find_asset_folder_geo()) through the same batch
+        import + texture set material pipeline as an MMB drop.
+        """
+        if not MAYA_AVAILABLE:
+            self.safe_show_status("Maya not available")
+            return
+        from .utils import find_asset_folder_geo, get_importable_extensions
+
+        folders = [a.file_path for a in self.get_selected_assets() if a.is_folder]
+        if not folders:
+            return
+        exts = get_importable_extensions()
+        paths, fell_back, empty = [], 0, 0
+        for folder in folders:
+            found, used_lod0 = find_asset_folder_geo(folder, level, exts)
+            paths.extend(found)
+            fell_back += used_lod0
+            empty += not found
+
+        label = 'High' if level == 'high' else 'LOD0'
+        if not paths:
+            self.safe_show_status(f"No {label} geo found in the selected folder(s)", 4000)
+            return
+
+        imported, failed, built = self._smart_import_geo_files(paths)
+        msg = f"✓ Imported {imported} {label} geo file(s) from {len(folders)} folder(s)"
+        if built:
+            msg += f", {built} texture set material(s)"
+        notes = []
+        if fell_back:
+            notes.append(f"LOD0 used for {fell_back} without High")
+        if empty:
+            notes.append(f"{empty} folder(s) without matching geo")
+        if failed:
+            notes.append(f"{failed} failed")
+        if notes:
+            msg += " (" + ", ".join(notes) + ")"
+        self.safe_show_status(msg, 6000)
+
     def import_selected_file(self):
         """Import selected file or navigate into folder"""
         assets = self.get_selected_assets()
@@ -5189,6 +5231,16 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                     
                     add_fav_action = menu.addAction("⭐ Add to Favorites")
                     add_fav_action.triggered.connect(lambda: self.add_folder_to_favorites(asset.file_path))
+
+                    # Batch-import the selected asset folders' geo (Megascans-style)
+                    if MAYA_AVAILABLE:
+                        folder_count = sum(1 for a in self.get_selected_assets() if a.is_folder)
+                        import_menu = menu.addMenu("📦 Import Asset Folder" if folder_count == 1
+                                                   else f"📦 Import {folder_count} Asset Folders")
+                        high_action = import_menu.addAction("High (LOD0 where there's no High)")
+                        high_action.triggered.connect(lambda: self.import_asset_folders('high'))
+                        lod0_action = import_menu.addAction("LOD0")
+                        lod0_action.triggered.connect(lambda: self.import_asset_folders('LOD0'))
                 else:
                     # File context menu
                     import_action = menu.addAction("📥 Import")
