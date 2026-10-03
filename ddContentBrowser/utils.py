@@ -2157,9 +2157,12 @@ def find_asset_folder_geo(folder, level, importable_extensions):
     Per base: 'high' takes High, else LOD0 (3D plants never ship a High);
     'LOD0' takes LOD0 - never High instead (much heavier). Untagged files
     are only picked in a folder with no High/LOD0 geo at all (next to
-    tagged geo they're extras like _proxy or ZTool exports). When the
-    chosen level exists in several formats: FBX > ABC > OBJ > anything
-    else importable.
+    tagged geo they're extras like _proxy or ZTool exports), and when some
+    bases have a LOD chain (any _LODn file) and others don't, only the
+    ones with a chain are the asset - the rest are extras (e.g. pieces).
+    Formats rank FBX > ABC > OBJ > anything else importable: per file the
+    best one is taken, and per folder only picks in the best format present
+    are kept (Megascans' OBJs/ABCs are fallback copies or pieces).
 
     Args:
         folder: the asset folder (Path or str).
@@ -2193,10 +2196,13 @@ def find_asset_folder_geo(folder, level, importable_extensions):
         except OSError:
             return []
         by_base = {}
+        has_lod_chain = set()
         for p in files:
             base, suffix = strip_geo_suffix(p.stem)
-            if suffix and suffix.startswith('LOD') and suffix != 'LOD0':
-                continue  # only High, LOD0 or untagged can be picked
+            if suffix and suffix.startswith('LOD'):
+                has_lod_chain.add(base.lower())
+                if suffix != 'LOD0':
+                    continue  # only High, LOD0 or untagged can be picked
             by_base.setdefault(base.lower(), {}).setdefault(suffix, []).append(p)
         # A VarN folder holding its own VarN_* geo: ignore strays from other
         # Vars (seen in real downloads: a Var4_LOD0 sitting in Var3)
@@ -2207,6 +2213,11 @@ def find_asset_folder_geo(folder, level, importable_extensions):
         # next to tagged geo they're extras (_proxy, ZTool exports, ...)
         if any(set(v) - {None} for v in by_base.values()):
             by_base = {b: v for b, v in by_base.items() if set(v) - {None}}
+        # Geo with a LOD chain is the asset; single-level files next to it are
+        # extras (Debris_rb0gufa: a combined High+LOD6 FBX plus its pieces as
+        # High-only OBJs)
+        if any(b in has_lod_chain for b in by_base) and any(b not in has_lod_chain for b in by_base):
+            by_base = {b: v for b, v in by_base.items() if b in has_lod_chain}
         picks = []
         for base in sorted(by_base):
             variants = by_base[base]
@@ -2214,6 +2225,13 @@ def find_asset_folder_geo(folder, level, importable_extensions):
                 if suffix in variants:
                     picks.append((min(variants[suffix], key=_format_rank), suffix))
                     break
+        # One folder, one format: Megascans ships the same asset as FBX and
+        # as OBJ/ABC fallbacks (or as pieces in a fallback format), so only
+        # the best format present is imported (Debris_rb0gufa: a combined
+        # FBX plus its pieces as OBJs)
+        if picks:
+            best = min(_format_rank(p)[0] for p, _ in picks)
+            picks = [pk for pk in picks if _format_rank(pk[0])[0] == best]
         return picks
 
     picks = [pick for d in var_dirs for pick in _picks(d)] or _picks(folder)

@@ -315,7 +315,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                 from PySide6.QtCore import QTimer
             else:
                 from PySide2.QtCore import QTimer
-            QTimer.singleShot(100, self.show_help_overlay_briefly)
+            QTimer.singleShot(100, self, self.show_help_overlay_briefly)
         except:
             self.show_help_overlay_briefly()
         
@@ -811,7 +811,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                 from PySide2.QtCore import QTimer
             
             # Re-fit regardless (either pixmap or grid)
-            QTimer.singleShot(10, self._refit_on_first_show)
+            QTimer.singleShot(10, self, self._refit_on_first_show)
             
             # if DEBUG_MODE:
             #     print("[QuickView] First show - scheduling refit")

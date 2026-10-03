@@ -19,6 +19,7 @@ DD Content Browser is a high-performance, feature-rich asset browser for Maya, d
 - **Import Asset Folders** - Right-click selected asset folders (e.g. Megascans downloads) → *Import Asset Folder(s)* → *High* or *LOD0*: the right geo file is picked from each folder (and its `VarN` plant folders) and goes through the same batch import
 - **One material per texture set** - A set used by many geos, objects or face groups across the batch is built once and shared
 - **Replaced import materials cleaned up** - The placeholder materials the import itself brought in, and that the texture set materials replaced, are removed - nothing else in the scene is ever touched
+- **Floating video player** - Space on a video plays it in a floating, resizable window that stays open while you keep browsing (several videos selected = a playlist); Space play/pause, ←/→ previous/next, P pin, F fullscreen, Esc close
 - **MMB drag over Collections fixed** - Crossing the Collections panel no longer kills the drag; over a collection the cursor shows a copy sign and the target row is highlighted
 
 ---
@@ -120,8 +121,9 @@ Cheers, D
 - **Batch first, materials after** - All selected geo is imported back to back, then the materials are built in one pass for the whole batch, with folder scans cached across files
 - **Import Asset Folders** - Select asset folders, right-click → *Import Asset Folder(s)* → *High* or *LOD0*. Each folder (and its `VarN` subfolders - never deeper, so a category folder selected by mistake imports nothing) gets one geo per asset:
   - *High* uses LOD0 where there's no High (3D plants never ship one); *LOD0* never falls back to the heavier High
-  - Several formats of the same file: FBX > ABC > OBJ
+  - Formats rank FBX > ABC > OBJ - per file, and per folder too: only geo in the best format present is imported (Megascans' OBJs are fallback copies or separately exported pieces, e.g. numbered `_High` OBJs next to a single `_High` FBX)
   - Untagged geo is only used when the folder has no High/LOD0 at all (so `_proxy`/ZTool extras are skipped); with `VarN` folders present, duplicate copies at the asset's top level are ignored
+  - When some geo in a folder has a LOD chain (`_LODn` files) and other geo doesn't, only the geo with the chain is the asset - single-level extras (e.g. a debris set's separate pieces next to its combined file) are skipped
   - The status bar reports how many files came in, how many used the LOD0 fallback and which folders had nothing to import
 - **Matched per material / per object** - Every shading assignment of an imported file (a whole object or a face group) gets its texture set by:
   1. the imported material's name - configured suffixes (`_MAT`, `_mtl`, ...), `_High`/`_LODn` and `_2K`/`_4K` tags and Maya's clash numbering (`RockA_MAT1`) are ignored,
@@ -140,8 +142,16 @@ Cheers, D
 - **Undo** - One Ctrl+Z takes back the whole material step (build, assignment, cleanup); the geo stays in the scene, back on its imported materials. (Maya's file import itself can't be undone.)
 - **Texture Set Settings dialog** (`Settings > Texture Set Settings...`) - Dedicated panel for all of the above, plus VarN displacement toggle and `.tx`-as-Texture-Set grouping
 
+### Floating Video Player ✨ **NEW in v2.5!**
+- **Space on a video** - Plays it in a floating, resizable window (size and position remembered) - Quick View stays for images
+- **Stays open while you browse** - Made for watching a reference while you work: it only closes with **Esc** or its X button. Selecting images, folders or nothing leaves it playing
+- **Follow or pin** - Unpinned, selecting another video switches the player to it (quick skimming). **📌 Pin** (the button, or **P** in the player window) keeps it on its video whatever you select
+- **Several videos selected** - A playlist, starting at the focused video, with a counter in the title (e.g. `(2/5)`); **←/→** step through it and stop at either end - the browser selection stays as it is, and later selections don't change the playlist
+- **While open** - **Space** play/pause, **Esc** close and **←/→** (playlist) work from the browser and from the player window alike; **F** fullscreen and **P** pin in the player window
+- **Same player as the preview panel** - The panel's own player and controls move into the window and back, so there's never a second player running; meanwhile the panel shows selected videos as a still frame
+
 ### Quick View System ✨ **NEW!**
-- **Space to open** - macOS Quick Look-style floating preview
+- **Space to open** - macOS Quick Look-style floating preview (images; a video or a selection of videos opens the floating video player instead)
 - **Frameless window** - Custom title bar with close button (Space/Escape)
 - **Multi-file grid** - 2-100+ images in auto-layout (wide aspect preference)
 - **Canvas controls** - Mouse-centered scroll zoom, left-drag pan
@@ -261,7 +271,7 @@ Cheers, D
 
 | Shortcut           | Action                                           |
 |--------------------|--------------------------------------------------|
-| **Space**          | Quick View (floating preview)                    |
+| **Space**          | Quick View (floating preview) / video player; in the player: play/pause |
 | **F**              | Fit to view (in Quick View)                      |
 | **F5**             | Refresh current folder (force cache bypass)      |
 | **Delete**         | Delete selected files to Recycle Bin             |
@@ -278,7 +288,7 @@ Cheers, D
 | **Backspace**      | Go to parent folder                              |
 | **Ctrl+Scroll**    | Zoom thumbnails                                  |
 | **Alt+Left/Right** | Back/Forward navigation                          |
-| **Escape**         | Cancel path edit / Close Quick View              |
+| **Escape**         | Cancel path edit / Close Quick View / Close the video player |
 | **Arrow Keys**     | Navigation / Quick View file browsing            |
 | **1-5**            | Star rating (future feature)                     |
 | **Ctrl+1-7**       | Color labels (future feature)                    |

@@ -321,7 +321,7 @@ class BreadcrumbWidget(QWidget):
             elif event.type() == QEvent.FocusOut:
                 # Exit edit mode when focus is lost (clicked elsewhere)
                 # Use a short timer to avoid conflicts with returnPressed
-                QtCore.QTimer.singleShot(100, self.cancel_edit_mode)
+                QtCore.QTimer.singleShot(100, self, self.cancel_edit_mode)
                 return False  # Let the event propagate
         return super().eventFilter(obj, event)
     

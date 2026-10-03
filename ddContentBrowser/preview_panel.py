@@ -1111,6 +1111,61 @@ class SequencePlaybackWidget(QWidget):
             super().keyPressEvent(event)
 
 
+class FloatingVideoWindow(QWidget):
+    """
+    Floating, resizable video player (Space on video(s)). Holds the preview
+    panel's OWN video widget and controls while open - moved in, and back on
+    close (PreviewPanel.close_floating_video) - so there's only ever one
+    player. Owned by the browser window, deleted on close.
+
+    Keys: Space play/pause, Esc close (leaves fullscreen first), F fullscreen,
+    P pin, Left/Right previous/next video when several were selected.
+    """
+
+    def __init__(self, panel, parent):
+        super().__init__(parent, Qt.Window)
+        self.panel = panel
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setMinimumSize(320, 240)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Window-level shortcuts: they win over a focused control (Space would
+        # otherwise just press whichever button has focus)
+        self._shortcuts = {}
+        for key, slot in (("Space", panel.toggle_video_playback), ("Esc", self._on_escape),
+                          ("F", self.toggle_fullscreen), ("P", panel.toggle_floating_pin),
+                          ("Left", lambda: panel.step_floating_video(-1)),
+                          ("Right", lambda: panel.step_floating_video(1))):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(slot)
+            self._shortcuts[key] = shortcut
+        self.set_playlist_mode(False)
+
+    def set_playlist_mode(self, on):
+        """Left/Right step through the selected videos - only grabbed in
+        playlist mode, so otherwise the position slider keeps its arrow keys."""
+        for key in ("Left", "Right"):
+            self._shortcuts[key].setEnabled(on)
+
+    def _on_escape(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.close()
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def closeEvent(self, event):
+        self.panel._on_floating_video_closing(self)
+        super().closeEvent(event)
+
+
 class PreviewPanel(QWidget):
     """Preview panel showing file preview and metadata"""
     
@@ -1120,6 +1175,14 @@ class PreviewPanel(QWidget):
         self.config = config
         self.metadata_manager = metadata_manager  # For tag-based color management
         self.current_assets = []
+        self._floating_video = None  # FloatingVideoWindow while open
+        self._video_playlist = []  # selected videos it steps through (2+), else empty
+        self._video_playlist_index = 0
+        self._floating_pinned = False  # pinned: ignores the browser selection
+        self._floating_asset = None  # what the floating player is playing
+        self._floating_refresh_panel = True
+        # asset -> already generated browser thumbnail (QPixmap) or None; set by the browser
+        self.thumbnail_lookup = None
         self.current_pixmap = None  # Store scaled preview pixmap
         self.full_res_pixmap = None  # Store full resolution pixmap for zoom
         self.preview_cache = {}  # Cache: file_path -> (pixmap, resolution)
@@ -1943,6 +2006,21 @@ class PreviewPanel(QWidget):
         self.video_time_label.setStyleSheet(f"font-family: {UI_FONT}; color: #aaa;")
         video_layout.addWidget(self.video_time_label)
         
+        # Pin button - floating player only: pinned, it ignores the browser selection
+        self.video_pin_button = QToolButton()
+        self.video_pin_button.setText("📌")
+        self.video_pin_button.setCheckable(True)
+        self.video_pin_button.setStyleSheet("""
+            QToolButton { font-size: 11pt; background: transparent; border: none; border-radius: 4px; }
+            QToolButton:hover { background: #3a3a3a; }
+            QToolButton:checked { background: #3d5a80; }
+        """)
+        self.video_pin_button.setToolTip("Pin (P in the player window) - keep playing this video while you browse other files")
+        self.video_pin_button.setFixedSize(28, 28)
+        self.video_pin_button.toggled.connect(self._set_floating_pinned)
+        self.video_pin_button.hide()
+        video_layout.addWidget(self.video_pin_button)
+
         # Fullscreen button (AFTER timeline slider)
         self.video_fullscreen_button = QToolButton()
         # Use text instead of icon for consistent color
@@ -2380,21 +2458,11 @@ class PreviewPanel(QWidget):
         self.clear_metadata()
         self.exposure_controls.hide()  # Hide exposure controls
         self.text_controls.hide()  # Hide text controls
-        self.video_playback.hide()  # Hide video controls
-        
-        # Stop video playback and hide video widget
-        if self.media_player:
-            self.media_player.stop()
-            if PYSIDE_VERSION == 6:
-                from PySide6.QtCore import QUrl
-                self.media_player.setSource(QUrl())  # Clear source
-            else:
-                from PySide2.QtMultimedia import QMediaContent
-                self.media_player.setMedia(QMediaContent())  # Clear media
-            # Reset button icon
-            self.video_play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.video_widget.hide()
-        self.graphics_view.show()  # Show graphics view again
+        if self._floating_video is not None:
+            # The player and its controls are in the floating window - leave them be
+            self.graphics_view.show()
+        else:
+            self._reset_panel_video()
         
         # Clear EXR channel info
         self.current_exr_file_path = None
@@ -2415,6 +2483,24 @@ class PreviewPanel(QWidget):
         if hasattr(self, 'load_full_btn'):
             self.load_full_btn.setChecked(False)
             self.load_full_btn.setText("📄 Load Full")
+
+    def _reset_panel_video(self):
+        """Stop the panel's video and hide its widgets, graphics view back."""
+        self.video_playback.hide()  # Hide video controls
+        
+        # Stop video playback and hide video widget
+        if self.media_player:
+            self.media_player.stop()
+            if PYSIDE_VERSION == 6:
+                from PySide6.QtCore import QUrl
+                self.media_player.setSource(QUrl())  # Clear source
+            else:
+                from PySide2.QtMultimedia import QMediaContent
+                self.media_player.setMedia(QMediaContent())  # Clear media
+            # Reset button icon
+            self.video_play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.video_widget.hide()
+        self.graphics_view.show()  # Show graphics view again
     
     def on_exposure_slider_pressed(self):
         """User started dragging the exposure slider"""
@@ -4089,7 +4175,15 @@ class PreviewPanel(QWidget):
     def update_preview(self, assets):
         """Update preview panel with selected assets"""
         self.current_assets = assets
-        
+
+        # The floating video player never closes on its own. Unpinned (and not
+        # running a playlist) it switches to a newly selected single video;
+        # anything else selected, it keeps playing what it plays.
+        if (self._floating_video is not None and not self._floating_pinned and not self._video_playlist
+                and len(assets) == 1 and assets[0].is_video_file
+                and not self._player_has(assets[0].file_path)):
+            self._load_video_into_player(assets[0])
+
         # Refresh browse dialog colors if open (selection changed)
         if hasattr(self, '_active_browse_dialog') and self._active_browse_dialog:
             try:
@@ -4142,12 +4236,14 @@ class PreviewPanel(QWidget):
         # If we're NOT showing a video, ensure graphics_view is visible and video_widget is hidden
         # This fixes the issue where video → image switching doesn't update the display
         if not asset.is_video_file:
-            # Stop any playing video first
-            if hasattr(self, 'media_player') and self.media_player:
-                self.media_player.stop()
-            # Hide video widgets, show graphics view
-            self.video_widget.hide()
-            self.video_playback.hide()
+            # (not while the floating player has the video widgets - it keeps playing)
+            if self._floating_video is None:
+                # Stop any playing video first
+                if hasattr(self, 'media_player') and self.media_player:
+                    self.media_player.stop()
+                # Hide video widgets
+                self.video_widget.hide()
+                self.video_playback.hide()
             self.graphics_view.show()
         
         self.title_label.setText(f"Preview: {asset.name}")
@@ -4558,8 +4654,11 @@ class PreviewPanel(QWidget):
             # has one
             self._show_folder_thumbnail(asset)
         elif asset.is_video_file:
-            # Video file - extract middle frame for preview
-            self.show_video_preview(asset)
+            if self._floating_video is not None:
+                # The one player is busy in the floating window - a still here
+                self._show_video_still(asset)
+            else:
+                self.show_video_preview(asset)
         elif asset.is_pdf_file:
             # PDF file - show preview with page navigation
             self.show_pdf_preview(asset)
@@ -5074,7 +5173,7 @@ class PreviewPanel(QWidget):
             # Show confirmation in button
             original_text = self.copy_text_btn.text()
             self.copy_text_btn.setText("✓ Copied!")
-            QtCore.QTimer.singleShot(1500, lambda: self.copy_text_btn.setText(original_text))
+            QtCore.QTimer.singleShot(1500, self, lambda: self.copy_text_btn.setText(original_text))
     
     def pdf_previous_page(self):
         """Navigate to previous PDF page"""
@@ -5147,6 +5246,20 @@ class PreviewPanel(QWidget):
             self.show_placeholder_with_text("⚠️ Qt Multimedia not available\nVideo playback requires PySide6.QtMultimedia")
             return
         
+        # Hide graphics view, show video widget
+        self.graphics_view.hide()
+        self.video_widget.show()
+        self.video_playback.show()
+        self._load_video_into_player(asset)
+
+    def _load_video_into_player(self, asset):
+        """
+        Load a video into the (one) player - first frame shown, or playing
+        right away in the floating player (see on_media_status_changed).
+        Touches only the player and its controls, not the rest of the panel,
+        so the floating player can switch videos while the panel shows
+        something else.
+        """
         try:
             # Stop previous video if playing
             self.media_player.stop()
@@ -5156,11 +5269,9 @@ class PreviewPanel(QWidget):
             # Reset slider to beginning
             self.video_slider.setValue(0)
             self.video_time_label.setText("0:00 / 0:00")
-            
-            # Hide graphics view, show video widget
-            self.graphics_view.hide()
-            self.video_widget.show()
-            self.video_playback.show()
+            if self._floating_video is not None:
+                self._floating_asset = asset
+            self._update_floating_title(asset)
             
             # Detect FPS using OpenCV
             try:
@@ -5193,7 +5304,29 @@ class PreviewPanel(QWidget):
             print(f"[PREVIEW] Video preview error: {e}")
             import traceback
             traceback.print_exc()
-            self.show_placeholder_with_text(f"⚠️ Video preview error:\n{str(e)}")
+            if self._floating_video is None:
+                self.show_placeholder_with_text(f"⚠️ Video preview error:\n{str(e)}")
+
+    def _show_video_still(self, asset):
+        """
+        The panel's view of a video while the floating player is open: the
+        browser's own thumbnail of it (made in the background, read from
+        cache) or a short note. NEVER decode frames here - a second decoder
+        running next to the playing one hangs Maya (OpenCV + Qt Multimedia
+        FFmpeg in one process).
+        """
+        self.graphics_view.show()
+        pixmap = None
+        if self.thumbnail_lookup is not None:
+            try:
+                pixmap = self.thumbnail_lookup(asset)
+            except Exception:
+                pixmap = None
+        if pixmap is None:
+            self.show_placeholder_with_text("🎬 Video player is open")
+            return
+        self.current_pixmap = pixmap
+        self.fit_pixmap_to_label()
     
     def show_pdf_preview(self, asset):
         """Show PDF file preview with floating overlay navigation"""
@@ -6879,7 +7012,7 @@ class PreviewPanel(QWidget):
         except ImportError:
             from PySide2.QtCore import QTimer
         
-        QTimer.singleShot(50, lambda: scroll_area.verticalScrollBar().setValue(scroll_position))
+        QTimer.singleShot(50, self, lambda: scroll_area.verticalScrollBar().setValue(scroll_position))
     
     def _show_tag_context_menu(self, pos, button, dialog, tag_buttons):
         """Show context menu for tag button in browse dialog"""
@@ -8099,6 +8232,8 @@ class PreviewPanel(QWidget):
     
     def _pause_and_reset_video(self):
         """Helper to pause video and show first frame after brief play"""
+        if self._floating_video is not None:
+            return  # the floating player keeps playing (Space = watch it)
         if self.media_player:
             self.media_player.pause()
             # Only reset to 0 if we actually want the first frame (initial load)
@@ -8117,7 +8252,8 @@ class PreviewPanel(QWidget):
                     self._video_needs_initial_pause = False
                     self.media_player.setPosition(0)
                     self.media_player.play()
-                    QtCore.QTimer.singleShot(100, lambda: self._pause_and_reset_video())
+                    if self._floating_video is None:
+                        QtCore.QTimer.singleShot(100, self, lambda: self._pause_and_reset_video())
         else:
             from PySide2.QtMultimedia import QMediaPlayer
             if status == QMediaPlayer.LoadedMedia:
@@ -8125,8 +8261,9 @@ class PreviewPanel(QWidget):
                     self._video_needs_initial_pause = False
                     self.media_player.setPosition(0)
                     self.media_player.play()
-                    QtCore.QTimer.singleShot(100, lambda: self._pause_and_reset_video())
-    
+                    if self._floating_video is None:
+                        QtCore.QTimer.singleShot(100, self, lambda: self._pause_and_reset_video())
+
     def show_volume_popup(self):
         """Show volume slider popup below the volume button"""
         if not self.media_player:
@@ -8203,18 +8340,25 @@ class PreviewPanel(QWidget):
         """Toggle fullscreen mode for video widget with controls"""
         if not self.video_widget:
             return
-        
+
+        # In the floating player, fullscreen is that window's own state
+        if self._floating_video is not None:
+            self._floating_video.toggle_fullscreen()
+            return
+
         if hasattr(self, '_fullscreen_widget') and self._fullscreen_widget and self._fullscreen_widget.isVisible():
             # Exit fullscreen
             self._fullscreen_widget.hide()
             
             try:
-                # Stop and cleanup hide timer
-                if hasattr(self, '_fullscreen_hide_timer') and self._fullscreen_hide_timer:
-                    self._fullscreen_hide_timer.stop()
-                    self._fullscreen_hide_timer.deleteLater()
-                    self._fullscreen_hide_timer = None
-                
+                # Stop and cleanup hide + cursor tracking timers
+                for timer_attr in ('_fullscreen_hide_timer', '_cursor_tracking_timer'):
+                    timer = getattr(self, timer_attr, None)
+                    if timer:
+                        timer.stop()
+                        timer.deleteLater()
+                        setattr(self, timer_attr, None)
+
                 # Remove opacity effect and reset mouse transparency
                 if hasattr(self, '_fullscreen_opacity_effect'):
                     try:
@@ -8233,18 +8377,8 @@ class PreviewPanel(QWidget):
                 # Reset video playback controls style to normal
                 self.video_playback.setStyleSheet("")
                 
-                # Re-parent video widget back to preview layout (after graphics_view)
-                # Find the correct index (video should be after graphics_view, before controls)
-                graphics_view_index = self.preview_layout.indexOf(self.graphics_view)
-                self.preview_layout.insertWidget(graphics_view_index + 1, self.video_widget, 1)  # stretch factor 1
-                
-                # Re-parent controls back to preview layout (at the end)
-                self.preview_layout.addWidget(self.video_playback)
-                
-                # Show the widgets
-                self.video_widget.show()
-                self.video_playback.show()
-                
+                self._restore_video_widgets_to_panel()
+
                 # Update button text (exit fullscreen mode)
                 self.video_fullscreen_button.setText("⛶")
                 self.video_fullscreen_button.setToolTip("Fullscreen (F)")
@@ -8258,8 +8392,9 @@ class PreviewPanel(QWidget):
                 import traceback
                 traceback.print_exc()
         else:
-            # Create fullscreen widget
-            self._fullscreen_widget = QWidget()
+            # Create fullscreen widget - owned by the browser window, so it can
+            # never outlive it (a parentless window survives into Maya's exit)
+            self._fullscreen_widget = QWidget(self.window())
             self._fullscreen_widget.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
             self._fullscreen_widget.setStyleSheet("background-color: black;")
             self._fullscreen_widget.setMouseTracking(True)  # Track mouse movement
@@ -8293,14 +8428,14 @@ class PreviewPanel(QWidget):
             self._fullscreen_widget.installEventFilter(self)
             
             # Create auto-hide timer for controls
-            self._fullscreen_hide_timer = QtCore.QTimer()
+            self._fullscreen_hide_timer = QtCore.QTimer(self)
             self._fullscreen_hide_timer.setSingleShot(True)
             self._fullscreen_hide_timer.setInterval(3000)  # Hide after 3 seconds of inactivity
             self._fullscreen_hide_timer.timeout.connect(self._hide_fullscreen_controls)
             self._fullscreen_hide_timer.start()
             
             # Create continuous cursor tracking timer for auto-hide control
-            self._cursor_tracking_timer = QtCore.QTimer()
+            self._cursor_tracking_timer = QtCore.QTimer(self)
             self._cursor_tracking_timer.setInterval(100)  # Every 100ms
             self._cursor_tracking_timer.timeout.connect(self._track_cursor_position)
             self._cursor_tracking_timer.start()
@@ -8324,6 +8459,177 @@ class PreviewPanel(QWidget):
             self.video_fullscreen_button.setText("⛝")  # Exit fullscreen icon
             self.video_fullscreen_button.setToolTip("Exit Fullscreen (F or Esc)")
     
+    def _restore_video_widgets_to_panel(self, show=True):
+        """Put the video widget and its controls back into the preview layout
+        (after fullscreen or the floating player): video right after the
+        graphics view, controls at the end. show=False puts them back hidden,
+        so the panel's layout doesn't jump."""
+        if not show:
+            self.video_widget.hide()
+            self.video_playback.hide()
+        graphics_view_index = self.preview_layout.indexOf(self.graphics_view)
+        self.preview_layout.insertWidget(graphics_view_index + 1, self.video_widget, 1)  # stretch factor 1
+        self.preview_layout.addWidget(self.video_playback)
+        if show:
+            self.video_widget.show()
+            self.video_playback.show()
+
+    # ========== Floating video player (Space on a video) ==========
+
+    def can_play_video(self):
+        return self.media_player is not None
+
+    def floating_video_open(self):
+        return self._floating_video is not None
+
+    def _player_has(self, path):
+        """Whether the panel's player already holds this file."""
+        try:
+            if PYSIDE_VERSION == 6:
+                src = self.media_player.source().toLocalFile()
+            else:
+                src = self.media_player.media().canonicalUrl().toLocalFile()
+        except Exception:
+            return False
+        norm = lambda p: os.path.normcase(os.path.normpath(str(p)))
+        return bool(src) and norm(src) == norm(path)
+
+    def open_floating_video(self, asset, playlist=None):
+        """
+        Play `asset` in a floating, resizable window. The panel's own video
+        widget and controls move into it (one player, never two) and come
+        back when it closes. It never closes on its own: unpinned, it
+        switches to a newly selected single video; pinned (P), it ignores
+        the selection. With a `playlist` (the selected videos, 2+),
+        Left/Right step through it and the selection is ignored too.
+        """
+        if not self.can_play_video() or self._floating_video is not None:
+            return
+        # The widgets can only be in one place - leave panel fullscreen first
+        fullscreen = getattr(self, '_fullscreen_widget', None)
+        if fullscreen is not None and fullscreen.isVisible():
+            self.toggle_video_fullscreen()
+        playlist = [a for a in (playlist or []) if a.is_video_file]
+
+        win = FloatingVideoWindow(self, self.window())
+        win.layout().addWidget(self.video_widget, 1)
+        win.layout().addWidget(self.video_playback, 0)
+        self.video_widget.show()
+        self.video_playback.show()
+        self._floating_video = win
+        self._floating_asset = asset
+        self._floating_pinned = False
+        self.video_pin_button.setChecked(False)
+        self.video_pin_button.show()
+        self._set_video_playlist(playlist, asset)
+        if not self._player_has(asset.file_path):
+            self._load_video_into_player(asset)  # plays as soon as it's loaded
+        self._update_floating_title(asset)
+
+        # The panel's video slot just moved out - show a still there instead
+        self.graphics_view.show()
+        if len(self.current_assets) == 1 and self.current_assets[0].is_video_file:
+            self._show_video_still(self.current_assets[0])
+
+        if not self._restore_floating_geometry(win):
+            win.resize(960, 600)
+            win.move(self.window().frameGeometry().center() - win.rect().center())
+        win.show()
+        win.raise_()
+
+        # Already loaded: play now. Still loading: on_media_status_changed
+        # starts it (and skips the "show first frame" pause while floating)
+        if not getattr(self, '_video_needs_initial_pause', False):
+            self.media_player.play()
+
+    def close_floating_video(self, refresh_panel=True):
+        """Close the floating player, if open - the player goes back into the
+        panel. refresh_panel=False when the panel is going away anyway."""
+        if self._floating_video is not None:
+            self._floating_refresh_panel = refresh_panel
+            self._floating_video.close()  # -> _on_floating_video_closing
+
+    def _on_floating_video_closing(self, win):
+        if self._floating_video is not win:
+            return
+        self._save_floating_geometry(win)
+        self._floating_video = None
+        self._floating_asset = None
+        self._floating_pinned = False
+        self._video_playlist = []
+        self.video_pin_button.hide()
+        # Back in the panel hidden, player stopped - and the panel is NOT
+        # redrawn: it has been showing the current selection all along (no
+        # flash, zoom/exposure untouched). Only a selected single video
+        # changes view: from its still to the panel's own player.
+        self._restore_video_widgets_to_panel(show=False)
+        self._reset_panel_video()
+        if (self._floating_refresh_panel and len(self.current_assets) == 1
+                and self.current_assets[0].is_video_file):
+            self.show_video_preview(self.current_assets[0])
+        self._floating_refresh_panel = True
+
+    def toggle_floating_pin(self):
+        """P / the pin button: pinned, the floating player ignores the selection."""
+        if self._floating_video is not None:
+            self.video_pin_button.setChecked(not self._floating_pinned)  # -> _set_floating_pinned
+
+    def _set_floating_pinned(self, pinned):
+        self._floating_pinned = bool(pinned) and self._floating_video is not None
+        if self._floating_asset is not None:
+            self._update_floating_title(self._floating_asset)
+
+    def _set_video_playlist(self, playlist, current=None):
+        """Selected videos the floating player steps through (needs 2+)."""
+        self._video_playlist = list(playlist) if len(playlist) > 1 else []
+        self._video_playlist_index = 0
+        if self._video_playlist and current is not None:
+            key = os.path.normcase(str(current.file_path))
+            for i, a in enumerate(self._video_playlist):
+                if os.path.normcase(str(a.file_path)) == key:
+                    self._video_playlist_index = i
+                    break
+        if self._floating_video is not None:
+            self._floating_video.set_playlist_mode(bool(self._video_playlist))
+
+    def step_floating_video(self, delta):
+        """
+        Previous/next video of the playlist in the floating player - stops at
+        either end. Returns True when there's a playlist (the key is ours),
+        False otherwise (the browser moves its selection as usual).
+        """
+        if self._floating_video is None or not self._video_playlist:
+            return False
+        index = max(0, min(len(self._video_playlist) - 1, self._video_playlist_index + delta))
+        if index != self._video_playlist_index:
+            self._video_playlist_index = index
+            self._load_video_into_player(self._video_playlist[index])  # plays on load (floating)
+        return True
+
+    def _update_floating_title(self, asset):
+        if self._floating_video is None:
+            return
+        title = f"{'📌 ' if self._floating_pinned else ''}▶ {asset.name}"
+        if self._video_playlist:
+            title += f"  ({self._video_playlist_index + 1}/{len(self._video_playlist)})"
+        self._floating_video.setWindowTitle(title)
+
+    def _save_floating_geometry(self, win):
+        if win.isFullScreen():
+            return  # keep the last windowed geometry
+        try:
+            self.settings.set('preview', 'floating_video_geometry', bytes(win.saveGeometry().toBase64()).decode())
+            self.settings.save()
+        except Exception:
+            pass
+
+    def _restore_floating_geometry(self, win):
+        try:
+            data = self.settings.get('preview', 'floating_video_geometry', None)
+            return bool(data) and win.restoreGeometry(QByteArray.fromBase64(data.encode()))
+        except Exception:
+            return False
+
     def _hide_fullscreen_controls(self):
         """Hide controls in fullscreen mode by setting opacity to 0"""
         try:
@@ -8401,6 +8707,12 @@ class PreviewPanel(QWidget):
     
     def cleanup(self):
         """Cleanup resources (called on close)"""
+        # Video widgets back home before the browser goes away
+        self.close_floating_video(refresh_panel=False)
+        fullscreen = getattr(self, '_fullscreen_widget', None)
+        if fullscreen is not None and fullscreen.isVisible():
+            self.toggle_video_fullscreen()
+
         # Stop video playback and release resources
         if self.media_player:
             self.media_player.stop()

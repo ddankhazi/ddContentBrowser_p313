@@ -443,11 +443,46 @@ def _on_maya_exiting(*_args):
         except Exception as e:
             print(f"[DD Content Browser] Cleanup at exit failed: {e}")
         _content_browser_instance = None
+    _delete_leftover_windows()
     try:
         qInstallMessageHandler(None)
     except Exception:
         pass
     _remove_exit_callback()
+
+
+# Qt class names (not Python classes - those differ after a module reload)
+_LEFTOVER_WINDOW_CLASSES = ('DDContentBrowser', 'QuickViewWindow')
+
+
+def _delete_leftover_windows():
+    """
+    Delete every browser / Quick View window still parented to Maya's main
+    window - e.g. one closed before the WA_DeleteOnClose fix or left behind
+    by a module reload, whose own exit callback is long gone. Deleted, not
+    closed: an old window's closeEvent would save its stale state over the
+    current config.
+    """
+    try:
+        from shiboken6 import isValid, delete
+    except ImportError:
+        from shiboken2 import isValid, delete
+    main = get_maya_main_window()
+    if main is None:
+        return
+    for child in list(main.children()):  # direct children - that's where they live
+        try:
+            if (isValid(child) and child.isWidgetType()
+                    and child.metaObject().className() in _LEFTOVER_WINDOW_CLASSES):
+                delete(child)
+        except Exception as e:
+            print(f"[DD Content Browser] Could not delete leftover window at exit: {e}")
+
+
+# Installed on import, not only when the window is first shown: the Qt message
+# handler above is installed on import too (the package also gets imported
+# without any window, e.g. by a texture set drop) and must be put back at exit.
+_install_exit_callback()
 
 
 class DDContentBrowser(QtWidgets.QMainWindow):
@@ -456,9 +491,14 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         if parent is None:
             parent = get_maya_main_window()
-        
+
         super().__init__(parent)
-        
+
+        # Closing really deletes the window. Closed-but-alive, it'd stay a
+        # hidden child of Maya's main window that nothing tracks any more,
+        # and outlive Python at Maya exit (see _on_maya_exiting).
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
         # Settings manager (load first, before config)
         self.settings_manager = SettingsManager()
         
@@ -692,6 +732,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Right panel - Preview (initially visible)
         self.preview_panel = PreviewPanel(self.settings_manager, config=self.config, metadata_manager=self.metadata_manager)
         self.content_splitter.addWidget(self.preview_panel)
+        # Videos shown in the panel while the floating player is open use
+        # their already generated thumbnail (never a second decoder)
+        self.preview_panel.thumbnail_lookup = self._cached_thumbnail
 
         # Let the preview panel show a selected folder's own thumbnail (if
         # it has one - see resolve_folder_previews() in utils.py): a direct
@@ -1320,7 +1363,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         browser_layout.addLayout(button_layout)
         
         # Initialize visual feedback for filters
-        QtCore.QTimer.singleShot(0, self.update_filter_visual_feedback)
+        QtCore.QTimer.singleShot(0, self, self.update_filter_visual_feedback)
         
         parent_splitter.addWidget(browser_widget)
     
@@ -1413,7 +1456,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.update_sort_indicators()
         
         # Request thumbnails for newly visible items after sorting
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
     
     def update_sort_indicators(self):
         """Update sort indicator arrows on header buttons"""
@@ -1573,9 +1616,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
         self.file_model.setFilterText(text)
         # Update match count (will be called after model refresh)
-        QTimer.singleShot(50, self.update_search_match_count)
+        QTimer.singleShot(50, self, self.update_search_match_count)
         # Request thumbnails for new filtered results
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
 
     def on_subfolder_search_requested(self):
         """Handle manual subfolder search request (search button clicked or Enter pressed)"""
@@ -1587,8 +1630,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 # Had search before, now clearing it
                 self.file_model.setFilterText("")
                 self.safe_show_status("Search cleared - showing current folder")
-                QTimer.singleShot(50, self.update_search_match_count)
-                QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+                QTimer.singleShot(50, self, self.update_search_match_count)
+                QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
             else:
                 # Already no search
                 self.safe_show_status("Enter search text first")
@@ -1605,9 +1648,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.setFilterText(search_text)
         
         # Update match count after search completes
-        QTimer.singleShot(50, self.update_search_match_count)
+        QTimer.singleShot(50, self, self.update_search_match_count)
         # Request thumbnails for results
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
     
     def on_search_cleared(self):
         """Handle search clear button click - reset to current folder"""
@@ -1619,7 +1662,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.interrupt_search()
         
         # Small delay to let the interrupt take effect
-        QTimer.singleShot(50, self._finish_search_clear)
+        QTimer.singleShot(50, self, self._finish_search_clear)
     
     def _finish_search_clear(self):
         """Finish clearing search after interrupt has taken effect"""
@@ -1632,8 +1675,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Clear progress
         self.search_bar.clear_search_progress()
         # Update UI
-        QTimer.singleShot(50, self.update_search_match_count)
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(50, self, self.update_search_match_count)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         self.safe_show_status("Search cleared - showing current folder")
     
     def on_search_progress(self, scanned, matches):
@@ -1723,15 +1766,15 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             else:
                 # Just options changed - regular refresh
                 self.file_model.refresh()
-            QTimer.singleShot(50, self.update_search_match_count)
-            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+            QTimer.singleShot(50, self, self.update_search_match_count)
+            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         elif subfolders_changed and old_subfolders and not new_subfolders:
             # No search text, but subfolders was just disabled (going from subfolder search to normal)
             # Force refresh to return to current folder view
             self.file_model.beginResetModel()
             self.file_model.refresh(force=True)
             self.file_model.endResetModel()
-            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
     
     def update_search_match_count(self):
         """Update search match count display"""
@@ -1807,7 +1850,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             self.safe_show_status(f"✓ Loaded {file_count} files")
         
         # Request thumbnails for visible items
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
     
     def navigate_to_path(self, path):
         """Navigate to specified path"""
@@ -1920,13 +1963,13 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.safe_show_status(f"Loaded: {path}")
         
         # Request thumbnails for visible items
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
 
         # Re-select the folder we navigated up FROM, once the view has
         # settled (rows exist synchronously after setPath(), but give the
         # view a paint cycle before scrolling/selecting into it)
         if select_after is not None:
-            QTimer.singleShot(100, lambda p=select_after: self._select_folder_after_navigate(p))
+            QTimer.singleShot(100, self, lambda p=select_after: self._select_folder_after_navigate(p))
 
     def _select_folder_after_navigate(self, target_path):
         """Re-select target_path's row in the file list, if still present (see navigate_to_path)."""
@@ -2077,7 +2120,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.safe_show_status(f"View mode: {'Grid' if icon_mode else 'List'}")
         
         # Request thumbnails for newly visible items after view mode change
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
     
     def on_size_slider_changed(self, value):
         """Handle thumbnail size slider change"""
@@ -2158,7 +2201,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Restore scroll position after layout update - use center positioning for smooth experience
         if anchor_index and anchor_index.isValid():
             # Use QTimer to ensure layout is complete before scrolling
-            QTimer.singleShot(10, lambda: self.file_list.scrollTo(
+            QTimer.singleShot(10, self, lambda: self.file_list.scrollTo(
                 anchor_index, 
                 QtWidgets.QAbstractItemView.PositionAtCenter
             ))
@@ -2186,7 +2229,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
         if enabled:
             # Re-enable thumbnails - request visible items
-            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         else:
             # Clear thumbnail queue when disabled
             if hasattr(self, 'thumbnail_generator'):
@@ -2222,7 +2265,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
         # Request thumbnail generation for any newly-revealed folder previews
         if enabled:
-            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
 
 
     def browse_for_folder(self):
@@ -2885,6 +2928,15 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         else:
             self.safe_show_status("No items were removed")
     
+    def _cached_thumbnail(self, asset):
+        """An already generated thumbnail of `asset` (memory, then disk cache),
+        or None - never generates one."""
+        key = str(asset.file_path)
+        pixmap = self.memory_cache.get(key)
+        if pixmap is None:
+            pixmap = self.disk_cache.get(key, asset.modified_time)
+        return pixmap if pixmap is not None and not pixmap.isNull() else None
+
     def get_selected_assets(self):
         """Get selected assets"""
         selected_indexes = self.file_list.selectedIndexes()
@@ -2898,7 +2950,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     def on_selection_changed(self, selected, deselected):
         """Handle file selection change - update preview panel (deferred)"""
         # Defer preview update slightly to not block selection
-        QTimer.singleShot(10, self._update_preview_deferred)
+        QTimer.singleShot(10, self, self._update_preview_deferred)
         
         # Update selection info immediately
         self.update_selection_info()
@@ -2940,7 +2992,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     def on_model_reset(self):
         """Handle model reset (after filter changes) - trigger thumbnail loading"""
         # Small delay to let the view update, then request thumbnails
-        QtCore.QTimer.singleShot(10, self.request_thumbnails_for_visible_items)
+        QtCore.QTimer.singleShot(10, self, self.request_thumbnails_for_visible_items)
     
     def on_scroll_changed(self, value):
         """Handle scroll - load thumbnails for newly visible items"""
@@ -2974,7 +3026,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             # This stops generating thumbnails for items that scrolled out of view
             if hasattr(self, 'thumbnail_generator'):
                 self.thumbnail_generator.clear_queue()
-            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         else:
             # Show panel and restore last sizes
             self.preview_panel.setVisible(True)
@@ -2987,7 +3039,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             # This stops generating thumbnails for items that scrolled out of view
             if hasattr(self, 'thumbnail_generator'):
                 self.thumbnail_generator.clear_queue()
-            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
             
             # Restore previous sizes if available
             current_sizes = self.content_splitter.sizes()
@@ -3057,7 +3109,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.endResetModel()
         
         # Request thumbnails for new state
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         
         # Update status
         if is_checked:
@@ -3102,7 +3154,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.endResetModel()
         
         # Request thumbnails for new state
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         
         # Update status
         if is_checked:
@@ -3124,7 +3176,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.reapplySequenceGrouping()
         self.file_model.endResetModel()
         
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         
         if is_checked:
             self.safe_show_status("Showing only texture sets")
@@ -4159,7 +4211,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self._splitter_move_count = 0
         
         # Request thumbnails for newly visible items after resize
-        QTimer.singleShot(50, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(50, self, self.request_thumbnails_for_visible_items)
         
         if DEBUG_MODE and move_count > 0:
             import time
@@ -4507,7 +4559,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 self.safe_show_status("Cache cleared", 3000)
                 
                 # Request thumbnail regeneration
-                QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+                QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Error", f"Failed to clear cache: {e}")
     
@@ -4631,12 +4683,43 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                     
                     return True  # Event handled, prevent scrolling
             
-            # === SPACE KEY FOR QUICK VIEW ===
+            # === VIDEO PLAYER OPEN: Space play/pause, Esc close, Left/Right step a playlist ===
+            # (P pins only inside the player window - here letters keep jumping to file names)
+            if event.type() == QtCore.QEvent.KeyPress and self.preview_panel.floating_video_open():
+                key = event.key()
+                if key == Qt.Key_Space:
+                    self.preview_panel.toggle_video_playback()
+                    return True
+                if key == Qt.Key_Escape and not self.file_list.middle_button_pressed:
+                    self.preview_panel.close_floating_video()
+                    return True
+                # Single video: not consumed - the selection moves and the player follows
+                if key in (Qt.Key_Left, Qt.Key_Right) and self.preview_panel.step_floating_video(
+                        -1 if key == Qt.Key_Left else 1):
+                    return True
+
+            # === SPACE KEY: QUICK VIEW / FLOATING VIDEO PLAYER ===
             if event.type() == QtCore.QEvent.KeyPress and event.key() == Qt.Key_Space:
-                # If there are selected files, open quick view and consume the event
+                if self.quick_view_window is not None and self.quick_view_window.isVisible():
+                    self.toggle_quick_view()
+                    return True
                 selected = self.get_selected_assets()
                 if selected:
-                    self.toggle_quick_view()
+                    # Videos play in the floating player (Quick View is
+                    # image-only) - several selected = a playlist, starting at
+                    # the focused one. Anything else opens Quick View.
+                    if (all(getattr(a, 'is_video_file', False) for a in selected)
+                            and self.preview_panel.can_play_video()):
+                        rows = sorted(self.file_list.selectedIndexes(), key=lambda i: i.row())
+                        playlist = [a for a in (self.file_model.data(i, Qt.UserRole) for i in rows) if a]
+                        current = self.file_model.data(self.file_list.currentIndex(), Qt.UserRole)
+                        start = current if any(a is current for a in playlist) else playlist[0]
+                        self.preview_panel.open_floating_video(start, playlist=playlist)
+                        # Keep keyboard focus here (Space/Esc/arrows handled above)
+                        self.activateWindow()
+                        self.file_list.setFocus()
+                    else:
+                        self.toggle_quick_view()
                     return True
         
         return super().eventFilter(obj, event)
@@ -4706,10 +4789,17 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         """Save configuration before closing window"""
         global _content_browser_instance
         
-        # Close Quick View if open
-        if self.quick_view_window and self.quick_view_window.isVisible():
-            self.quick_view_window.close()
-        
+        # Close and delete the Quick View too - it's the Maya window's child,
+        # not ours, so it wouldn't go with us
+        if self.quick_view_window is not None:
+            try:
+                if self.quick_view_window.isVisible():
+                    self.quick_view_window.close()
+                self.quick_view_window.deleteLater()
+            except RuntimeError:
+                pass  # already deleted
+            self.quick_view_window = None
+
         # Cleanup preview panel (stop video playback, etc.)
         if hasattr(self, 'preview_panel') and self.preview_panel:
             self.preview_panel.cleanup()
@@ -4792,7 +4882,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
         self.file_model.refresh(force=True)
         self.safe_show_status("Refreshed (cache bypassed)")
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
     
     def navigate_to_parent(self):
         """Navigate to parent folder (Backspace)"""
@@ -5443,7 +5533,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.interrupt_search()
         
         # Delay the rest to let interrupt take effect
-        QTimer.singleShot(50, lambda: self._finish_show_in_browser(parent_dir, file_path))
+        QTimer.singleShot(50, self, lambda: self._finish_show_in_browser(parent_dir, file_path))
     
     def _finish_show_in_browser(self, parent_dir, file_path):
         """Finish showing file in browser after interrupt has taken effect"""
@@ -5484,7 +5574,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             self.safe_show_status(f"File shown in directory: {file_path.name}")
         
         # Delay selection to ensure view is updated
-        QTimer.singleShot(300, select_file)
+        QTimer.singleShot(300, self, select_file)
     
     def regenerate_selected_thumbnails(self):
         """Regenerate thumbnails for selected files by clearing their cache entries"""
@@ -5549,7 +5639,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             
             # Request thumbnail regeneration for visible items
             # Use a longer delay to ensure caches are fully cleared
-            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
             
             # Force delegate redraw by emitting dataChanged (no viewport().update() needed)
             model = self.file_list.model()
@@ -5744,7 +5834,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status(f"Advanced filters: {filter_count} active - {file_count} files shown", 4000)
         
         # Request thumbnails for filtered results
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         
         if DEBUG_MODE:
             if DEBUG_MODE:
@@ -5759,7 +5849,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status(f"Advanced filters cleared - {file_count} files shown", 3000)
         
         # Request thumbnails
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         
         if DEBUG_MODE:
             if DEBUG_MODE:
@@ -5872,7 +5962,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
             self.update_navigation_buttons()
             
             # Request thumbnails for visible items
-            QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
             
             # CRITICAL: Refresh Advanced Filters panel to enable re-analysis
             # This ensures the "Analyze Folder" button works with the new collection items
@@ -5915,7 +6005,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status("Returned to folder view")
         
         # Request thumbnails for visible items
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         
         # CRITICAL: Refresh Advanced Filters panel to enable re-analysis
         # This ensures the "Analyze Folder" button works after returning to folder view
@@ -6026,7 +6116,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status(f"Removed {item_count} {item_word} from collection '{self.current_collection_name}'")
         
         # Request thumbnails for remaining visible items
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
         
         if DEBUG_MODE:
             print(f"[Browser] Removed {item_count} {item_word} from collection '{self.current_collection_name}'")
@@ -6059,7 +6149,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
             # Debounce: only schedule refresh if not already pending
             if not self._watcher_pending_refresh:
                 self._watcher_pending_refresh = True
-                QTimer.singleShot(300, self._refresh_from_watcher)
+                QTimer.singleShot(300, self, self._refresh_from_watcher)
             
         except Exception as e:
             import traceback
@@ -6084,4 +6174,4 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status("📂 Directory updated automatically")
         
         # Request thumbnails for visible items
-        QTimer.singleShot(100, self.request_thumbnails_for_visible_items)
+        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
