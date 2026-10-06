@@ -97,6 +97,16 @@ class SettingsManager:
                 "var_import_displacement": False,  # Displacement for VarN-matched (Megascans plant) assets
                 "convert_to_tif": False,  # Convert jpg/png/tga channel textures to TIF (LZW) before building
                 "import_lod_proxy": False  # Also import a lower-detail LODN proxy next to a high/untagged geo import
+            },
+            # Asset Library (Megascans tag filtering) - see asset_library.py
+            "asset_library": {
+                "megascans_roots": [],  # Library folders (root, its Downloaded folder, or a folder of category folders)
+                "visible_types": ['3d', '3dplant', 'surface', 'decal', 'atlas',
+                                  'imperfection', 'displacement', 'other'],  # asset_library.TYPE_LABELS keys
+                "auto_update": False,  # Rebuild a library's database by itself when the library changed
+                # Shared database folder: None = this installation's default
+                # (site_defaults.json next to the tool), "" = off, else a path
+                "shared_folder": None
             }
         }
     
@@ -563,10 +573,11 @@ class ThumbnailSettingsTab(QWidget):
     def update_cache_info(self):
         """Update cache size information"""
         try:
-            # Unified cache directory
-            cache_dir = Path.home() / ".ddContentBrowser" / "thumbnails"
+            # Same folder ThumbnailDiskCache uses (see utils.get_local_cache_dir())
+            from .utils import get_local_cache_dir
+            cache_dir = get_local_cache_dir("thumbnails")
             if cache_dir.exists():
-                total_size = sum(f.stat().st_size for f in cache_dir.rglob('*') if f.is_file())
+                total_size = sum(f.stat().st_size for f in cache_dir.glob('*.jpg'))
                 size_mb = total_size / (1024 * 1024)
                 self.cache_info_label.setText(f"Current cache size: {size_mb:.1f} MB")
             else:
@@ -581,12 +592,17 @@ class ThumbnailSettingsTab(QWidget):
                                      QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             try:
-                # Unified cache directory
-                cache_dir = Path.home() / ".ddContentBrowser" / "thumbnails"
+                # Same folder ThumbnailDiskCache uses. Only the cached
+                # thumbnails go - the folder (and its cache_info.json) stays,
+                # the running browser keeps writing into it.
+                from .utils import get_local_cache_dir
+                cache_dir = get_local_cache_dir("thumbnails")
                 if cache_dir.exists():
-                    import shutil
-                    shutil.rmtree(cache_dir)
-                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    for thumb_file in cache_dir.glob("*.jpg"):
+                        try:
+                            thumb_file.unlink()
+                        except OSError:
+                            pass  # in use by a thumbnail worker right now
                     self.update_cache_info()
                     QMessageBox.information(self, "Success", "Cache cleared successfully!")
                 else:

@@ -16,12 +16,13 @@ from datetime import datetime
 # Import from package modules
 from . import __version__
 from .config import ContentBrowserConfig
-from .utils import get_maya_main_window, MAYA_AVAILABLE
+from .utils import get_maya_main_window, MAYA_AVAILABLE, single_shot
 from .cache import ThumbnailCache, ThumbnailDiskCache, ThumbnailGenerator
 from .models import AssetItem, FileSystemModel
 from .delegates import ThumbnailDelegate
 from .widgets import BreadcrumbWidget, PreviewPanel, MayaStyleListView
 from .settings import SettingsManager, SettingsDialog, TextureSetSettingsDialog
+from .asset_library_panel import AssetLibraryService, AssetLibraryPanel, AssetLibrarySettingsDialog
 from .advanced_filters_v2 import AdvancedFiltersPanelV2
 
 # PySide imports
@@ -578,7 +579,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         
         # Track current collection (for remove from collection feature)
         self.current_collection_name = None
-        
+        # Asset Library results shown in the file list (a collection-mode view)
+        self.library_view_active = False
+
         # Quick View window (macOS Quick Look style)
         self.quick_view_window = None
         
@@ -827,6 +830,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         texture_set_settings_action = QAction("Texture Set Settings...", self)
         texture_set_settings_action.triggered.connect(self.show_texture_set_settings_dialog)
         settings_menu.addAction(texture_set_settings_action)
+
+        asset_library_settings_action = QAction("Asset Library Settings...", self)
+        asset_library_settings_action.triggered.connect(self.show_asset_library_settings_dialog)
+        settings_menu.addAction(asset_library_settings_action)
 
         # Tools menu
         tools_menu = menu_bar.addMenu("Tools")
@@ -1096,12 +1103,24 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.advanced_filters_layout = QtWidgets.QVBoxLayout(self.advanced_filters_widget)
         self.advanced_filters_layout.setContentsMargins(5, 5, 5, 5)
         self.nav_tab_widgets["Advanced Filters"] = self.advanced_filters_widget
-        
-        # Restore tab order or add in default order
+
+        # Asset Library tab - Megascans tag filtering (asset_library_panel.py)
+        self.asset_library_service = AssetLibraryService(self.settings_manager, self)
+        self.asset_library_panel = AssetLibraryPanel(self.asset_library_service)
+        self.asset_library_panel.show_results.connect(self.show_library_results)
+        self.asset_library_panel.open_settings_requested.connect(self.show_asset_library_settings_dialog)
+        self.nav_tab_widgets["Asset Library"] = self.asset_library_panel
+        # Load (and pick up a newer shared snapshot) shortly after startup, in
+        # the background, so the tab is ready when it's opened
+        single_shot(3000, self, self._load_asset_library_at_startup)
+
+        # Restore tab order or add in default order - tabs added since the
+        # order was saved go at the end
         nav_tabs_order = self.config.config.get("nav_tabs_order", ["Collections", "Advanced Filters"])
+        nav_tabs_order = [n for n in nav_tabs_order if n in self.nav_tab_widgets]
+        nav_tabs_order += [n for n in self.nav_tab_widgets if n not in nav_tabs_order]
         for tab_name in nav_tabs_order:
-            if tab_name in self.nav_tab_widgets:
-                self.nav_tabs.addTab(self.nav_tab_widgets[tab_name], tab_name)
+            self.nav_tabs.addTab(self.nav_tab_widgets[tab_name], tab_name)
         
         self.nav_splitter.addWidget(self.nav_tabs)
         
@@ -1279,6 +1298,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model = FileSystemModel()
         self.file_model.thumbnails_enabled = self.thumbnails_enabled_checkbox.isChecked()
         self.file_model.folder_thumbnails_enabled = self.folder_thumbnails_enabled_checkbox.isChecked()
+        # Browsing an Asset Library category folder (e.g. Megascans' Downloaded/3d):
+        # listing + folder previews from the library database, not the network
+        self.file_model.library_lookup = self.asset_library_service.lookup_dir
         self.file_list = MayaStyleListView()
         self.file_list.setModel(self.file_model)
         self.file_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -1363,7 +1385,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         browser_layout.addLayout(button_layout)
         
         # Initialize visual feedback for filters
-        QtCore.QTimer.singleShot(0, self, self.update_filter_visual_feedback)
+        single_shot(0, self, self.update_filter_visual_feedback)
         
         parent_splitter.addWidget(browser_widget)
     
@@ -1456,7 +1478,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.update_sort_indicators()
         
         # Request thumbnails for newly visible items after sorting
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
     
     def update_sort_indicators(self):
         """Update sort indicator arrows on header buttons"""
@@ -1616,9 +1638,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
         self.file_model.setFilterText(text)
         # Update match count (will be called after model refresh)
-        QTimer.singleShot(50, self, self.update_search_match_count)
+        single_shot(50, self, self.update_search_match_count)
         # Request thumbnails for new filtered results
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
 
     def on_subfolder_search_requested(self):
         """Handle manual subfolder search request (search button clicked or Enter pressed)"""
@@ -1630,8 +1652,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 # Had search before, now clearing it
                 self.file_model.setFilterText("")
                 self.safe_show_status("Search cleared - showing current folder")
-                QTimer.singleShot(50, self, self.update_search_match_count)
-                QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+                single_shot(50, self, self.update_search_match_count)
+                single_shot(100, self, self.request_thumbnails_for_visible_items)
             else:
                 # Already no search
                 self.safe_show_status("Enter search text first")
@@ -1648,9 +1670,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.setFilterText(search_text)
         
         # Update match count after search completes
-        QTimer.singleShot(50, self, self.update_search_match_count)
+        single_shot(50, self, self.update_search_match_count)
         # Request thumbnails for results
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
     
     def on_search_cleared(self):
         """Handle search clear button click - reset to current folder"""
@@ -1662,7 +1684,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.interrupt_search()
         
         # Small delay to let the interrupt take effect
-        QTimer.singleShot(50, self, self._finish_search_clear)
+        single_shot(50, self, self._finish_search_clear)
     
     def _finish_search_clear(self):
         """Finish clearing search after interrupt has taken effect"""
@@ -1675,8 +1697,8 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Clear progress
         self.search_bar.clear_search_progress()
         # Update UI
-        QTimer.singleShot(50, self, self.update_search_match_count)
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(50, self, self.update_search_match_count)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
         self.safe_show_status("Search cleared - showing current folder")
     
     def on_search_progress(self, scanned, matches):
@@ -1766,15 +1788,15 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             else:
                 # Just options changed - regular refresh
                 self.file_model.refresh()
-            QTimer.singleShot(50, self, self.update_search_match_count)
-            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+            single_shot(50, self, self.update_search_match_count)
+            single_shot(100, self, self.request_thumbnails_for_visible_items)
         elif subfolders_changed and old_subfolders and not new_subfolders:
             # No search text, but subfolders was just disabled (going from subfolder search to normal)
             # Force refresh to return to current folder view
             self.file_model.beginResetModel()
             self.file_model.refresh(force=True)
             self.file_model.endResetModel()
-            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+            single_shot(100, self, self.request_thumbnails_for_visible_items)
     
     def update_search_match_count(self):
         """Update search match count display"""
@@ -1850,7 +1872,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             self.safe_show_status(f"✓ Loaded {file_count} files")
         
         # Request thumbnails for visible items
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
     
     def navigate_to_path(self, path):
         """Navigate to specified path"""
@@ -1963,13 +1985,13 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.safe_show_status(f"Loaded: {path}")
         
         # Request thumbnails for visible items
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
 
         # Re-select the folder we navigated up FROM, once the view has
         # settled (rows exist synchronously after setPath(), but give the
         # view a paint cycle before scrolling/selecting into it)
         if select_after is not None:
-            QTimer.singleShot(100, self, lambda p=select_after: self._select_folder_after_navigate(p))
+            single_shot(100, self, lambda p=select_after: self._select_folder_after_navigate(p))
 
     def _select_folder_after_navigate(self, target_path):
         """Re-select target_path's row in the file list, if still present (see navigate_to_path)."""
@@ -2120,7 +2142,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.safe_show_status(f"View mode: {'Grid' if icon_mode else 'List'}")
         
         # Request thumbnails for newly visible items after view mode change
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
     
     def on_size_slider_changed(self, value):
         """Handle thumbnail size slider change"""
@@ -2201,7 +2223,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Restore scroll position after layout update - use center positioning for smooth experience
         if anchor_index and anchor_index.isValid():
             # Use QTimer to ensure layout is complete before scrolling
-            QTimer.singleShot(10, self, lambda: self.file_list.scrollTo(
+            single_shot(10, self, lambda: self.file_list.scrollTo(
                 anchor_index, 
                 QtWidgets.QAbstractItemView.PositionAtCenter
             ))
@@ -2229,7 +2251,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
         if enabled:
             # Re-enable thumbnails - request visible items
-            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+            single_shot(100, self, self.request_thumbnails_for_visible_items)
         else:
             # Clear thumbnail queue when disabled
             if hasattr(self, 'thumbnail_generator'):
@@ -2265,7 +2287,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
         # Request thumbnail generation for any newly-revealed folder previews
         if enabled:
-            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+            single_shot(100, self, self.request_thumbnails_for_visible_items)
 
 
     def browse_for_folder(self):
@@ -2950,7 +2972,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     def on_selection_changed(self, selected, deselected):
         """Handle file selection change - update preview panel (deferred)"""
         # Defer preview update slightly to not block selection
-        QTimer.singleShot(10, self, self._update_preview_deferred)
+        single_shot(10, self, self._update_preview_deferred)
         
         # Update selection info immediately
         self.update_selection_info()
@@ -2992,7 +3014,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
     def on_model_reset(self):
         """Handle model reset (after filter changes) - trigger thumbnail loading"""
         # Small delay to let the view update, then request thumbnails
-        QtCore.QTimer.singleShot(10, self, self.request_thumbnails_for_visible_items)
+        single_shot(10, self, self.request_thumbnails_for_visible_items)
     
     def on_scroll_changed(self, value):
         """Handle scroll - load thumbnails for newly visible items"""
@@ -3026,7 +3048,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             # This stops generating thumbnails for items that scrolled out of view
             if hasattr(self, 'thumbnail_generator'):
                 self.thumbnail_generator.clear_queue()
-            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+            single_shot(100, self, self.request_thumbnails_for_visible_items)
         else:
             # Show panel and restore last sizes
             self.preview_panel.setVisible(True)
@@ -3039,7 +3061,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             # This stops generating thumbnails for items that scrolled out of view
             if hasattr(self, 'thumbnail_generator'):
                 self.thumbnail_generator.clear_queue()
-            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+            single_shot(100, self, self.request_thumbnails_for_visible_items)
             
             # Restore previous sizes if available
             current_sizes = self.content_splitter.sizes()
@@ -3109,7 +3131,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.endResetModel()
         
         # Request thumbnails for new state
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
         
         # Update status
         if is_checked:
@@ -3154,7 +3176,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.endResetModel()
         
         # Request thumbnails for new state
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
         
         # Update status
         if is_checked:
@@ -3176,7 +3198,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.reapplySequenceGrouping()
         self.file_model.endResetModel()
         
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
         
         if is_checked:
             self.safe_show_status("Showing only texture sets")
@@ -3304,12 +3326,16 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
     def _import_geo_file(self, file_path):
         """Import one geo file into the root namespace. Returns its new nodes."""
-        from .utils import get_maya_import_type, to_maya_path
+        from .utils import get_maya_import_type, get_maya_import_options, to_maya_path
         kwargs = dict(i=True, ignoreVersion=True, mergeNamespacesOnClash=False,
                       namespace=':', preserveReferences=True, returnNewNodes=True)
         file_type = get_maya_import_type(Path(file_path).suffix.lower())
         if file_type:
-            kwargs.update(type=file_type, options='v=0')
+            kwargs['type'] = file_type
+            # 'v=0' only for Maya scenes - mayaUsd rejects it ("Unknown flag 'v'")
+            options = get_maya_import_options(file_type)
+            if options:
+                kwargs['options'] = options
         return cmds.file(to_maya_path(file_path), **kwargs) or []
 
     def _new_import_record(self, path, new_nodes):
@@ -3743,11 +3769,100 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         print(f"[AutoMaterial] Removed {len(doomed)} replaced import shading node(s)")
         return len(doomed)
 
+    # Asset folder kinds (Megascans types, see asset_library.TYPE_LABELS):
+    # geo assets get their geo + material, texture-only ones a material or
+    # just file nodes, brushes nothing (not importable into Maya)
+    _ASSET_KIND_BY_TYPE = {
+        '3d': 'geo', '3dplant': 'geo',
+        'surface': 'material', 'atlas': 'material', 'decal': 'material', 'displacement': 'material',
+        'imperfection': 'texture',
+        'brush': 'skip',
+    }
+    _ASSET_TYPE_NAMES = {
+        '3d': '3D asset', '3dplant': '3D plant', 'surface': 'surface', 'atlas': 'atlas', 'decal': 'decal',
+        'displacement': 'displacement', 'imperfection': 'imperfection', 'brush': 'brush',
+    }
+
+    def _asset_folder_type(self, folder):
+        """Asset type of a folder: from the Asset Library database, else from
+        its category folder's name (.../surface/<asset>), else None. Cheap -
+        no disk access, fine for building a context menu."""
+        from .asset_library import type_from_folder_name
+        info = self.asset_library_service.asset_info(folder)
+        if info and info.get('type') in self._ASSET_KIND_BY_TYPE:
+            return info['type']
+        return type_from_folder_name(Path(folder).parent.name)
+
+    def _asset_folder_kind(self, folder):
+        """'geo', 'material', 'texture', 'skip' - or 'unknown' (not a known
+        library asset: decided at import time - geo if it has any)."""
+        return self._ASSET_KIND_BY_TYPE.get(self._asset_folder_type(folder), 'unknown')
+
+    def _add_asset_folder_import_menu(self, menu):
+        """The folder context menu's "Import Asset Folder(s)" submenu, worded
+        for what the selection holds (3D assets and/or texture-only assets)."""
+        from collections import Counter
+        folders = [a.file_path for a in self.get_selected_assets() if a.is_folder]
+        if not folders:
+            return
+        types = [self._asset_folder_type(f) for f in folders]
+        kinds = [self._ASSET_KIND_BY_TYPE.get(t, 'unknown') for t in types]
+        n_geo = kinds.count('geo') + kinds.count('unknown')
+        n_mat = kinds.count('material')
+        n_tex = kinds.count('texture')
+
+        # Parented to the context menu explicitly - a menu.addMenu(title)
+        # submenu would go away with this function's Python reference to it
+        import_menu = QtWidgets.QMenu("📦 Import Asset Folder" if len(folders) == 1
+                                      else f"📦 Import {len(folders)} Asset Folders", menu)
+        menu.addMenu(import_menu)
+
+        # What's in the selection, when it's more than one kind of asset
+        counts = Counter(self._ASSET_TYPE_NAMES.get(t, 'folder') for t in types)
+        if len(counts) > 1:
+            info = import_menu.addAction(" · ".join(f"{n} × {name}" for name, n in counts.items()))
+            info.setEnabled(False)
+            import_menu.addSeparator()
+
+        extras = []
+        if n_mat:
+            extras.append(f"{n_mat} material{'s' if n_mat != 1 else ''}")
+        if n_tex:
+            extras.append(f"{n_tex} texture set{'s' if n_tex != 1 else ''}")
+
+        if n_geo:
+            if extras:
+                plus = " + " + " + ".join(extras)
+                assets = f"{n_geo} asset{'s' if n_geo != 1 else ''}"
+                high_text, lod0_text = f"High for {assets}{plus}", f"LOD0 for {assets}{plus}"
+            else:
+                high_text, lod0_text = "High (LOD0 where there's no High)", "LOD0"
+            high_action = import_menu.addAction(high_text)
+            high_action.setToolTip("High geo - LOD0 where an asset has no High")
+            high_action.triggered.connect(lambda: self.import_asset_folders('high'))
+            lod0_action = import_menu.addAction(lod0_text)
+            lod0_action.triggered.connect(lambda: self.import_asset_folders('LOD0'))
+        elif extras:
+            text = "Import " + " + ".join(extras)
+            action = import_menu.addAction(text[0].upper() + text[1:])
+            action.triggered.connect(lambda: self.import_asset_folders(None))
+        else:
+            action = import_menu.addAction("Nothing to import (brushes can't be imported)")
+            action.setEnabled(False)
+
     def import_asset_folders(self, level):
         """
-        Import the selected asset folders' geo at `level` ('high' or 'LOD0' -
-        which files, see find_asset_folder_geo()) through the same batch
-        import + texture set material pipeline as an MMB drop.
+        Import the selected asset folders, each by its kind:
+          - geo assets (3D assets, 3D plants): geo at `level` ('high' or
+            'LOD0' - which files, see find_asset_folder_geo()) through the
+            same batch import + texture set material pipeline as an MMB drop;
+          - surfaces, atlases, decals, displacements: a material from the
+            folder's texture set. With no geo asset in the import, the first
+            material built goes onto the current Maya selection (if any);
+          - imperfections: just file nodes, one per map;
+          - brushes: skipped.
+        Folders of unknown type (not in an Asset Library) count as geo assets
+        if they have geo, else as material assets. One undo step.
         """
         if not MAYA_AVAILABLE:
             self.safe_show_status("Maya not available")
@@ -3758,32 +3873,169 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         if not folders:
             return
         exts = get_importable_extensions()
-        paths, fell_back, empty = [], 0, 0
-        for folder in folders:
-            found, used_lod0 = find_asset_folder_geo(folder, level, exts)
-            paths.extend(found)
-            fell_back += used_lod0
-            empty += not found
+        geo_level = level or 'LOD0'
 
-        label = 'High' if level == 'high' else 'LOD0'
-        if not paths:
-            self.safe_show_status(f"No {label} geo found in the selected folder(s)", 4000)
+        geo_paths, material_folders, texture_folders = [], [], []
+        fell_back = empty = skipped = 0
+        for folder in folders:
+            kind = self._asset_folder_kind(folder)
+            if kind == 'skip':
+                skipped += 1
+                continue
+            if kind in ('geo', 'unknown') and level:
+                found, used_lod0 = find_asset_folder_geo(folder, geo_level, exts)
+                if found:
+                    geo_paths.extend(found)
+                    fell_back += used_lod0
+                    continue
+                if kind == 'geo':
+                    empty += 1
+                    continue
+            if kind in ('material', 'unknown'):
+                material_folders.append(folder)
+            elif kind == 'texture':
+                texture_folders.append(folder)
+
+        if not (geo_paths or material_folders or texture_folders):
+            self.safe_show_status("Nothing to import in the selected folder(s)", 4000)
             return
 
-        imported, failed, built = self._smart_import_geo_files(paths)
-        msg = f"✓ Imported {imported} {label} geo file(s) from {len(folders)} folder(s)"
-        if built:
-            msg += f", {built} texture set material(s)"
+        # The current selection only means something when nothing but
+        # texture-only assets is imported
+        assign_shapes = []
+        if material_folders and not geo_paths:
+            assign_shapes = self._load_shader_generator()._shapes_from_selection()
+
+        imported = failed = built = 0
+        cmds.undoInfo(openChunk=True, chunkName='ddContentBrowser_asset_folder_import')
+        try:
+            if geo_paths:
+                imported, failed, built = self._smart_import_geo_files(geo_paths)
+            materials, textures, no_set, assigned = self._import_texture_assets(
+                material_folders, texture_folders, assign_shapes)
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+        parts = []
+        if geo_paths:
+            label = 'High' if geo_level == 'high' else 'LOD0'
+            parts.append(f"{imported} {label} geo file(s)" + (f" with {built} material(s)" if built else ""))
+        if materials:
+            parts.append(f"{materials} material(s)" + (f" (assigned: {assigned})" if assigned else ""))
+        if textures:
+            parts.append(f"{textures} texture file node(s)")
+        msg = "✓ Imported " + ", ".join(parts) if parts else "Nothing imported"
         notes = []
         if fell_back:
             notes.append(f"LOD0 used for {fell_back} without High")
         if empty:
             notes.append(f"{empty} folder(s) without matching geo")
+        if no_set:
+            notes.append(f"{no_set} folder(s) without textures")
+        if skipped:
+            notes.append(f"{skipped} brush(es) skipped")
         if failed:
             notes.append(f"{failed} failed")
         if notes:
             msg += " (" + ", ".join(notes) + ")"
         self.safe_show_status(msg, 6000)
+
+    def _import_texture_assets(self, material_folders, texture_folders, assign_shapes):
+        """
+        The texture-only part of import_asset_folders(): a material per
+        material folder (the first one built goes onto assign_shapes, if
+        any), file nodes per texture folder. Named after the asset ("Dirty
+        Concrete Ceiling" + its id, so two same-named assets don't collide);
+        re-importing reuses what's already built.
+
+        Returns (materials built, file nodes created, folders without a
+        texture set, name of the assigned material or None).
+        """
+        if not material_folders and not texture_folders:
+            return 0, 0, 0, None
+        import traceback
+        from .utils import find_asset_folder_texture_set, resolve_texture_set_channels
+
+        sm = self.settings_manager
+        preferred_resolution = sm.get('smart_import', 'preferred_resolution', '4K')
+        shader_type = sm.get('smart_import', 'shader_type', 'aiStandardSurface')
+
+        jobs, no_set = [], 0
+        for kind, folder in ([('material', f) for f in material_folders] +
+                             [('texture', f) for f in texture_folders]):
+            info = self.asset_library_service.asset_info(folder) or {}
+            asset_id = info.get('id') or ''
+            ts = find_asset_folder_texture_set(folder, preferred_resolution, asset_id or None)
+            if ts is None:
+                no_set += 1
+                print(f"[AssetImport] No texture set in {folder}")
+                continue
+            name = info.get('name') or Path(folder).name
+            if asset_id and asset_id.lower() not in name.lower():
+                name = f"{name}_{asset_id}"
+            jobs.append((kind, name, ts['variant_map']))
+        if not jobs:
+            return 0, 0, no_set, None
+
+        # One TIF conversion pass (one progress dialog) for the whole batch
+        variant_maps = [vm for _, _, vm in jobs]
+        if sm.get('smart_import', 'convert_to_tif', False):
+            from .utils import convert_variant_maps_to_tif
+            progress, on_progress = self._tif_conversion_progress_callback()
+            try:
+                variant_maps = convert_variant_maps_to_tif(variant_maps, progress_callback=on_progress)
+            finally:
+                progress.close()
+
+        gen = self._load_shader_generator()
+        materials = textures = 0
+        assigned = None
+        selection = cmds.ls(selection=True, long=True) or []
+        cmds.refresh(suspend=True)
+        try:
+            for (kind, name, _), variant_map in zip(jobs, variant_maps):
+                try:
+                    if kind == 'material':
+                        channels = resolve_texture_set_channels(variant_map, None)
+                        if not channels:
+                            continue
+                        shapes = assign_shapes if (assign_shapes and assigned is None) else []
+                        material, sg = gen.build_texture_set_material(name, channels, shader_type=shader_type,
+                                                                      disp_shapes=shapes)
+                        materials += 1
+                        if shapes:
+                            gen._assign_material_to_shapes(sg, shapes)
+                            assigned = material
+                    else:
+                        for channel, path in self._one_texture_per_channel(variant_map).items():
+                            gen._create_file_node("{0}_{1}".format(gen._sanitize_name(name), channel), path,
+                                                  gen._looks_like_udim(path),
+                                                  colorspace=gen._TEXTURE_SET_CHANNEL_CS.get(channel, "Raw"))
+                            textures += 1
+                except Exception as e:
+                    traceback.print_exc()
+                    print(f"[AssetImport] Failed for '{name}': {e}")
+        finally:
+            try:
+                # (never cmds.ls([]) - that lists the whole scene)
+                kept = (cmds.ls(selection, long=True) or []) if selection else []
+                if kept:
+                    cmds.select(kept, replace=True)
+                else:
+                    cmds.select(clear=True)
+            except Exception:
+                pass
+            cmds.refresh(suspend=False)
+        return materials, textures, no_set, assigned
+
+    @staticmethod
+    def _one_texture_per_channel(variant_map):
+        """One file per channel of a texture set (its LOD0 / untagged
+        variant) - for importing a set's maps as plain file nodes."""
+        picked = {}
+        for (channel, _udim, lod), path in sorted(variant_map.items(), key=lambda kv: (kv[0][2] not in (None, 'LOD0'),)):
+            picked.setdefault(channel, str(path))
+        return picked
 
     def import_selected_file(self):
         """Import selected file or navigate into folder"""
@@ -4211,7 +4463,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self._splitter_move_count = 0
         
         # Request thumbnails for newly visible items after resize
-        QTimer.singleShot(50, self, self.request_thumbnails_for_visible_items)
+        single_shot(50, self, self.request_thumbnails_for_visible_items)
         
         if DEBUG_MODE and move_count > 0:
             import time
@@ -4377,6 +4629,16 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         dialog = TextureSetSettingsDialog(self.settings_manager, self)
         dialog.settings_changed.connect(self.apply_settings)
         dialog.exec_()
+
+    def _load_asset_library_at_startup(self):
+        if self.asset_library_service.has_libraries_configured():
+            self.asset_library_service.ensure_loaded()
+
+    def show_asset_library_settings_dialog(self):
+        """Show the Asset Library settings panel (libraries, databases, types)"""
+        dialog = AssetLibrarySettingsDialog(self.asset_library_service, self)
+        dialog.exec_()
+        dialog.deleteLater()  # it's connected to the service - don't let closed ones pile up
     
     def apply_settings(self):
         """Apply settings to the application"""
@@ -4547,19 +4809,15 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 if hasattr(self, 'memory_cache'):
                     self.memory_cache.clear()
                 
-                # Clear disk cache
+                # Clear disk cache - the cache's own folder, wherever it lives
                 if hasattr(self, 'disk_cache'):
-                    cache_dir = Path.home() / ".ddContentBrowser" / "cache"
-                    if cache_dir.exists():
-                        import shutil
-                        shutil.rmtree(cache_dir)
-                        cache_dir.mkdir(parents=True, exist_ok=True)
+                    self.disk_cache.clear()
                 
                 QtWidgets.QMessageBox.information(self, "Success", "Thumbnail cache cleared successfully!")
                 self.safe_show_status("Cache cleared", 3000)
                 
                 # Request thumbnail regeneration
-                QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+                single_shot(100, self, self.request_thumbnails_for_visible_items)
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Error", f"Failed to clear cache: {e}")
     
@@ -4803,6 +5061,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # Cleanup preview panel (stop video playback, etc.)
         if hasattr(self, 'preview_panel') and self.preview_panel:
             self.preview_panel.cleanup()
+
+        # Stop Asset Library background work (a database build, a load)
+        if hasattr(self, 'asset_library_service'):
+            self.asset_library_service.shutdown()
         
         # Disconnect thumbnail generator signals BEFORE stopping (prevents RuntimeError)
         if hasattr(self, 'thumbnail_generator'):
@@ -4872,7 +5134,11 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         # status so F5 re-checks it (not just the directory listing itself -
         # the cache lives in the metadata DB, outside the directory cache
         # that file_model.refresh(force=True) below already bypasses).
-        if self.file_model.current_path is not None:
+        # (Not needed in an Asset Library category folder: its asset folders'
+        # previews come from the library database, and listing its thousands
+        # of subfolders here would cost a network scan.)
+        if (self.file_model.current_path is not None
+                and self.file_model._library_dir(self.file_model.current_path) is None):
             try:
                 from .utils import invalidate_folder_previews
                 subfolders = [p for p in self.file_model.current_path.iterdir() if p.is_dir()]
@@ -4882,7 +5148,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
 
         self.file_model.refresh(force=True)
         self.safe_show_status("Refreshed (cache bypassed)")
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
     
     def navigate_to_parent(self):
         """Navigate to parent folder (Backspace)"""
@@ -5077,7 +5343,13 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         if len(assets) > 1:
             self.safe_show_status("Can only rename one file at a time")
             return
-        
+
+        # Library items show the asset's name, not the folder's - and renaming
+        # a library's asset folder would break the library's own index anyway
+        if getattr(assets[0], 'is_library_asset', False):
+            self.safe_show_status("Asset Library items can't be renamed here")
+            return
+
         asset = assets[0]
         old_name = asset.name
         
@@ -5322,15 +5594,10 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                     add_fav_action = menu.addAction("⭐ Add to Favorites")
                     add_fav_action.triggered.connect(lambda: self.add_folder_to_favorites(asset.file_path))
 
-                    # Batch-import the selected asset folders' geo (Megascans-style)
+                    # Batch-import the selected asset folders (Megascans-style):
+                    # 3D assets with geo, surfaces & co. as materials, ...
                     if MAYA_AVAILABLE:
-                        folder_count = sum(1 for a in self.get_selected_assets() if a.is_folder)
-                        import_menu = menu.addMenu("📦 Import Asset Folder" if folder_count == 1
-                                                   else f"📦 Import {folder_count} Asset Folders")
-                        high_action = import_menu.addAction("High (LOD0 where there's no High)")
-                        high_action.triggered.connect(lambda: self.import_asset_folders('high'))
-                        lod0_action = import_menu.addAction("LOD0")
-                        lod0_action.triggered.connect(lambda: self.import_asset_folders('LOD0'))
+                        self._add_asset_folder_import_menu(menu)
                 else:
                     # File context menu
                     import_action = menu.addAction("📥 Import")
@@ -5390,8 +5657,9 @@ class DDContentBrowser(QtWidgets.QMainWindow):
                 # Add to Collection submenu (for both files and folders)
                 self.add_collection_submenu(menu, selected_assets)
                 
-                # Remove from Collection (only if in collection mode)
-                if self.file_model.collection_mode:
+                # Remove from Collection (only in a manual collection's view -
+                # not in the Asset Library view, which runs as collection mode too)
+                if self.file_model.collection_mode and self.current_collection_name:
                     remove_action = menu.addAction("➖ Remove from Collection")
                     remove_action.triggered.connect(lambda: self.remove_files_from_current_collection(selected_assets))
                 
@@ -5533,7 +5801,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         self.file_model.interrupt_search()
         
         # Delay the rest to let interrupt take effect
-        QTimer.singleShot(50, self, lambda: self._finish_show_in_browser(parent_dir, file_path))
+        single_shot(50, self, lambda: self._finish_show_in_browser(parent_dir, file_path))
     
     def _finish_show_in_browser(self, parent_dir, file_path):
         """Finish showing file in browser after interrupt has taken effect"""
@@ -5574,7 +5842,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             self.safe_show_status(f"File shown in directory: {file_path.name}")
         
         # Delay selection to ensure view is updated
-        QTimer.singleShot(300, self, select_file)
+        single_shot(300, self, select_file)
     
     def regenerate_selected_thumbnails(self):
         """Regenerate thumbnails for selected files by clearing their cache entries"""
@@ -5639,7 +5907,7 @@ class DDContentBrowser(QtWidgets.QMainWindow):
             
             # Request thumbnail regeneration for visible items
             # Use a longer delay to ensure caches are fully cleared
-            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+            single_shot(100, self, self.request_thumbnails_for_visible_items)
             
             # Force delegate redraw by emitting dataChanged (no viewport().update() needed)
             model = self.file_list.model()
@@ -5711,10 +5979,16 @@ class DDContentBrowser(QtWidgets.QMainWindow):
         normalized_path = str(Path(path_str).resolve())
         
         # Check if already in favorites
-        existing_normalized = [str(Path(p).resolve()) for p in self.config.config["favorites"]]
-        
+        existing_favorites = [self._normalize_favorite(fav) for fav in self.config.config["favorites"]]
+        existing_normalized = [str(Path(fav["path"]).resolve()) for fav in existing_favorites if fav]
+
         if normalized_path not in existing_normalized:
-            self.config.config["favorites"].append(path_str)
+            # New dict format - a bare string would reintroduce the old one
+            self.config.config["favorites"].append({
+                "path": normalized_path,
+                "alias": None,
+                "color": None
+            })
             self.config.save_config()
             self.update_favorites_list()
             self.safe_show_status(f"Added to favorites: {Path(path_str).name}")
@@ -5834,7 +6108,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status(f"Advanced filters: {filter_count} active - {file_count} files shown", 4000)
         
         # Request thumbnails for filtered results
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
         
         if DEBUG_MODE:
             if DEBUG_MODE:
@@ -5849,7 +6123,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status(f"Advanced filters cleared - {file_count} files shown", 3000)
         
         # Request thumbnails
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
         
         if DEBUG_MODE:
             if DEBUG_MODE:
@@ -5943,7 +6217,12 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
             
             # Apply collection filter to file model
             self.file_model.setCollectionFilter(collection_files)
-            
+
+            # A collection replaces the Asset Library view, if that was shown
+            if self.library_view_active:
+                self.library_view_active = False
+                self.asset_library_panel.set_view_active(False)
+
             # Store current collection name
             self.current_collection_name = collection_name
             
@@ -5962,7 +6241,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
             self.update_navigation_buttons()
             
             # Request thumbnails for visible items
-            QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+            single_shot(100, self, self.request_thumbnails_for_visible_items)
             
             # CRITICAL: Refresh Advanced Filters panel to enable re-analysis
             # This ensures the "Analyze Folder" button works with the new collection items
@@ -5972,8 +6251,49 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
             if DEBUG_MODE:
                 print(f"[Browser] Applied collection filter: {collection_name}")
     
+    def show_library_results(self, entries, label):
+        """
+        Show Asset Library results in the file list. Runs as a collection
+        view (file_model.setLibraryResults), so leaving it - navigating,
+        Back, a collection - goes through on_collection_cleared() like any
+        collection. Called again on every filter change while it's shown.
+        """
+        if hasattr(self, 'thumbnail_generator'):
+            self.thumbnail_generator.clear_queue()
+
+        entering = not self.library_view_active
+        if entering:
+            # Coming from a manual collection: leave it without a round trip
+            # through the folder view
+            if self.current_collection_name:
+                self.current_collection_name = None
+                self.collections_panel.clear_btn.setVisible(False)
+                self.collections_panel.collections_list.clearSelection()
+            self.clear_search_state()
+            if self.include_subfolders_checkbox.isChecked():
+                self.include_subfolders_checkbox.setChecked(False)
+                self.file_model.include_subfolders = False
+            watched_dirs = self.file_watcher.directories()
+            if watched_dirs:
+                self.file_watcher.removePaths(watched_dirs)
+
+        self.library_view_active = True
+        self.file_model.setLibraryResults(entries)
+        self.breadcrumb.set_collection_mode(label)
+        self.update_navigation_buttons()
+        self.safe_show_status("Asset Library: {0} assets".format(len(entries)))
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
+
+        if entering and hasattr(self, 'advanced_filters_panel'):
+            self.advanced_filters_panel.refresh()
+
     def on_collection_cleared(self):
         """Handle collection filter clear - show all files"""
+        # Leaving the Asset Library view (it runs as a collection view)
+        if self.library_view_active:
+            self.library_view_active = False
+            self.asset_library_panel.set_view_active(False)
+
         # CLEAR thumbnail generator queue when clearing collection
         if hasattr(self, 'thumbnail_generator'):
             self.thumbnail_generator.clear_queue()
@@ -6005,7 +6325,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status("Returned to folder view")
         
         # Request thumbnails for visible items
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
         
         # CRITICAL: Refresh Advanced Filters panel to enable re-analysis
         # This ensures the "Analyze Folder" button works after returning to folder view
@@ -6116,7 +6436,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status(f"Removed {item_count} {item_word} from collection '{self.current_collection_name}'")
         
         # Request thumbnails for remaining visible items
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)
         
         if DEBUG_MODE:
             print(f"[Browser] Removed {item_count} {item_word} from collection '{self.current_collection_name}'")
@@ -6149,7 +6469,7 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
             # Debounce: only schedule refresh if not already pending
             if not self._watcher_pending_refresh:
                 self._watcher_pending_refresh = True
-                QTimer.singleShot(300, self, self._refresh_from_watcher)
+                single_shot(300, self, self._refresh_from_watcher)
             
         except Exception as e:
             import traceback
@@ -6174,4 +6494,4 @@ Type: {'Folder' if asset.is_folder else asset.extension.upper()[1:] + ' File'}
         self.safe_show_status("📂 Directory updated automatically")
         
         # Request thumbnails for visible items
-        QTimer.singleShot(100, self, self.request_thumbnails_for_visible_items)
+        single_shot(100, self, self.request_thumbnails_for_visible_items)

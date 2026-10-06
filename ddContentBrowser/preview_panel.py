@@ -99,15 +99,16 @@ except ImportError:
     NUMPY_AVAILABLE = False
     print("[Preview Panel] Warning: numpy not available - HDR/EXR support disabled")
 
-# Check for OpenCV (for advanced TIFF support)
-try:
-    import cv2
+# Check for OpenCV (for advanced TIFF support) - falls back to the bundled
+# build if the first cv2 found can't handle the loaded numpy (see utils.import_cv2())
+from .utils import import_cv2, single_shot
+cv2 = import_cv2()
+OPENCV_AVAILABLE = cv2 is not None
+if OPENCV_AVAILABLE:
     # Set OpenCV logging level to ERROR only (suppresses INFO/DEBUG spam)
     if hasattr(cv2, 'setLogLevel'):
         cv2.setLogLevel(0)  # 0 = Silent
-    OPENCV_AVAILABLE = True
-except ImportError:
-    OPENCV_AVAILABLE = False
+else:
     print("[Preview Panel] Info: OpenCV not available - using QImageReader for TIFF")
 
 
@@ -1472,10 +1473,21 @@ class PreviewPanel(QWidget):
                     return None, None
                 
                 # Now we have rgb data (RAW float)
-                
-                # Convert float16 to float32
-                if rgb.dtype == np.float16:
-                    rgb = rgb.astype(np.float32)
+
+                # Normalize to HxWx3 float32 - cv2.resize rejects >4 channels and
+                # unsupported dtypes (e.g. uint32 ID/crypto channels)
+                rgb = np.asarray(rgb)
+                if rgb.ndim == 1:
+                    rgb = rgb.reshape(height, width)
+                if rgb.ndim == 2:
+                    rgb = np.stack([rgb, rgb, rgb], axis=2)
+                elif rgb.shape[2] == 1:
+                    rgb = np.repeat(rgb, 3, axis=2)
+                elif rgb.shape[2] == 2:
+                    rgb = np.concatenate([rgb, np.zeros_like(rgb[:, :, :1])], axis=2)
+                elif rgb.shape[2] > 3:
+                    rgb = rgb[:, :, :3]
+                rgb = np.ascontiguousarray(rgb, dtype=np.float32)
                 
                 # Store ORIGINAL resolution BEFORE downsampling (for metadata display)
                 resolution_str = f"{width} x {height}"
@@ -3487,8 +3499,16 @@ class PreviewPanel(QWidget):
                                     sys.path.append(external_libs)
                                 
                                 from PIL import Image
-                                pil_image = Image.open(file_path_str)
-                                
+                                if file_path_str.lower().endswith('.psd'):
+                                    # PIL garbles PSDs whose merged preview it
+                                    # cannot decode - go through psd-tools.
+                                    from .utils import load_psd_pil
+                                    pil_image = load_psd_pil(file_path_str)
+                                    if pil_image is None:
+                                        pil_image = Image.open(file_path_str)
+                                else:
+                                    pil_image = Image.open(file_path_str)
+
                                 # Convert to RGB
                                 if pil_image.mode not in ('RGB', 'L'):
                                     pil_image = pil_image.convert('RGB')
@@ -4484,9 +4504,17 @@ class PreviewPanel(QWidget):
                                         original_height = psd.height
                                         resolution_str = f"{original_width} x {original_height}"
                                     
-                                    # Load PSD with PIL (fast path)
-                                    pil_image = Image.open(file_path_str)
-                                    
+                                    # psd-tools, not PIL: PIL silently returns a
+                                    # garbled image for PSDs whose merged
+                                    # preview it cannot decode. The preview is
+                                    # shown at 2048px, so let the loader scale
+                                    # before the ICC conversion - that is where
+                                    # the time goes on full size composites.
+                                    from .utils import load_psd_pil
+                                    pil_image = load_psd_pil(file_path_str, max_size=2048)
+                                    if pil_image is None:
+                                        pil_image = Image.open(file_path_str)
+
                                     # Convert to RGB (handle all color modes)
                                     if pil_image.mode not in ('RGB', 'RGBA'):
                                         pil_image = pil_image.convert('RGB')
@@ -4500,23 +4528,29 @@ class PreviewPanel(QWidget):
                                     import numpy as np
                                     img_array = np.array(pil_image)
                                     height, width = img_array.shape[:2]
-                                    
+
+                                    # QImage does not copy the buffer it is
+                                    # given, so it must stay referenced until
+                                    # q_image.copy() below - an inline
+                                    # tobytes() is freed before that.
+                                    buffer = img_array.tobytes()
+
                                     # Handle RGB/RGBA
                                     if len(img_array.shape) == 3:
                                         channels = img_array.shape[2]
                                         if channels == 4:
                                             # RGBA
                                             bytes_per_line = width * 4
-                                            q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGBA8888)
+                                            q_image = QImage(buffer, width, height, bytes_per_line, QImage.Format_RGBA8888)
                                         else:
                                             # RGB
                                             bytes_per_line = width * 3
-                                            q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
+                                            q_image = QImage(buffer, width, height, bytes_per_line, QImage.Format_RGB888)
                                     else:
                                         # Grayscale
                                         bytes_per_line = width
-                                        q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_Grayscale8)
-                                    
+                                        q_image = QImage(buffer, width, height, bytes_per_line, QImage.Format_Grayscale8)
+
                                     composite_pixmap = QPixmap.fromImage(q_image.copy())
                                     pil_image.close()
                                     
@@ -4541,7 +4575,6 @@ class PreviewPanel(QWidget):
                                         
                                         # Fit to view
                                         self.fit_pixmap_to_label()
-                                        print(f"{'='*60}\n")
                                     else:
                                         print(f"[PREVIEW-DEBUG] ✗ PSD composite loading failed")
                                         self.graphics_scene.clear()
@@ -4594,12 +4627,13 @@ class PreviewPanel(QWidget):
                                     print(f"[PREVIEW-DEBUG] Converting to QImage with Format_RGB888...")
                                     
                                     bytes_per_line = width * 3
-                                    q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
+                                    # Keep the buffer alive until copy() - see above
+                                    buffer = img_array.tobytes()
+                                    q_image = QImage(buffer, width, height, bytes_per_line, QImage.Format_RGB888)
                                     pixmap = QPixmap.fromImage(q_image.copy())
-                                    
+
                                     print(f"[PREVIEW-DEBUG] ✓ QPixmap created: {pixmap.width()}x{pixmap.height()}")
-                                    print(f"{'='*60}\n")
-                                    
+
                                     self.current_pixmap = pixmap
                                     self.add_to_cache(file_path_str, pixmap, resolution_str)
                                     self.fit_pixmap_to_label()
@@ -5173,7 +5207,7 @@ class PreviewPanel(QWidget):
             # Show confirmation in button
             original_text = self.copy_text_btn.text()
             self.copy_text_btn.setText("✓ Copied!")
-            QtCore.QTimer.singleShot(1500, self, lambda: self.copy_text_btn.setText(original_text))
+            single_shot(1500, self, lambda: self.copy_text_btn.setText(original_text))
     
     def pdf_previous_page(self):
         """Navigate to previous PDF page"""
@@ -7012,7 +7046,7 @@ class PreviewPanel(QWidget):
         except ImportError:
             from PySide2.QtCore import QTimer
         
-        QTimer.singleShot(50, self, lambda: scroll_area.verticalScrollBar().setValue(scroll_position))
+        single_shot(50, self, lambda: scroll_area.verticalScrollBar().setValue(scroll_position))
     
     def _show_tag_context_menu(self, pos, button, dialog, tag_buttons):
         """Show context menu for tag button in browse dialog"""
@@ -8036,8 +8070,16 @@ class PreviewPanel(QWidget):
                         try:
                             from PIL import Image
                             Image.MAX_IMAGE_PIXELS = None  # Disable decompression bomb warning
-                            
-                            pil_image = Image.open(file_path_str)
+
+                            if file_path_str.lower().endswith('.psd'):
+                                # PIL garbles PSDs whose merged preview it
+                                # cannot decode - go through psd-tools.
+                                from .utils import load_psd_pil
+                                pil_image = load_psd_pil(file_path_str)
+                                if pil_image is None:
+                                    pil_image = Image.open(file_path_str)
+                            else:
+                                pil_image = Image.open(file_path_str)
                             original_size = pil_image.size
                             resolution_str = f"{original_size[0]} x {original_size[1]}"
                             
@@ -8253,7 +8295,7 @@ class PreviewPanel(QWidget):
                     self.media_player.setPosition(0)
                     self.media_player.play()
                     if self._floating_video is None:
-                        QtCore.QTimer.singleShot(100, self, lambda: self._pause_and_reset_video())
+                        single_shot(100, self, lambda: self._pause_and_reset_video())
         else:
             from PySide2.QtMultimedia import QMediaPlayer
             if status == QMediaPlayer.LoadedMedia:
@@ -8262,7 +8304,7 @@ class PreviewPanel(QWidget):
                     self.media_player.setPosition(0)
                     self.media_player.play()
                     if self._floating_video is None:
-                        QtCore.QTimer.singleShot(100, self, lambda: self._pause_and_reset_video())
+                        single_shot(100, self, lambda: self._pause_and_reset_video())
 
     def show_volume_popup(self):
         """Show volume slider popup below the volume button"""

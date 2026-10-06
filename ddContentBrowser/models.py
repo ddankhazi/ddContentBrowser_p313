@@ -307,6 +307,20 @@ class TextureSet:
         return len(self.files)
 
 
+class _ListedEntry:
+    """os.DirEntry stand-in for a directory listing taken from the Asset
+    Library database (FileSystemModel.refresh) - just what refresh() uses."""
+    __slots__ = ('name', 'path', '_is_dir')
+
+    def __init__(self, directory, name, is_dir):
+        self.name = name
+        self.path = os.path.join(directory, name)
+        self._is_dir = is_dir
+
+    def is_dir(self, follow_symlinks=True):
+        return self._is_dir
+
+
 class AssetItem:
     """Asset item representation with lazy stat loading"""
     
@@ -525,6 +539,17 @@ class FileSystemModel(QAbstractListModel):
         # Collection mode - when active, show collection files instead of directory
         self.collection_mode = False
         self.collection_files = []  # List of file paths to display in collection mode
+        # Asset Library view: a collection-mode variant fed with ready-made
+        # (folder path, display name, preview path, folder mtime) entries from
+        # the library database - no stat or folder scan per item, see
+        # setLibraryResults(). None when not in that view.
+        self.library_entries = None
+        # Normal browsing inside an Asset Library category folder: callable
+        # (folder) -> what the library database knows about it, or None (see
+        # asset_library.LibraryDataset.dir_listing) - lets refresh() skip the
+        # network directory scan and the per-folder preview search there.
+        # Set by the browser; None = plain filesystem browsing only.
+        self.library_lookup = None
         
         # Sorting
         self.sort_column = "name"  # "name", "size", "date", "type"
@@ -689,7 +714,10 @@ class FileSystemModel(QAbstractListModel):
         
         # Collection mode - load files from collection list instead of directory
         if self.collection_mode:
-            self._load_collection_files()
+            if self.library_entries is not None:
+                self._load_library_entries()
+            else:
+                self._load_collection_files()
             return
         
         if not self.current_path or not self.current_path.exists():
@@ -931,10 +959,21 @@ class FileSystemModel(QAbstractListModel):
                     # No cache - load from filesystem using os.scandir() for maximum performance
                     # scandir() returns DirEntry objects with cached stat info (1 filesystem call!)
                     all_items = []
-                    
+
+                    # An Asset Library category folder unchanged since its
+                    # database was built (same mtime - adding, removing or
+                    # renaming an entry changes it): the database holds its
+                    # complete listing, so no network directory scan
+                    listing = self._library_dir(self.current_path)
+                    if listing is not None and listing['files'] is None:
+                        listing = None
+                    if listing is not None and listing['dir_mtime'] != current_mtime:
+                        listing = None
+                    entries = self._library_listing_entries(listing) if listing is not None else None
+
                     # Use os.scandir() - much faster than iterdir() + glob()
                     # DirEntry.is_dir() uses cached data from the initial scandir() call
-                    for entry in os.scandir(self.current_path):
+                    for entry in (entries if entries is not None else os.scandir(self.current_path)):
                         # Skip hidden files/folders (starting with .)
                         if entry.name.startswith('.'):
                             continue
@@ -1190,6 +1229,38 @@ class FileSystemModel(QAbstractListModel):
             # No image files to group
             self.assets = folders + other_files
     
+    def _library_dir(self, directory):
+        """What the Asset Library database knows about `directory` (a
+        library category folder), or None - see library_lookup."""
+        if self.library_lookup is None:
+            return None
+        try:
+            return self.library_lookup(directory)
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"[Model] Asset Library lookup failed for {directory}: {e}")
+            return None
+
+    def _library_listing_entries(self, listing):
+        """A category folder's listing from the Asset Library database, as
+        os.DirEntry stand-ins for refresh()'s scandir loop."""
+        directory = str(self.current_path)
+        entries = [_ListedEntry(directory, name, True) for name, _preview, _mtime in listing['folders'].values()]
+        entries += [_ListedEntry(directory, name, False) for name in listing['files']]
+        return entries
+
+    @staticmethod
+    def _set_known_stat(asset, mtime, size=0):
+        """Fill in stat info already known (e.g. from the Asset Library
+        database), so nothing stats the item over the network later."""
+        asset._size = size
+        asset._modified_time = mtime or 0
+        try:
+            asset._modified = datetime.fromtimestamp(mtime) if mtime else datetime.fromtimestamp(0)
+        except (OverflowError, OSError, ValueError):
+            asset._modified = datetime.fromtimestamp(0)
+        asset._stat_loaded = True
+
     def _resolve_folder_previews(self, assets):
         """
         Set .folder_preview_path / .should_generate_thumbnail on folder
@@ -1199,6 +1270,9 @@ class FileSystemModel(QAbstractListModel):
         picks it up. Batched over all folders in this listing at once -
         cheap after the first visit (see utils.resolve_folder_previews(),
         cached in the metadata DB).
+
+        Asset folders of an Asset Library come straight from its database
+        instead (preview path + folder mtime) - no folder is opened at all.
         """
         if not self.thumbnails_enabled or not self.folder_thumbnails_enabled:
             # Nothing would be shown anyway - skip the DB/filesystem work
@@ -1209,6 +1283,27 @@ class FileSystemModel(QAbstractListModel):
         folders = [a for a in assets if a.is_folder]
         if not folders:
             return
+
+        if self.library_lookup is not None:
+            listings = {}
+            unknown = []
+            for asset in folders:
+                parent = str(asset.file_path.parent)
+                if parent not in listings:
+                    listings[parent] = self._library_dir(parent)
+                listing = listings[parent]
+                info = listing['folders'].get(asset.file_path.name.lower()) if listing is not None else None
+                if info is None:
+                    unknown.append(asset)
+                    continue
+                _name, preview, mtime = info
+                self._set_known_stat(asset, mtime)
+                if preview:
+                    asset.folder_preview_path = Path(preview)
+                    asset.should_generate_thumbnail = True
+            folders = unknown
+            if not folders:
+                return
         try:
             from .utils import resolve_folder_previews
             previews = resolve_folder_previews(a.file_path for a in folders)
@@ -1438,14 +1533,30 @@ class FileSystemModel(QAbstractListModel):
         self.beginResetModel()
         self.collection_mode = True
         self.collection_files = [str(Path(p).resolve()) for p in file_paths]
+        self.library_entries = None
         self.refresh()
         self.endResetModel()
-    
+
+    def setLibraryResults(self, entries):
+        """
+        Show Asset Library results: (folder path, display name, preview path
+        or None, folder mtime) tuples. Runs as collection mode, so the
+        browser's collection handling (navigation exits it, no file watcher,
+        Back button, ...) applies as is.
+        """
+        self.beginResetModel()
+        self.collection_mode = True
+        self.collection_files = []
+        self.library_entries = list(entries)
+        self.refresh()
+        self.endResetModel()
+
     def clearCollectionFilter(self):
         """Exit collection mode and return to normal directory browsing"""
         self.beginResetModel()
         self.collection_mode = False
         self.collection_files = []
+        self.library_entries = None
         # Force refresh to ensure we get current directory state, not cached search results
         self.refresh(force=True)
         self.endResetModel()
@@ -1502,6 +1613,42 @@ class FileSystemModel(QAbstractListModel):
             print(f"[ERROR] Sorting failed: {e}")
             traceback.print_exc()
     
+    def _load_library_entries(self):
+        """
+        Build the Asset Library view's items straight from the database
+        entries - a library can hold ~20k asset folders on a network drive,
+        so nothing here touches the disk: the folder mtime comes from the
+        database (taken from the directory listing - the same value a stat
+        gives for a settled folder, so thumbnail cache keys match normal
+        browsing) and the preview image path is known.
+        """
+        show_previews = self.thumbnails_enabled and self.folder_thumbnails_enabled
+        epoch = datetime.fromtimestamp(0)
+        assets = []
+        for path, name, preview, mtime in self.library_entries:
+            asset = AssetItem(path, lazy_load=True, is_dir=True)
+            asset.name = name  # the asset's own name, not "3d_building_wmfhbggdw"
+            asset.is_library_asset = True
+            asset._size = 0
+            asset._modified_time = mtime or 0
+            try:
+                asset._modified = datetime.fromtimestamp(mtime) if mtime else epoch
+            except (OverflowError, OSError, ValueError):
+                asset._modified = epoch
+            asset._stat_loaded = True
+            if preview and show_previews:
+                asset.folder_preview_path = Path(preview)
+                asset.should_generate_thumbnail = True
+            assets.append(asset)
+
+        # The browser's own search box narrows the results further, by name
+        if self.filter_text:
+            assets = [a for a in assets
+                      if self._matches_search(a.name, self.filter_text, full_path=str(a.file_path))]
+        self.assets = assets
+        self._ungrouped_assets = self.assets.copy()
+        self._sort_assets()
+
     def _load_collection_files(self):
         """Load files and folders from collection list (collection mode)"""
         try:
@@ -1848,8 +1995,10 @@ class FileSystemModel(QAbstractListModel):
                         mel_cmd += f"substance_node = cmds.shadingNode('substance', asTexture=True)\\n"
                         mel_cmd += f"cmds.setAttr(substance_node + '.filePath', r'{escaped_path}', type='string')\\n"
                     else:
-                        # Regular files
-                        mel_cmd += f"cmds.file(r'{escaped_path}', i=True, ignoreVersion=True, mergeNamespacesOnClash=False, namespace=':', options='v=0', preserveReferences=True)\\n"
+                        # Regular files ('v=0' is a Maya-scene-only option;
+                        # the USD translator rejects it with "Unknown flag 'v'")
+                        options_arg = ", options='v=0'" if asset.extension in ('.ma', '.mb') else ""
+                        mel_cmd += f"cmds.file(r'{escaped_path}', i=True, ignoreVersion=True, mergeNamespacesOnClash=False, namespace=':'{options_arg}, preserveReferences=True)\\n"
                 mel_cmd += "\");"
             
             # Set as plain text (Maya Script Editor and viewport accept this)

@@ -1,5 +1,5 @@
 
-# DD Content Browser v2.5.0
+# DD Content Browser v2.5.5
 
 Content Browser for Maya by Denes Dankhazi
 Modern Maya Asset Browser for Autodesk Maya 2025+ (PySide6, Python 3.11 & 3.13)
@@ -11,6 +11,15 @@ Modern Maya Asset Browser for Autodesk Maya 2025+ (PySide6, Python 3.11 & 3.13)
 DD Content Browser is a high-performance, feature-rich asset browser for Maya, designed for large production environments. It replaces the built-in browser with a fast, intuitive, and visually advanced interface with advanced features like video support, texture sets, collections, tags, Quick View, and more.
 
 ---
+
+## 🆕 What's New in v2.5.5
+
+- **Asset Library** - New tab next to Collections / Advanced Filters: browse a downloaded Megascans library by its own tags, Quixel Bridge style - category tree, Environment / State / Color / Size / ... chips with live counts, search over names and tags; results show right in the file list (see *Asset Library* below). Set up in *Settings > Asset Library Settings...*
+- **Shared database (optional)** - A library's database can be built once and shared with everyone through a shared folder (immutable snapshots + manifest, downloaded to a local cache) - never both shared and local; an installation-wide default folder can be set
+- **Fast Megascans browsing** - Browsing a library's category folders (e.g. `Downloaded/3d`, `surface`) takes the listing and folder previews from the library database when the folder hasn't changed: thousands of asset folders open in a fraction of a second instead of seconds - no network scan, no per-folder preview search
+- **Import Asset Folders by type** - Surfaces, atlases, decals and displacements come in as materials (the first one onto the current selection when nothing else is imported), imperfections as file nodes, brushes are skipped; the menu says what will happen (*High for 3 assets + 5 materials*)
+- **Maya 2026 / PySide6 6.5 compatibility** - Context-object `QTimer.singleShot` calls replaced with a helper that works on every PySide build (the 6.8-only overload crashed the browser on Maya 2026)
+- **Fixes** - EXR channels with more than 4 channels or integer data (ID/crypto) load again; OpenCV falls back to the bundled build when the one found first can't handle the session's numpy; PSDs with unreadable merged previews are composited from their layers (ICC applied after scaling); USD import no longer fails on Maya-only import options; thumbnail cache size/clear act on the real cache folder
 
 ## 🆕 What's New in v2.5
 
@@ -125,6 +134,7 @@ Cheers, D
   - Untagged geo is only used when the folder has no High/LOD0 at all (so `_proxy`/ZTool extras are skipped); with `VarN` folders present, duplicate copies at the asset's top level are ignored
   - When some geo in a folder has a LOD chain (`_LODn` files) and other geo doesn't, only the geo with the chain is the asset - single-level extras (e.g. a debris set's separate pieces next to its combined file) are skipped
   - The status bar reports how many files came in, how many used the LOD0 fallback and which folders had nothing to import
+  - **By asset type** (Megascans types from the Asset Library database, else the category folder's name): 3D assets and 3D plants get their geo + material as above; **surfaces, atlases, decals and displacements** get a material built from the folder's own texture set (named after the asset, e.g. `Dirty_Concrete_Ceiling_xeokfboga_MAT`) - with nothing but those in the import, the first material goes onto the current Maya selection; **imperfections** come in as plain file nodes; brushes are skipped. `Thumbs/` and `previews/` subfolders are never used. The menu says what will happen, e.g. *High for 3 assets + 5 materials + 2 texture sets*. One undo step
 - **Matched per material / per object** - Every shading assignment of an imported file (a whole object or a face group) gets its texture set by:
   1. the imported material's name - configured suffixes (`_MAT`, `_mtl`, ...), `_High`/`_LODn` and `_2K`/`_4K` tags and Maya's clash numbering (`RockA_MAT1`) are ignored,
   2. else the geo object's name,
@@ -171,6 +181,17 @@ Cheers, D
 - **File counts** - Display number of files per collection (e.g., "▸ MyAssets (23)")
 - **Cleanup missing files** - Validate file existence
 - **Persistent storage** - JSON at `~/.ddContentBrowser/collections.json`
+
+### Asset Library - Megascans Tag Filtering 🏛️ ✨ **NEW!**
+Browse a downloaded Megascans library by its own tags, Quixel Bridge style - in the **Asset Library** tab next to Collections / Advanced Filters.
+- **Setup** - *Settings > Asset Library Settings...*: add your library folder (the library root holding `Downloaded`, the `Downloaded` folder itself, or any folder of category folders like `3d` / `surface`), then **Build Database**. Several libraries can be added
+- **Fast build** - Reads Bridge's own index (`Downloaded/assetsData.json`) when present (~10 s for ~19k assets on a network drive); without it, every asset's own JSON is read once. Folders without metadata still show up, by category
+- **Read-only** - Nothing is ever written into the library. The database is a local per-user cache (`%LOCALAPPDATA%/ddContentBrowser/asset_library/`, one file per library), rebuildable any time
+- **Filters** - Category tree (type › category › subcategory) plus chips for Environment, State, Color, real-world Size, Subject, Interior/Exterior, Orientation, Tileable and Region, and a search over names and tags. OR within a filter, AND across filters; every chip shows a live count
+- **Results in the file list** - Matching asset folders show with their preview images and asset names; Import Asset Folder, MMB batch import and auto material build work as usual. Navigating anywhere leaves the view, the **Show** button returns to it
+- **Change detection** - A library changed since its database was built is reported in the tab (one click updates it), or updated automatically if enabled
+- **Shared database (optional)** - Set a *Shared Database* folder everyone can reach, then **Make Shared**: the library's database is built once and published there, and everyone with the same folder set gets it automatically (no own build needed). Finished snapshots + a small manifest, never a live database on the share: the tool downloads the current snapshot into its local cache when it loads and reads it locally (keeps working from that copy when the share is offline). A library is either shared or local, never both. Anyone with write access can update it (a lock file prevents two updates at once). A default shared folder for everyone running one installation can be set with *Set as Default for Everyone* (writes `site_defaults.json` next to the tool - not part of the distribution)
+- **Asset types** - Brushes are hidden by default (not importable into Maya); any type can be switched on/off in the settings
 
 ### Tag System 🏷️ ✨ **NEW!**
 - **SQLite backend** - Fast metadata storage at `~/.ddContentBrowser/tags.db`
@@ -379,7 +400,7 @@ Commercial redistribution is not permitted without the author's permission.
 ## 🙏 Credits
 
 **Author:** Denes Dankhazi (ddankhazi)  
-**Version:** 2.5.0  
+**Version:** 2.5.5  
 **Maya Version:** 2025+ (PySide6)  
 **Python:** 3.11 (Maya 2025/2026) & 3.13 (Maya 2027+)  
 **Blog & Portfolio:** [ddankhazi.com](https://ddankhazi.com)

@@ -46,13 +46,9 @@ OPENEXR_AVAILABLE = OpenEXR is not None
 #     print("OpenEXR not available - EXR preview will be limited")
 
 # Try to import OpenCV for Radiance HDR (.hdr) support
-try:
-    import cv2
-    OPENCV_AVAILABLE = True
-    # print(f"OpenCV loaded - Full HDR support enabled")
-except ImportError:
-    OPENCV_AVAILABLE = False
-    # print("OpenCV not available - HDR preview will be limited")
+from .utils import import_cv2, single_shot
+cv2 = import_cv2()
+OPENCV_AVAILABLE = cv2 is not None
 
 # Try to import PyMuPDF (fitz) for PDF support
 try:
@@ -134,6 +130,10 @@ class FlowLayout(QtWidgets.QLayout):
     
     def addWidget(self, widget):
         """Add widget to the flow layout"""
+        # Parent it to the layout's widget, as QLayout.addWidget does - else
+        # a widget added after the layout was set on its widget stays a
+        # hidden parentless window
+        self.addChildWidget(widget)
         self.addItem(QtWidgets.QWidgetItem(widget))
     
     def horizontalSpacing(self):
@@ -321,7 +321,7 @@ class BreadcrumbWidget(QWidget):
             elif event.type() == QEvent.FocusOut:
                 # Exit edit mode when focus is lost (clicked elsewhere)
                 # Use a short timer to avoid conflicts with returnPressed
-                QtCore.QTimer.singleShot(100, self, self.cancel_edit_mode)
+                single_shot(100, self, self.cancel_edit_mode)
                 return False  # Let the event propagate
         return super().eventFilter(obj, event)
     

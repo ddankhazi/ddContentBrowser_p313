@@ -95,6 +95,224 @@ def import_openexr():
         return OpenEXR, Imath
 
 
+_cv2_import_cache = {}
+_cv2_import_lock = threading.Lock()
+
+
+def _cv2_works(cv2):
+    """Smoke test: can this cv2 build actually accept the loaded numpy's arrays?"""
+    try:
+        import numpy as np
+        cv2.resize(np.zeros((4, 4, 3), np.float32), (2, 2), interpolation=cv2.INTER_AREA)
+        return True
+    except Exception:
+        return False
+
+
+def import_cv2():
+    """
+    Import cv2, falling back to the bundled build in external_libs when the
+    one found first on sys.path can't work with the numpy already loaded.
+
+    Only one numpy can live in a process, and Maya sessions often have it
+    pulled in by another tool (e.g. numpy 2.x) while the studio site-packages
+    cv2 (4.9) was compiled against numpy 1.x. That cv2 imports fine but then
+    rejects every array ("src is not a numpy array, neither a scalar").
+
+    This smoke-tests the first cv2 found; if it fails, swaps in the bundled
+    cv2 (numpy 2 compatible) via sys.modules, so every later `import cv2` in
+    this package gets the working one. Cached after the first call.
+
+    Returns the cv2 module, or None if no working cv2 is available.
+    """
+    if 'result' in _cv2_import_cache:
+        return _cv2_import_cache['result']
+
+    with _cv2_import_lock:
+        if 'result' in _cv2_import_cache:
+            return _cv2_import_cache['result']
+
+        try:
+            import cv2
+        except ImportError:
+            cv2 = None
+
+        if cv2 is None or not _cv2_works(cv2):
+            external_libs = get_external_libs_dir()
+            if os.path.isdir(os.path.join(external_libs, 'cv2')):
+                saved = {k: v for k, v in sys.modules.items() if k == 'cv2' or k.startswith('cv2.')}
+                for k in saved:
+                    sys.modules.pop(k, None)
+                # A failed cv2 import (e.g. "_ARRAY_API not found") leaves its
+                # recursion guard and binary folder behind, which would make the
+                # bundled import die with "recursion is detected"
+                if hasattr(sys, 'OpenCV_LOADER'):
+                    delattr(sys, 'OpenCV_LOADER')
+                wanted = os.path.normcase(external_libs)
+                for entry in list(sys.path):
+                    if (os.path.basename(os.path.normpath(entry)).lower() == 'cv2'
+                            and not os.path.normcase(entry).startswith(wanted)):
+                        sys.path.remove(entry)
+                if external_libs in sys.path:
+                    sys.path.remove(external_libs)
+                sys.path.insert(0, external_libs)
+                bundled = None
+                try:
+                    import cv2 as bundled
+                except Exception as e:
+                    print(f"[ddContentBrowser] Bundled cv2 failed to import: {e}")
+                finally:
+                    # Restore append-only priority for everything else
+                    if external_libs in sys.path:
+                        sys.path.remove(external_libs)
+                    sys.path.append(external_libs)
+
+                if bundled is not None and _cv2_works(bundled):
+                    print(f"[ddContentBrowser] Using bundled cv2 {bundled.__version__} "
+                          f"(incompatible cv2 {getattr(cv2, '__version__', '?')} found first)")
+                    cv2 = bundled
+                else:
+                    # Bundled one no better - put the original back untouched
+                    for k in [k for k in sys.modules if k == 'cv2' or k.startswith('cv2.')]:
+                        sys.modules.pop(k, None)
+                    sys.modules.update(saved)
+                    if cv2 is not None:
+                        print(f"[ddContentBrowser] Warning: cv2 {cv2.__version__} is incompatible "
+                              f"with the loaded numpy, and the bundled cv2 didn't help")
+
+        _cv2_import_cache['result'] = cv2
+        return cv2
+
+
+def _ensure_pil_lambda_eval():
+    """
+    Give older Pillow versions the ImageMath.lambda_eval() psd_tools needs.
+
+    psd_tools calls ImageMath.lambda_eval() in _remove_white_background(),
+    which runs for every PSD whose preview has an alpha channel. That function
+    only exists from Pillow 10.3; under Maya the studio Pillow 10.2 usually
+    wins over the bundled one, so the call raises AttributeError and every
+    PSD with alpha falls back to the slow layer compositing - or, before that
+    fallback existed, to PIL's garbled output.
+
+    The shim mirrors Pillow's own implementation and is only installed when
+    the function is genuinely missing.
+    """
+    try:
+        from PIL import ImageMath
+    except ImportError:
+        return
+
+    if hasattr(ImageMath, "lambda_eval"):
+        return
+    if not hasattr(ImageMath, "_Operand") or not hasattr(ImageMath, "ops"):
+        return  # unknown Pillow layout - better to leave it alone
+
+    def lambda_eval(expression, options={}, **kw):
+        args = ImageMath.ops.copy()
+        args.update(options)
+        args.update(kw)
+        for key, value in args.items():
+            if hasattr(value, "im"):
+                args[key] = ImageMath._Operand(value)
+        out = expression(args)
+        try:
+            return out.im
+        except AttributeError:
+            return out
+
+    ImageMath.lambda_eval = lambda_eval
+    print(f"[PSD] Pillow {getattr(ImageMath, '__version__', '')} lacks "
+          f"ImageMath.lambda_eval - compatibility shim installed")
+
+
+def _apply_icc_profile(image, icc_profile):
+    """Convert an image to sRGB through its embedded ICC profile."""
+    import io
+
+    try:
+        from PIL import ImageCms
+    except ImportError:
+        return image
+
+    try:
+        with io.BytesIO(icc_profile) as stream:
+            in_profile = ImageCms.ImageCmsProfile(stream)
+        out_profile = ImageCms.createProfile("sRGB")
+        out_mode = image.mode if image.mode in ("L", "LA", "RGBA") else "RGB"
+        converted = ImageCms.profileToProfile(
+            image, in_profile, out_profile, outputMode=out_mode
+        )
+        return converted if converted is not None else image
+    except Exception as exc:
+        print(f"[PSD] Could not apply the embedded ICC profile: {exc}")
+        return image
+
+
+def load_psd_pil(file_path, max_size=None):
+    """
+    Load a PSD as a PIL Image, working around unreadable merged previews.
+
+    psd_tools normally hands back the flattened preview Photoshop stored in
+    the file, which is both fast and exactly what Photoshop shows. Some PSDs -
+    seen with files carrying extra alpha channels - have a merged image
+    section that neither psd_tools nor PIL can decode: psd_tools raises
+    "Invalid RLE compression", while PIL silently returns a garbled, colour
+    shifted image. The layer data in those files is intact, so re-compositing
+    from the layers gives the correct picture; it is only used as a fallback
+    because it is the slower of the two.
+
+    :param max_size: longest edge the caller actually needs. The embedded ICC
+        profile is applied after scaling down to it, which is where nearly all
+        the time used to go: converting a 4000px composite to sRGB takes
+        seconds, the same conversion on a 256px thumbnail is instant and
+        indistinguishable.
+
+    Returns a PIL Image (RGB or RGBA), or None if psd_tools is unavailable.
+    """
+    import sys
+
+    external_libs = get_external_libs_dir()
+    if external_libs not in sys.path:
+        sys.path.append(external_libs)
+
+    _ensure_pil_lambda_eval()
+
+    try:
+        from psd_tools import PSDImage
+        from psd_tools.constants import Resource
+    except ImportError:
+        return None
+    from PIL import Image
+
+    psd = PSDImage.open(str(file_path))
+
+    # apply_icc=False: the profile is applied below, on the scaled down image.
+    image = None
+    try:
+        image = psd.composite(apply_icc=False)
+    except Exception as exc:
+        print(f"[PSD] Merged preview of {file_path} is unreadable ({exc}); "
+              f"compositing from layers instead")
+
+    if image is None:
+        # ignore_preview re-renders the layer stack instead of reading the
+        # unreadable merged image section.
+        image = psd.composite(ignore_preview=True, apply_icc=False)
+
+    if max_size and (image.width > max_size or image.height > max_size):
+        image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+    try:
+        has_profile = Resource.ICC_PROFILE in psd.image_resources
+    except Exception:
+        has_profile = False
+    if has_profile:
+        image = _apply_icc_profile(image, psd.image_resources.get_data(Resource.ICC_PROFILE))
+
+    return image
+
+
 # Maya imports
 try:
     import maya.cmds as cmds
@@ -130,6 +348,28 @@ def get_maya_main_window():
     if main_window_ptr:
         return wrapInstance(int(main_window_ptr), QtWidgets.QWidget)
     return None
+
+
+def single_shot(msec, context, func):
+    """
+    QTimer.singleShot(msec, context, func) that works on every PySide build.
+
+    The (msec, context, callable) overload - the callback is dropped if
+    `context` is deleted first - only exists in newer PySide6. Maya's
+    PySide6 6.5 and PySide2 reject it with a TypeError. Same behaviour here
+    with a one-shot QTimer parented to `context`: it goes with `context`, so
+    the callback never runs on a deleted object.
+    """
+    # The timer has to come from the same binding as its parent
+    if any(c.__module__.startswith('PySide6') for c in type(context).__mro__):
+        from PySide6.QtCore import QTimer
+    else:
+        from PySide2.QtCore import QTimer
+    timer = QTimer(context)
+    timer.setSingleShot(True)
+    timer.timeout.connect(func)
+    timer.timeout.connect(timer.deleteLater)
+    timer.start(msec)
 
 
 # Default UI font - can be overridden by settings
@@ -429,6 +669,25 @@ def get_browser_data_dir():
     data_dir = Path.home() / ".ddContentBrowser"
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
+
+
+def get_local_cache_dir(*parts):
+    """
+    Machine-local folder for rebuildable caches (thumbnails, the Asset
+    Library database), as opposed to get_browser_data_dir(), which holds
+    the user's own data (settings, tags, collections).
+
+    %LOCALAPPDATA%/ddContentBrowser on Windows (not roamed - caches can be
+    large), ~/.local/share/ddContentBrowser elsewhere. `parts` are joined
+    onto it (e.g. get_local_cache_dir("thumbnails")). Not created here.
+    """
+    from pathlib import Path
+
+    if os.name == 'nt':
+        root = Path(os.getenv('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local'))
+    else:
+        root = Path.home() / '.local' / 'share'
+    return root.joinpath('ddContentBrowser', *parts)
 
 
 # ============================================================================
@@ -996,6 +1255,22 @@ def get_maya_import_type(extension):
     """
     ext_config = get_extension_config(extension)
     return ext_config.get("maya_import_type", None)
+
+
+def get_maya_import_options(file_type):
+    """
+    Get the cmds.file(options=...) string for a Maya import type.
+
+    'v=0' is a mayaAscii/mayaBinary translator option only. Other translators
+    parse the options string strictly (e.g. mayaUsd's "USD Import" fails with
+    "Unknown flag 'v'"), so they get no options at all.
+
+    Returns:
+        str or None: Options string, or None to omit the flag
+    """
+    if file_type in ('mayaAscii', 'mayaBinary'):
+        return 'v=0'
+    return None
 
 
 def get_extensions_for_thumbnail_method(method):
@@ -2237,6 +2512,72 @@ def find_asset_folder_geo(folder, level, importable_extensions):
     picks = [pick for d in var_dirs for pick in _picks(d)] or _picks(folder)
     fell_back = sum(1 for _, suffix in picks if level == 'high' and suffix == 'LOD0')
     return [p for p, _ in picks], fell_back
+
+
+def _single_map_sets_in_dir(directory):
+    """
+    "Sets" of the texture maps in `directory` that group_texture_sets() leaves
+    as loose files because there's only one map per base name - Megascans
+    imperfections are a single Roughness map. Same shape as a texture set,
+    same duplicate handling (one file per variant: alias priority, then file
+    format - e.g. the .jpg/.tif pair of one map).
+    """
+    groups = {}
+    for path in _images_in_dir(directory):
+        base, channel, udim, lod, alias = parse_texture_filename(path.stem, path.suffix)
+        if channel is None:
+            continue
+        group = groups.setdefault(base.lower(), {'display': base, 'variants': {}})
+        key = (channel, udim, lod)
+        rank = (_alias_rank(channel, alias), _texture_extension_rank(path))
+        if key not in group['variants'] or rank < group['variants'][key][1]:
+            group['variants'][key] = (path, rank)
+    sets = []
+    for group in groups.values():
+        channels = {}
+        for (channel, _udim, _lod), (path, _rank) in group['variants'].items():
+            channels.setdefault(channel, []).append(path)
+        sets.append({
+            'display': group['display'],
+            'channels': channels,
+            'files': [p for p, _ in group['variants'].values()],
+            'extra_formats': [],
+            'variant_map': {k: v[0] for k, v in group['variants'].items()},
+        })
+    return sets
+
+
+def find_asset_folder_texture_set(folder, preferred_resolution="4K", asset_id=None):
+    """
+    The texture set of a texture-only asset folder (a Megascans surface,
+    decal, atlas, imperfection, displacement, ...) - for "Import Asset
+    Folders". Built from the images directly in the folder, never its
+    subfolders: Megascans' Thumbs/ only holds low-res copies, previews/
+    renders.
+
+    When the folder holds several sets, the one named after the asset (its
+    id, else the folder name's last '_' part - "concrete_rough_xeokfboga"
+    -> "xeokfboga") wins, then the one with more channels, then the usual
+    non-.tx / preferred_resolution tie-break.
+
+    Returns the set dict (see group_texture_sets()), or None.
+    """
+    folder = Path(folder)
+    sets = _texture_sets_in_dir(folder)
+    if not sets:
+        sets = _single_map_sets_in_dir(folder)
+    if not sets:
+        return None
+    ident = (asset_id or folder.name.rsplit('_', 1)[-1]).lower()
+    matches = []
+    for data in sets:
+        clean = _TX_SET_SUFFIX_REGEX.sub('', data['display'])
+        base, res_tag = _strip_resolution_tag(clean)
+        matches.append((data, res_tag, 0 if ident and ident in base.lower() else 1))
+    # More channels first; _best_texture_set's stable sort keeps that order
+    # within its own ranking
+    matches.sort(key=lambda m: -len(m[0]['channels']))
+    return _best_texture_set(matches, preferred_resolution)
 
 
 def find_lod_proxy_for_geo(geo_path, geo_suffix, importable_extensions):

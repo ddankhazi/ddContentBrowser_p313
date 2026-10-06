@@ -10,7 +10,7 @@ License: MIT
 from pathlib import Path
 
 # Import Maya detection
-from .utils import MAYA_AVAILABLE
+from .utils import MAYA_AVAILABLE, single_shot
 
 try:
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
@@ -315,7 +315,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                 from PySide6.QtCore import QTimer
             else:
                 from PySide2.QtCore import QTimer
-            QTimer.singleShot(100, self, self.show_help_overlay_briefly)
+            single_shot(100, self, self.show_help_overlay_briefly)
         except:
             self.show_help_overlay_briefly()
         
@@ -811,7 +811,7 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                 from PySide2.QtCore import QTimer
             
             # Re-fit regardless (either pixmap or grid)
-            QTimer.singleShot(10, self, self._refit_on_first_show)
+            single_shot(10, self, self._refit_on_first_show)
             
             # if DEBUG_MODE:
             #     print("[QuickView] First show - scheduling refit")
@@ -1295,13 +1295,21 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                         
                         from PIL import Image
                         Image.MAX_IMAGE_PIXELS = None
-                        
-                        pil_image = Image.open(str(file_path))
-                        
+
+                        # psd-tools, not PIL: PIL silently returns a garbled
+                        # image for PSDs whose merged preview it cannot decode.
+                        from .utils import load_psd_pil
+                        # Quick View shows at most 4096px, so let the loader
+                        # scale before the ICC conversion - that is where the
+                        # time goes on full resolution composites.
+                        pil_image = load_psd_pil(file_path, max_size=4096)
+                        if pil_image is None:
+                            pil_image = Image.open(str(file_path))
+
                         # Convert to RGB
                         if pil_image.mode not in ('RGB', 'RGBA'):
                             pil_image = pil_image.convert('RGB')
-                        
+
                         # Scale for Quick View (4096 max for quality)
                         max_dimension = 4096
                         if pil_image.width > max_dimension or pil_image.height > max_dimension:
@@ -1314,22 +1322,28 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                         
                         img_array = np.array(pil_image)
                         height, width = img_array.shape[:2]
-                        
+
+                        # QImage does not copy the buffer it is given, so the
+                        # bytes must stay referenced until q_image.copy() below;
+                        # passing tobytes() inline lets it be freed first and
+                        # the image is then built from released memory.
+                        buffer = img_array.tobytes()
+
                         # Handle RGB/RGBA
                         if len(img_array.shape) == 3:
                             channels = img_array.shape[2]
                             if channels == 4:
                                 # RGBA
                                 bytes_per_line = width * 4
-                                q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGBA8888)
+                                q_image = QImage(buffer, width, height, bytes_per_line, QImage.Format_RGBA8888)
                             else:
                                 # RGB
                                 bytes_per_line = width * 3
-                                q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
+                                q_image = QImage(buffer, width, height, bytes_per_line, QImage.Format_RGB888)
                         else:
                             # Grayscale
                             bytes_per_line = width
-                            q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_Grayscale8)
+                            q_image = QImage(buffer, width, height, bytes_per_line, QImage.Format_Grayscale8)
                         
                         pixmap = QPixmap.fromImage(q_image.copy())
                         pil_image.close()
@@ -1389,8 +1403,16 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                                     sys.path.append(external_libs)
 
                                 from PIL import Image
-                                pil_image = Image.open(str(file_path))
-                                
+                                if str(file_path).lower().endswith('.psd'):
+                                    # PIL garbles PSDs whose merged preview it
+                                    # cannot decode - go through psd-tools.
+                                    from .utils import load_psd_pil
+                                    pil_image = load_psd_pil(file_path)
+                                    if pil_image is None:
+                                        pil_image = Image.open(str(file_path))
+                                else:
+                                    pil_image = Image.open(str(file_path))
+
                                 # Convert to RGB
                                 if pil_image.mode not in ('RGB', 'L'):
                                     pil_image = pil_image.convert('RGB')
@@ -2069,11 +2091,15 @@ MMB: Pan, Scroll Wheel: Zoom, F: Fit, Alt+MMB: Move Window
                         
                         # Try psd-tools first for PSD files
                         if file_path.suffix.lower() == '.psd':
-                            # Use PIL for PSD (fast, consistent with single-file mode)
+                            # psd-tools, not PIL: PIL silently returns a garbled
+                            # image for PSDs whose merged preview it cannot decode.
                             from PIL import Image
                             Image.MAX_IMAGE_PIXELS = None
-                            pil_image = Image.open(str(file_path))
-                            
+                            from .utils import load_psd_pil
+                            pil_image = load_psd_pil(file_path, max_size=4096)
+                            if pil_image is None:
+                                pil_image = Image.open(str(file_path))
+
                             if pil_image.mode not in ('RGB', 'RGBA'):
                                 pil_image = pil_image.convert('RGB')
                             

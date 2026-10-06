@@ -248,13 +248,9 @@ class ThumbnailDiskCache:
             max_size_mb: Maximum cache size in megabytes (default: 500 MB)
         """
         if cache_dir is None:
-            # Use AppData/Local on Windows, ~/.local/share on Linux/Mac
-            import os
-            if os.name == 'nt':  # Windows
-                cache_root = Path(os.getenv('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
-            else:  # Linux/Mac
-                cache_root = Path.home() / '.local' / 'share'
-            cache_dir = cache_root / "ddContentBrowser" / "thumbnails"
+            # AppData/Local on Windows, ~/.local/share on Linux/Mac
+            from .utils import get_local_cache_dir
+            cache_dir = get_local_cache_dir("thumbnails")
         
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1910,12 +1906,22 @@ class ThumbnailGenerator(QThread):
             
             # Try to load PSD composite first
             try:
-                from psd_tools import PSDImage
-                psd = PSDImage.open(str(file_path))
-                pil_img = psd.composite()
-                
+                from .utils import load_psd_pil
+                # Scale inside the loader, so the ICC conversion runs on the
+                # thumbnail instead of the full size composite.
+                pil_img = load_psd_pil(file_path, max_size=self.thumbnail_size)
+
                 if pil_img:
-                    pil_img = pil_img.convert('RGB')
+                    if 'A' in pil_img.getbands():
+                        # Flatten over black the way Photoshop's own flattened
+                        # preview does - a plain convert('RGB') would leave the
+                        # transparent areas white.
+                        rgba = pil_img.convert('RGBA')
+                        flattened = Image.new('RGB', rgba.size, (0, 0, 0))
+                        flattened.paste(rgba, mask=rgba.getchannel('A'))
+                        pil_img = flattened
+                    else:
+                        pil_img = pil_img.convert('RGB')
                     pil_img.thumbnail((self.thumbnail_size, self.thumbnail_size), Image.Resampling.LANCZOS)
                     
                     img_array = np.array(pil_img)
@@ -2129,20 +2135,15 @@ class ThumbnailGenerator(QThread):
             sys.path.append(external_libs)
         
         try:
-            from psd_tools import PSDImage
             from PIL import Image
-            
+            from .utils import load_psd_pil
+
             if DEBUG_MODE:
                 print(f"[PSD] Loading composite with psd-tools: {Path(file_path).name}")
-            
-            # Open PSD
-            psd = PSDImage.open(str(file_path))
-            
-            if DEBUG_MODE:
-                print(f"[PSD] PSD size: {psd.width}x{psd.height}, depth={psd.depth}-bit")
-            
-            # Get composite (flattened) image as PIL Image
-            composite = psd.composite()
+
+            # Get composite (flattened) image as PIL Image. Passing max_size on
+            # keeps the ICC conversion off the full size composite.
+            composite = load_psd_pil(file_path, max_size=max_size)
             
             if composite is None:
                 if DEBUG_MODE:
@@ -2188,7 +2189,10 @@ class ThumbnailGenerator(QThread):
                 img_array = np.array(composite)
                 height, width = img_array.shape[:2]
                 bytes_per_line = width * 3
-                q_image = QImage(img_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
+                # Keep the buffer referenced: QImage does not copy it, and the
+                # copy() below would otherwise read already freed memory.
+                data = img_array.tobytes()
+                q_image = QImage(data, width, height, bytes_per_line, QImage.Format_RGB888)
             
             if DEBUG_MODE:
                 print(f"[PSD] ✓ Composite loaded: {width}x{height}, mode={composite.mode}")
